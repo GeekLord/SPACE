@@ -440,3 +440,62 @@ SPACE_KIND_CLUSTER=space-local \
   unset SPACE_API_TOKEN &&
   kind get clusters
 ```
+
+## Separating volume-manager's credential identity
+
+The worker image provides a separate `space-volmgr` account (UID/GID 964) and
+credential-client group `space-volcredclients` (GID 965). The local launcher
+continues to run volume-manager as `space-sbxmgr` (UID 950), using the standard
+credential socket. Adding these accounts does not change the running identity
+or migrate retained files.
+
+Credential-manager supports an optional `--volume-socket
+/space/run/volume-credentials/credmgr.sock` listener. It admits only the
+volume-manager identity and only `ExchangeToken`, `IssueDek`, and `UnwrapDek`.
+Certificate issuance and other privileged credential methods are denied before
+handling or forwarding the request. Both the node agent and local authority
+support this listener; existing sandbox-manager and template-manager clients
+continue to use the standard listener.
+
+To prepare the additional listener:
+
+- Provision `/space/run/volume-credentials` with mode `0750`, owned by the
+  credential-manager account `space-sbxmgr` (UID 950) and group 965. Give
+  credential-manager and volume-manager that supplementary group and mount the
+  directory into both services. The socket is mode `0660`. Parent directories
+  must be root-owned and not writable by group or others; only `/space` may be
+  a root-owned symlink, with the same protections on its target's ancestors.
+- Give the directory one initializer. Preserve credential-manager's identity
+  and standard socket directory ownership while older launchers remain in use.
+- Deploy compatible binaries before enabling `--volume-socket`. Before
+  advertising passive readiness or taking over from a running predecessor,
+  credential-manager checks that the path is safe and distinct from the standard
+  endpoint, then binds a temporary socket with the production permissions.
+  Bad provisioning rejects the replacement while the predecessor keeps serving.
+  The probe leaves existing sockets untouched.
+- Verify both real listeners after takeover. Preflight does not cover changes
+  made after its check, an upstream outage, or a rollout that stops the old
+  instance first. A killed preflight can leave a `.p-*` probe socket; remove
+  that file only after confirming its creating process has exited.
+- Exercise token exchange and transfer-key issue/unwrap as UID 964, verify
+  privileged methods are denied, and check legacy UID-950 calls still work.
+  Check the configured peer-process verification mode as well as pod readiness.
+
+Shared restore and fork directories use `space-cache-rw` (GID 952). Run both
+sandbox-manager and volume-manager with umask `0022`; restrictive masks can
+leave restore parents or downloaded files inaccessible across the identities.
+Validate retained transfers, snapshot restore, and fork with the intended image
+and filesystem settings before changing identities.
+
+Changing an existing node's identity requires separate migration tooling and
+deployment orchestration. Stop and drain the predecessor, preserve and acquire
+its existing service-lock inode, and transfer only volume-manager's retained
+state. Change the identity and credential endpoint together; use the same safe
+handoff for rollback. A running volume-manager under UID 964 must use
+`SPACE_CREDMGR_ENDPOINT=unix:///space/run/volume-credentials/credmgr.sock` and is
+denied access to the standard listener.
+
+The shared-identity vulnerability remains until volume-manager stops running as
+UID 950. Retain legacy authorization during the supported rollback window,
+then remove the UID-950 volume-manager executable allowance and storage-actor
+mapping in a follow-up.
