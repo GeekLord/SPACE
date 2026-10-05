@@ -1,0 +1,145 @@
+# Kind-only overrides for the upstream datadog/datadog chart. The key
+# decisions:
+#
+# * `datadog.apiKeyExistingSecret` — Fake Intake renders a dedicated dummy
+#   Secret. SaaS references a different, pre-existing dev-only Secret; neither
+#   the chart nor the bootstrap/Tilt helpers create or read its key value.
+#
+# * datadog_backend.py renders the same environment/owner/phase/version as
+#   SPACE and the shim. SaaS requires a unique local-kind-* environment and
+#   node hostname suffix; the source SHA + phase is the version query filter.
+#
+# * APM + DogStatsD on host ports — SPACE pods set DD_AGENT_HOST from
+#   status.hostIP and that routes to this node-local agent over hostNetwork.
+#   Uses the same DD_* environment contract as the EKS charts.
+#
+# * Logs use the stdout path in every transport mode. The backend helper
+#   restricts collection to the SPACE namespace and disables optional process,
+#   image, lifecycle, event and orchestrator inventory for bounded experiments.
+#   That namespace scope still includes the builder, which opts out separately
+#   through `ad.datadoghq.com/node-stack.logs_exclude`: guest command output
+#   can contain build secrets even when step descriptions omit user inputs.
+#   See space-node-stack/values-builder.yaml.
+
+# Fake Intake is deliberately single-replica and in-memory. A second replica
+# would split writes and make a query return only part of a comparison run.
+fakeintake:
+  enabled: false
+  image:
+    repository: docker.io/datadog/fakeintake
+    tag: v37
+    digest: sha256:457b93faebfb03c83fe799fc109ebe75ddd3ab01dd5cdae1423595c0c643f9c3
+    pullPolicy: IfNotPresent
+  retentionPeriod: 1h
+  resources:
+    requests:
+      cpu: 25m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      # Payload inspection decodes compressed metric batches in-process and
+      # briefly needs substantially more memory than passive collection.
+      memory: 2Gi
+  nodeSelector:
+    space.pplx.net/infra: "true"
+
+# Values below are nested under the upstream dependency name.
+datadog:
+  datadog:
+    apiKeyExistingSecret: ""  # choose values-fakeintake.yaml or an existing SaaS Secret
+    appKeyExistingSecret: ""              # not needed for agent-only telemetry
+    site: local.invalid
+    clusterName: space-local
+    # Kind exposes the kubelet through node IPs that are not covered by its
+    # self-signed serving certificate. This is limited to the local cluster.
+    kubelet:
+      tlsVerify: false
+    # Kind's kubelet endpoint is not a reliable hostname source during Agent
+    # startup. Use the Kubernetes node identity for every node Agent container;
+    # upstream applies `datadog.env` to the DaemonSet, not the Cluster Agent.
+    env:
+      - name: DD_HOSTNAME
+        valueFrom:
+          fieldRef:
+            fieldPath: spec.nodeName
+    envDict:
+      DD_ENV: local-unset
+    apm:
+      portEnabled: true                   # 8126 on host
+      instrumentation:
+        enabled: false                    # we set DD_* env per-service ourselves
+        skipKPITelemetry: true            # avoids a random install id on every template render
+    otlp:
+      receiver:
+        protocols:
+          grpc:
+            enabled: true
+            endpoint: "0.0.0.0:4317"
+    dogstatsd:
+      useHostPort: true                   # 8125 on host
+      nonLocalTraffic: true
+    logs:
+      enabled: true
+      containerCollectAll: true
+    processAgent:
+      enabled: true
+    # Keeps the privileged eBPF system-probe container off the node. Agent
+    # >= 7.78.0 resolves a null `discovery.enabled` to on, and system-probe
+    # arrives with SYS_ADMIN/NET_ADMIN/SYS_PTRACE and a seccomp profile written
+    # into the node's kubelet directory. This node also runs Firecracker, the
+    # nftables policy set and net-gateway, so it stays off until something
+    # needs it. `datadog.systemProbe` has no `enabled` key; only this works.
+    discovery:
+      enabled: false
+    # The Cluster Agent's kubernetes_state_core check supplies the Kubernetes
+    # metrics needed here; the legacy kube-state-metrics subchart is unnecessary.
+    kubeStateMetricsEnabled: false
+    clusterChecks:
+      enabled: true
+    # The Agent is installed directly by this chart. The upstream chart now
+    # enables its Operator dependency by default, which adds no value in Kind.
+    operator:
+      enabled: false
+    autoscaling:
+      workload:
+        enabled: false
+    instrumentationCrd:
+      enabled: false
+    remoteConfiguration:
+      enabled: false
+
+  # Keep the local comparison deterministic and independent of Datadog SaaS.
+  # This is the upstream chart's top-level `remoteConfiguration`, not a
+  # duplicate of `datadog.remoteConfiguration` above: the node Agent ANDs the
+  # two (`datadog-remoteConfiguration-enabled`), while the Cluster Agent reads
+  # only this one (`clusterAgent-remoteConfiguration-enabled`). Dropping it
+  # would let a later `autoscaling.workload` or admission-controller change
+  # silently turn remote configuration on for the Cluster Agent.
+  remoteConfiguration:
+    enabled: false
+
+  agents:
+    useHostNetwork: true
+    containers:
+      agent:
+        env:
+          - name: DD_KUBERNETES_KUBELET_NODENAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+
+  clusterAgent:
+    enabled: true
+    replicas: 1                           # single-replica fits the kind cluster
+    # `helm template | kubectl apply` has no Helm release state. Leaving this
+    # empty regenerates the shared token on every render and needlessly rolls
+    # both the Cluster Agent and every node Agent.
+    token: kindlocalnotasecretkindlocalnotasecret
+    admissionController:
+      enabled: false                      # SPACE charts provide their own DD_* wiring
+    metricsProvider:
+      enabled: false
+
+  # Nothing here keeps the Agent off the control-plane node: the chart adds no
+  # tolerations, so Kind's standard control-plane taint does it. `providers`
+  # upstream covers aks/eks/flatcar/gke/openshift/talos and has no kind key.

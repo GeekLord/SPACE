@@ -1,0 +1,32 @@
+/target/
+/ui/node_modules/
+/docs/api/node_modules/
+/ui/.next/
+/ui/tsconfig.tsbuildinfo
+# Claude Code per-session runtime state (NOT shared project config in
+# .claude/settings.json, .claude/agents/, .claude/commands/, etc.).
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/scheduled_tasks/
+
+ci/helm/plugins/
+# Tools ci/scripts/install-tools.py downloads into ci/bin, which
+# also holds checked-in shims (envsubst, gcloud, gsutil, modprobe, sudo,
+# udevadm). Named individually rather than ignoring the directory so a new shim
+# is still tracked by default; a bootstrap that runs locally otherwise dirties
+# the tree and these land in a commit.
+ci/bin/helm
+ci/bin/kubectl
+ci/bin/sccache
+ci/bin/tfswitch
+ci/bin/uv
+ci/bin/uvx
+ci/bin/wild
+
+.idea/
+
+__pycache__/
+.space-deploy-internal-tokens.env
+infra/space/kind/private.env
+.playwright-mcp/
+/.cache/

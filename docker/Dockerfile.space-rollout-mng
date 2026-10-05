@@ -1,0 +1,41 @@
+# syntax=docker/dockerfile:1.7
+
+FROM public.ecr.aws/docker/library/python:3.14-slim
+
+ARG KUBECTL_VERSION=v1.35.0
+ARG TARGETARCH
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      bash \
+      ca-certificates \
+      curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl" -o /usr/local/bin/kubectl \
+    && curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl.sha256" -o /tmp/kubectl.sha256 \
+    && echo "$(cat /tmp/kubectl.sha256)  /usr/local/bin/kubectl" | sha256sum -c - \
+    && chmod 0755 /usr/local/bin/kubectl \
+    && rm /tmp/kubectl.sha256
+
+# Inline-script deps from scripts/space-rollout-mng.py PEP 723 metadata,
+# resolved by uv at build time and baked into the image so Job startup
+# doesn't hit PyPI.
+RUN pip install --no-cache-dir uv==0.5.13 \
+    && uv pip install --system --no-cache-dir \
+        boto3==1.43.16 \
+        requests==2.34.2
+
+RUN groupadd --system --gid 955 space-rollout-mng \
+    && useradd --system --uid 955 --gid 955 --create-home --home-dir /space space-rollout-mng
+
+WORKDIR /space
+
+LABEL org.opencontainers.image.title="space-rollout-mng"
+LABEL org.opencontainers.image.description="Two-MNG node rollout orchestrator for SPACE EKS clusters."
+
+RUN mkdir -p /opt/space/bin
+COPY --chmod=0755 scripts/space-rollout-mng.py /opt/space/bin/space-rollout-mng.py
+
+USER space-rollout-mng
+
+ENTRYPOINT ["python3", "/opt/space/bin/space-rollout-mng.py"]

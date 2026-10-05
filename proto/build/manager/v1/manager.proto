@@ -1,0 +1,84 @@
+syntax = "proto3";
+
+package build.manager.v1;
+
+import "build/manager/v1/recipe.proto";
+
+service BuildManager {
+  rpc StartBuild(StartBuildRequest) returns (StartBuildResponse);
+  rpc GetBuildStatus(GetBuildStatusRequest) returns (GetBuildStatusResponse);
+  // Streaming blob upload to back Recipe.Copy.blob_sha256. Daemon stores
+  // by content hash and returns the canonical sha256 the caller should
+  // reference. Idempotent: re-uploading the same bytes is a no-op.
+  rpc UploadBlob(stream UploadBlobChunk) returns (UploadBlobResponse);
+}
+
+message StartBuildRequest {
+  // Required. The recipe to build.
+  Recipe recipe = 1;
+  // Required. Template ID to register the build artifact under.
+  string template_id = 3;
+  BuildOptions options = 4;
+  ClientContext client = 5;
+  // Caller organization: authorizes the base and owns the published template.
+  // Omitted only for trusted local/system builds.
+  optional string org_id = 7;
+}
+
+message BuildOptions {
+  // Skip the local-build-already-exists cache check.
+  bool force = 1;
+  // Tags applied when registering the cluster release.
+  repeated string publish_tags = 3;
+}
+
+// Free-form provenance for logs and template metadata. The daemon does
+// not resolve, fetch, or trust these values for routing decisions.
+message ClientContext {
+  string source_path = 1;
+  string cli_version = 2;
+  string hostname = 3;
+}
+
+message StartBuildResponse {
+  string job_id = 1;
+}
+
+message GetBuildStatusRequest {
+  string job_id = 1;
+}
+
+message GetBuildStatusResponse {
+  BuildState state = 1;
+  string template_id = 2;
+  string template_version = 3;
+  string content_hash = 4;
+  string error = 5;
+}
+
+enum BuildState {
+  BUILD_STATE_UNSPECIFIED = 0;
+  BUILD_STATE_PENDING = 1;
+  BUILD_STATE_RUNNING = 2;
+  BUILD_STATE_SUCCEEDED = 3;
+  BUILD_STATE_FAILED = 4;
+  BUILD_STATE_PUBLISH_FAILED = 5;
+}
+
+// Every chunk sets DATA or COMMIT. The daemon publishes the blob only after
+// a single empty COMMIT chunk terminates the stream; UNSPECIFIED is rejected.
+message UploadBlobChunk {
+  bytes data = 1;
+  UploadBlobPhase phase = 2;
+}
+
+enum UploadBlobPhase {
+  UPLOAD_BLOB_PHASE_UNSPECIFIED = 0;
+  UPLOAD_BLOB_PHASE_DATA = 1;
+  UPLOAD_BLOB_PHASE_COMMIT = 2;
+}
+
+message UploadBlobResponse {
+  string sha256 = 1;
+  uint64 size_bytes = 2;
+}

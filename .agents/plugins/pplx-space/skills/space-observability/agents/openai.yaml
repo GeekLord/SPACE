@@ -1,0 +1,3 @@
+interface:
+  display_name: "SPACE Observability"
+  short_description: "Metrics, traces, events, dashboards, and monitors"

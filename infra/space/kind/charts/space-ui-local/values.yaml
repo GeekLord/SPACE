@@ -1,0 +1,24 @@
+image:
+  repository: space-ui
+  tag: local
+  pullPolicy: IfNotPresent
+
+datadogTeam: team-space
+
+service:
+  name: space-ui
+  port: 3000
+  type: ClusterIP
+
+apiUrl: http://space-api:8080
+# Cluster-internal data-plane URL — used by Next.js to proxy
+# /v1/sessions/* requests so the browser doesn't have to cross origins.
+dataPlaneUrl: http://space-data-plane:8090
+
+resources:
+  requests:
+    cpu: 25m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi

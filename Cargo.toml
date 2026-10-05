@@ -1,0 +1,432 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/apps/api/svc",
+    "crates/apps/builder/cli",
+    "crates/apps/internal/api/svc",
+    "crates/apps/cluster/controller/svc",
+    "crates/apps/builder/svc",
+    "crates/apps/db/migrator",
+    "crates/apps/credential/mgr/svc",
+    "crates/apps/data/plane/svc",
+    "crates/apps/local/node-mgr/svc",
+    "crates/apps/net/gateway/bench",
+    "crates/apps/net/gateway/svc",
+    "crates/apps/node/api/svc",
+    "crates/apps/node/ctl/cli",
+    "crates/apps/node/ctl/svc",
+    "crates/apps/node/mgr/cli",
+    "crates/apps/node/mgr/svc",
+    "crates/apps/node/runtime/manager/cli",
+    "crates/apps/node/runtime/manager/svc",
+    "crates/apps/node/runtime/supervisor/svc",
+    "crates/apps/sbx/mgr/cli",
+    "crates/apps/sbx/mgr/svc",
+    "crates/apps/admin/cli",
+    "crates/apps/spaced/guest/svc",
+    "crates/apps/spaced/guest/cli",
+    "crates/apps/spaced/guest/loopback-test",
+    "crates/apps/spaced/host/svc",
+    "crates/apps/spaced/host/cli",
+    "crates/apps/ssh/cli",
+    "crates/apps/template/mgr/svc",
+    "crates/apps/template/mgr/cli",
+    "crates/apps/template/publish",
+    "crates/apps/vol/mgr/cli",
+    "crates/apps/mock/llm/svc",
+    "crates/apps/mock/branching-key-provider/svc",
+    "crates/libs/spaced/build",
+    "crates/libs/spaced/common",
+    "crates/libs/spaced/guest/client",
+    "crates/libs/spaced/guest/server",
+    "crates/libs/spaced/host/client",
+    "crates/libs/spaced/host/server",
+    "crates/libs/sqlite/migrations",
+    "crates/libs/test-env",
+    "crates/libs/sandbox/store",
+    "crates/libs/sandbox/teardown",
+    "crates/libs/sandbox/portability",
+    "crates/libs/snapshot/store",
+    "crates/libs/snapshot/storage",
+    "crates/libs/snapshot/retention",
+    "crates/libs/sbx/mgr/client",
+    "crates/libs/sbx/mgr/migrations",
+    "crates/libs/sbx/mgr/server",
+    "crates/libs/node/api/client",
+    "crates/libs/node/api/server",
+    "crates/libs/node/ctl/server",
+    "crates/libs/node/ctl/client",
+    "crates/libs/node/api/sim",
+    "crates/libs/node/mgr/client",
+    "crates/libs/node/mgr/server",
+    "crates/libs/node/runtime/core",
+    "crates/libs/node/runtime/manager/client",
+    "crates/libs/node/runtime/manager/server",
+    "crates/libs/node/runtime/supervisor",
+    "crates/libs/execution/common",
+    "crates/libs/net/common",
+    "crates/libs/net/gateway/client",
+    "crates/libs/net/gateway/server",
+    "crates/libs/build/mgr",
+    "crates/libs/build/mgr/client",
+    "crates/libs/build/mgr/server",
+    "crates/libs/object-store",
+    "crates/libs/placement/executor",
+    "crates/libs/placement/machine",
+    "crates/libs/public/api",
+    "crates/libs/api",
+    "crates/libs/common/core",
+    "crates/libs/common/cli",
+    "crates/libs/common/connection/admission",
+    "crates/libs/common/grpc",
+    "crates/libs/common/grpc-lb",
+    "crates/libs/common/io",
+    "crates/libs/common/jobs",
+    "crates/libs/common/lru-reaper",
+    "crates/libs/common/proto-build",
+    "crates/libs/common/work-coalescer",
+    "crates/libs/common/svc",
+    "crates/libs/data/plane/server",
+    "crates/libs/db-test-fixtures",
+    "crates/libs/db/migrator",
+    "crates/libs/aws/client",
+    "crates/libs/feature-flags",
+    "crates/libs/events",
+    "crates/libs/metrics",
+    "crates/libs/observability",
+    "crates/libs/internal/api/server",
+    "crates/libs/cluster/controller/server",
+    "crates/libs/cluster/pool",
+    "crates/libs/cluster/reconciler",
+    "crates/libs/cluster/trigger-queue",
+    "crates/libs/template/mgr",
+    "crates/libs/template/mgr-client",
+    "crates/libs/template/publish",
+    "crates/libs/credential/mgr/client",
+    "crates/libs/credential/mgr/server",
+    "crates/libs/credential/injection/core",
+    "crates/libs/credential/provider/client",
+    "crates/libs/credential/provider/proto",
+    "crates/apps/vol/mgr/svc",
+    "crates/libs/vol/mgr/client",
+    "crates/libs/vol/mgr/migrations",
+    "crates/libs/vol/mgr/server",
+]
+
+[workspace.package]
+version = "0.8.0"
+edition = "2024"
+# Minimum supported Rust version (MSRV) floor. Cargo refuses to build on any
+# toolchain below this, giving a clear "requires rustc >= X" error instead of a
+# confusing downstream compile failure. It must reflect the versions the code
+# actually compiles on: clippy is MSRV-aware and its default-warn
+# `incompatible_msrv` lint (a hard error under `-D warnings`) fires when workspace
+# code calls a std API stabilized *after* this floor, so a floor set below the
+# real minimum is not just cosmetic — it breaks CI. We keep the floor equal to
+# the pinned toolchain in rust-toolchain.toml (the version we build and validate
+# on): that is the minimum we can prove green. Raise both together when bumping.
+# Edition 2024 independently requires >=1.85. Members inherit via
+# `rust-version.workspace = true`.
+rust-version = "1.97"
+authors = ["Perplexity AI"]
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+aead-stream = "0.6"
+anyhow = "1"
+arc-swap = "1"
+async-trait = "0.1"
+aes-gcm = "0.11"
+aws-config = { version = "1", default-features = false }
+aws-credential-types = "1"
+aws-lc-rs = { version = "1.17", default-features = false, features = ["aws-lc-sys"] }
+aws-sdk-acmpca = { version = "1", default-features = false }
+aws-sdk-ecr = { version = "1", default-features = false }
+aws-sdk-s3 = { version = "1", default-features = false }
+aws-sdk-secretsmanager = { version = "1", default-features = false }
+aws-sigv4 = { version = "1", default-features = false }
+aws-smithy-runtime-api = "1"
+# aws-config 1.12 still uses aws-smithy-json 0.63, which does not compile with
+# aws-smithy-types 1.7. Keep the AWS SDK graph on its latest coherent line.
+aws-smithy-types = "=1.6.3"
+# 0.63 requires the currently incompatible aws-smithy-types 1.7 line above.
+aws-smithy-xml = "0.62"
+aws-types = "1"
+axum = "0.8"
+base64 = "0.23"
+bcrypt = "0.19"
+bytes = "1"
+bytesize = "2.3.1"
+clap = "4"
+comfy-table = "8"
+datadog-opentelemetry = "0.5"
+dashmap = "6"
+deadpool-redis = { version = "0.23", default-features = false, features = ["rt_tokio_1", "script", "tokio-comp", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
+# Eppo hard-enables reqwest 0.12's ring-backed `rustls-tls` feature. Keep that
+# transitive exception isolated; remove it when Eppo exposes an AWS-LC or
+# provider-neutral TLS feature.
+eppo = "5.2.1"
+futures-core = "0.3"
+futures-util = "0.3"
+globset = "0.4"
+hex = "0.4"
+hickory-resolver = { version = "0.26.1", default-features = false, features = ["metrics", "tokio", "tls-aws-lc-rs", "webpki-roots"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+h2 = "0.4"
+hmac = "0.13"
+hyper = "1"
+hyper-util = "0.1"
+insta = "1"
+jiff = "0.2"
+jsonschema = { version = "0.56", default-features = false }
+k8s-openapi = "0.28"
+kube = { version = "4.2", default-features = false }
+libc = "0.2"
+log = "0.4"
+lru = "0.18"
+md-5 = "0.11"
+metrics = "0.24.1"
+nix = "0.31"
+rustix = "1.1.4"
+notify = "8"
+oci-spec = { version = "0.10", default-features = false, features = ["distribution"] }
+object = { version = "0.40", default-features = false, features = ["read_core", "elf"] }
+# Default features stay on because 0.3.0 does not build without them, despite
+# declaring them optional: `src/hooks/logging.rs` imports `log` unconditionally
+# and `src/provider/mod.rs` re-exports `MockFeatureProvider` unconditionally, so
+# `default-features = false` fails to compile the SDK itself. The cost is
+# `mockall` in the graph of any build that enables `openfeature`. Left visible
+# rather than worked around; revisit when the SDK gates them properly.
+open-feature = { version = "0.3" }
+# Local (in-process) evaluation only: the flag set syncs in the background and
+# every read is served from it, which is what the sync `FeatureFlagProvider`
+# contract needs. `tls-aws-lc` replaces the default `tls-ring` because SPACE
+# standardises on AWS-LC and two crypto providers make rustls panic on first
+# use, unable to auto-select one.
+open-feature-flagd = { version = "0.2", default-features = false, features = ["in-process", "tls-aws-lc"] }
+# Keep the OTel family on the datadog-opentelemetry-compatible line. Advancing
+# these alone pulls a duplicate OTel SDK graph.
+opentelemetry = "0.32"
+opentelemetry-otlp = { version = "=0.32.0", default-features = false }
+opentelemetry-proto = { version = "=0.32.0", default-features = false }
+opentelemetry_sdk = "0.32"
+parking_lot = "0.12"
+percent-encoding = "2"
+pin-project-lite = "0.2"
+prost = "0.14"
+prost-types = "0.14"
+rand = "0.10"
+rcgen = { version = "0.14", default-features = false }
+redis = { version = "1", default-features = false, features = ["cluster-async", "script", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
+regex = "1"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+rstest = { version = "0.27", default-features = false }
+rtnetlink = "0.23"
+# rusqlite 0.40 and sqlx-sqlite 0.9 require incompatible libsqlite3-sys
+# versions, which cannot coexist because both link the native SQLite library.
+rusqlite = { version = "0.39", features = ["bundled", "trace"] }
+rustls = { version = "0.23", default-features = false }
+schemars = "1"
+serde = "1"
+serde_json = "1"
+semver = "1"
+sha2 = "0.11"
+subtle = "2"
+socket2 = "0.6"
+sqlx = { version = "0.9", default-features = false }
+tempfile = "3"
+tar = "0.4.46"
+flate2 = "1"
+form_urlencoded = "1"
+# testcontainers-modules 0.15 requires testcontainers 0.27. Keep the pair
+# aligned until a stable modules release supports testcontainers 0.28.
+testcontainers = { version = "0.27", default-features = false, features = ["aws-lc-rs"] }
+testcontainers-modules = { version = "0.15", default-features = false, features = ["aws-lc-rs"] }
+thiserror = "2"
+tikv-jemallocator = "0.7"
+time = "0.3"
+tokio = "1"
+tokio-rustls = { version = "0.26", default-features = false }
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
+tokio-vsock = "0.7"
+toml = "1"
+tonic = "0.14"
+tonic-health = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+tonic-reflection = "0.14"
+tower = "0.5"
+tower-http = "0.7"
+tracing = "0.1"
+tracing-log = "0.2"
+# tracing-opentelemetry 0.33 is the matching line for opentelemetry 0.32.
+tracing-opentelemetry = "0.33"
+tracing-subscriber = "0.3"
+uuid = { version = "1", features = ["v4"] }
+webpki-roots = "1"
+x509-parser = "0.18"
+zeroize = "1"
+zstd = { version = "0.14", features = ["zstdmt"] }
+
+# internal
+pplx-space-api = { path = "crates/libs/api" }
+pplx-space-aws-client = { path = "crates/libs/aws/client" }
+pplx-space-build-mgr = { path = "crates/libs/build/mgr" }
+pplx-space-build-mgr-client = { path = "crates/libs/build/mgr/client" }
+pplx-space-build-mgr-server = { path = "crates/libs/build/mgr/server" }
+pplx-space-common-core = { path = "crates/libs/common/core" }
+pplx-space-common-cli = { path = "crates/libs/common/cli" }
+pplx-space-common-connection-admission = { path = "crates/libs/common/connection/admission" }
+pplx-space-common-grpc = { path = "crates/libs/common/grpc" }
+pplx-space-common-grpc-lb = { path = "crates/libs/common/grpc-lb" }
+pplx-space-common-io = { path = "crates/libs/common/io" }
+pplx-space-common-jobs = { path = "crates/libs/common/jobs" }
+pplx-space-common-lru-reaper = { path = "crates/libs/common/lru-reaper" }
+pplx-space-common-proto-build = { path = "crates/libs/common/proto-build" }
+pplx-space-common-svc = { path = "crates/libs/common/svc", default-features = false }
+pplx-space-common-work-coalescer = { path = "crates/libs/common/work-coalescer" }
+pplx-space-sqlite-migrations = { path = "crates/libs/sqlite/migrations" }
+pplx-space-data-plane-server = { path = "crates/libs/data/plane/server" }
+pplx-space-db-migrate = { path = "crates/libs/db/migrator" }
+pplx-space-db-test-fixtures = { path = "crates/libs/db-test-fixtures" }
+pplx-space-execution-common = { path = "crates/libs/execution/common" }
+pplx-space-feature-flags = { path = "crates/libs/feature-flags" }
+pplx-space-events = { path = "crates/libs/events" }
+pplx-space-credmgr = { path = "crates/libs/credential/mgr/server" }
+pplx-space-credmgr-client = { path = "crates/libs/credential/mgr/client" }
+pplx-space-credential-injection-core = { path = "crates/libs/credential/injection/core" }
+pplx-space-credential-injection-store = { path = "crates/libs/credential/injection/store" }
+pplx-space-credential-provider-client = { path = "crates/libs/credential/provider/client" }
+pplx-space-credential-provider-proto = { path = "crates/libs/credential/provider/proto" }
+pplx-space-volmgr = { path = "crates/libs/vol/mgr/server" }
+pplx-space-volmgr-client = { path = "crates/libs/vol/mgr/client" }
+pplx-space-volmgr-migrations = { path = "crates/libs/vol/mgr/migrations" }
+pplx-space-net-gateway = { path = "crates/libs/net/gateway/server" }
+pplx-space-net-gateway-client = { path = "crates/libs/net/gateway/client" }
+pplx-space-node-api-client = { path = "crates/libs/node/api/client" }
+pplx-space-node-ctl-client = { path = "crates/libs/node/ctl/client" }
+pplx-space-node-api-server = { path = "crates/libs/node/api/server" }
+pplx-space-node-ctl-server = { path = "crates/libs/node/ctl/server" }
+pplx-space-node-api-sim = { path = "crates/libs/node/api/sim" }
+pplx-space-node-mgr = { path = "crates/libs/node/mgr/server" }
+pplx-space-node-mgr-client = { path = "crates/libs/node/mgr/client" }
+pplx-space-node-runtime-core = { path = "crates/libs/node/runtime/core" }
+pplx-space-node-runtime-manager = { path = "crates/libs/node/runtime/manager/server" }
+pplx-space-node-runtime-manager-client = { path = "crates/libs/node/runtime/manager/client" }
+pplx-space-node-runtime-supervisor = { path = "crates/libs/node/runtime/supervisor" }
+pplx-space-net-common = { path = "crates/libs/net/common" }
+pplx-space-object-store = { path = "crates/libs/object-store" }
+pplx-space-public-api = { path = "crates/libs/public/api" }
+pplx-space-metrics = { path = "crates/libs/metrics" }
+pplx-space-observability = { path = "crates/libs/observability", default-features = false }
+pplx-space-placement = { path = "crates/libs/placement/machine" }
+pplx-space-internal-api-server = { path = "crates/libs/internal/api/server" }
+pplx-space-internal-api-svc = { path = "crates/apps/internal/api/svc" }
+pplx-space-cluster-controller-server = { path = "crates/libs/cluster/controller/server" }
+pplx-space-cluster-pool = { path = "crates/libs/cluster/pool" }
+pplx-space-cluster-reconciler = { path = "crates/libs/cluster/reconciler" }
+pplx-space-cluster-trigger-queue = { path = "crates/libs/cluster/trigger-queue" }
+pplx-space-sandbox-portability = { path = "crates/libs/sandbox/portability" }
+pplx-space-sandbox-store = { path = "crates/libs/sandbox/store" }
+pplx-space-sandbox-teardown = { path = "crates/libs/sandbox/teardown" }
+pplx-space-snapshot-storage = { path = "crates/libs/snapshot/storage" }
+pplx-space-snapshot-retention = { path = "crates/libs/snapshot/retention" }
+pplx-space-snapshot-store = { path = "crates/libs/snapshot/store" }
+pplx-space-sbxmgr-migrations = { path = "crates/libs/sbx/mgr/migrations" }
+pplx-space-sbx-mgr = { path = "crates/libs/sbx/mgr/server" }
+pplx-space-sbx-mgr-client = { path = "crates/libs/sbx/mgr/client" }
+pplx-space-spaced-build = { path = "crates/libs/spaced/build" }
+pplx-space-spaced-common = { path = "crates/libs/spaced/common" }
+pplx-space-spaced-guest-client = { path = "crates/libs/spaced/guest/client" }
+pplx-space-spaced-guest-server = { path = "crates/libs/spaced/guest/server" }
+pplx-space-spaced-host-client = { path = "crates/libs/spaced/host/client" }
+pplx-space-spaced-host-server = { path = "crates/libs/spaced/host/server" }
+pplx-space-template-mgr = { path = "crates/libs/template/mgr" }
+pplx-space-template-mgr-client = { path = "crates/libs/template/mgr-client" }
+pplx-space-template-publisher = { path = "crates/libs/template/publish" }
+pplx-space-test-env = { path = "crates/libs/test-env" }
+[profile.release]
+lto = "thin"
+strip = true
+
+# These large test binaries exceed Mach-O's 24-bit DWARF unwind offset limit
+# without optimization. Keep debug information and unwind support while
+# reducing the generated code and unwind tables.
+[profile.test.package.pplx-space-api]
+opt-level = 1
+
+[profile.test.package.pplx-space-sbx-mgr]
+opt-level = 1
+
+# Three dependencies whose test cost is the compiled work itself, not the Rust
+# around it, so the debug profile's opt-level 0 lands directly on wall time.
+#
+# `libsqlite3-sys` bundles and compiles `sqlite3.c`: every SQLite-backed test
+# in the workspace runs the amalgamation, and unoptimized it is the dominant
+# term in the SQLite-heavy suites. `bcrypt` and `blowfish` are the same shape —
+# a cost-12 hash is 4096 Blowfish key schedules, and each password-handling
+# test pays for several.
+#
+# Scoped to `test` because that is where the cost falls; the `release` profile
+# already optimizes these and `dev` builds nothing that runs them in a loop.
+[profile.test.package.libsqlite3-sys]
+opt-level = 3
+
+[profile.test.package.bcrypt]
+opt-level = 3
+
+[profile.test.package.blowfish]
+opt-level = 3
+
+[profile.dev-release]
+inherits = "release"
+lto = false
+strip = false
+debug = 1
+incremental = true
+codegen-units = 16
+
+[workspace.lints.rust]
+
+[workspace.lints.clippy]
+# Panic / latent crash footguns
+string_slice = "warn"
+indexing_slicing = "warn"
+unwrap_used = "warn"
+get_unwrap = "warn"
+unwrap_in_result = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+# Silent failure / dropped work
+let_underscore_future = "warn"
+unused_result_ok = "warn"
+assertions_on_result_states = "warn"
+
+# Async / concurrency
+await_holding_lock = "warn"
+await_holding_refcell_ref = "warn"
+
+# Unsafe hygiene
+mem_forget = "warn"
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
+
+# Numeric correctness, low-ish noise
+cast_sign_loss = "warn"
+float_cmp = "warn"
+float_cmp_const = "warn"
+lossy_float_literal = "warn"
+invalid_upcast_comparisons = "warn"
+
+# Easy correctness/debugging wins
+rc_mutex = "warn"
+debug_assert_with_mut_call = "warn"
+iter_not_returning_iterator = "warn"
+infallible_try_from = "warn"
+dbg_macro = "warn"

@@ -1,0 +1,9 @@
+apiVersion: v2
+name: netgtw-cycle-job
+description: >-
+  Per-node privileged Job for the fleet net-gateway cycle sweep. Rendered by
+  scripts/netgtw/cycle-fleet.sh via `helm template` and applied with kubectl —
+  deliberately not installed as a Helm release, so the Job's own TTL cleanup
+  leaves no release record behind.
+type: application
+version: 0.1.0

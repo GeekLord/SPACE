@@ -1,0 +1,6 @@
+apiVersion: v2
+name: space-redis-local
+description: Local single-node Redis for the KinD SPACE stack — backs the cluster-activation and per-client-concurrency rate limiters (SPACE_REDIS_URL)
+type: application
+version: 0.1.0
+appVersion: "7"

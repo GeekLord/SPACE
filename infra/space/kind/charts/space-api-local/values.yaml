@@ -1,0 +1,163 @@
+image:
+  repository: space-api
+  tag: local
+  pullPolicy: IfNotPresent
+
+datadogTeam: team-space
+
+# Telemetry defaults come from the space-kind-telemetry library.
+telemetry: {}
+
+service:
+  name: space-api
+  port: 8080
+  type: ClusterIP
+
+internal:
+  secretName: space-internal
+  internalToken: "dev-internal-token"
+  controlToken: "dev-control-token"
+  publicCursorSecret: "dev-public-cursor-secret"
+  ecwCredentialKey: "kind-local-ecw-credential-key"
+
+spaceApiRouteToken:
+  # Public RFC 8032 test-vector material, intentionally limited to the local
+  # kind harness. Shared environments source independent keys from Secrets Manager.
+  ed25519:
+    signingSecretName: space-route-signing
+    verificationSecretName: space-route-verification
+    signingKey: |-
+      -----BEGIN PRIVATE KEY-----
+      MC4CAQAwBQYDK2VwBCIEIJ1hsZ3v/VpguoRK9JLsLMREScVpezJpGXA7rAMcrn9g
+      -----END PRIVATE KEY-----
+    signingKeyId: "kind-local-route-v2-1"
+    issuer: "kind-local-route-authority"
+    verificationBundle: '{"generation":1,"issuer":"kind-local-route-authority","keys":[{"key_id":"kind-local-route-v2-1","public_key_pem":"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=\n-----END PUBLIC KEY-----\n"}]}'
+
+clusterId: "kind-local"
+
+# Migrator runs as an initContainer before the api-server starts. It reuses
+# the same image (the api bundle ships space-db-migrator + space-api-svc).
+migrate:
+  enabled: true
+
+postgres:
+  # Dev-default managed-login passwords. bootstrap-roles (initContainer)
+  # provisions the roles with these; the services connect as space_user and
+  # space_creds using the same values.
+  managedUserPassword: space-dev-user
+  managedCredentialsPassword: space-dev-creds
+  bootstrapSuperadminPassword: space-dev-superadmin
+  bootstrapReadOnlyPassword: space-dev-ro
+  bootstrapMigratorPassword: space-dev-migrator
+
+# K8s control-plane substrate. Setting SPACE_K8S_CONTROL_PLANE=true switches
+# the api-server from DirectSubstrate to KubernetesSubstrate so it discovers
+# workers via the Pod reflector (watching pods with label
+# app.kubernetes.io/component=node-api) and so cluster-controller can run
+# alongside materializing per-sandbox pods.
+#
+# Enabled by default. The space-node-stack DaemonSet
+# carries the component=node-api label so the reflector finds each worker;
+# per-sandbox pods are pause containers hijacked by containerd-shim-space-v2
+# into real Firecracker sandboxes (install-shim.sh wires the shim into each
+# sandbox worker's containerd).
+#
+# DirectSubstrate (`enabled: false`) is the single-worker / no-cluster-controller
+# bench used by the space-local-3486 cluster + Tilt MINIMAL mode. In that
+# path the api-server dials the worker node-api directly via the
+# space-worker-node-api Service, placement flows through the Postgres node
+# tables (nodes/node_direct/node_status_snapshots/node_template_inventory),
+# and no per-sandbox pods are created.
+k8s:
+  enabled: true
+  # Namespace where per-sandbox pause pods are created and where the
+  # KubernetesSubstrate's pod reflector watches.
+  sandboxNamespace: space
+  # The shim never runs the pause container; it reads pod annotations
+  # (space.pplx.net/sandbox-id, vcpu, memory, template, …) and calls
+  # sandbox-manager to bring up the real sandbox. KinD's containerd pulls
+  # this from registry.k8s.io directly (no `kind load` needed).
+  sandboxPodImage: registry.k8s.io/pause:3.10
+  # The api-server pins sandbox pods to nodes with this label value. Tilt
+  # labels the KinD workers before bringing the charts up.
+  sandboxNodeSelectorKey: node.kubernetes.io/space-enabled
+  sandboxNodeSelectorValue: "true"
+
+nodeSelector:
+  space.pplx.net/infra: "true"
+
+# ECW (E2B-compatible) host routing. The api-server only serves the ECW API for
+# requests whose Host header matches an `apiHost`, and parses data-plane sandbox
+# hosts of the form `<port>-<sandbox>.<host>`. Wired here so the typed ECW suite
+# can reach the ECW surface via Host-header overrides against the local api.
+# JSON array of
+# {apiHost, host} pairs (SPACE_ECW_HOSTS).
+ecwHosts: '[{"apiHost":"api.local.e2b.test","host":"local.e2b.test"},{"apiHost":"127.0.0.1","host":"local.e2b.test"}]'
+
+fork:
+  enabled: "true"
+
+# SPACE_DATA_PLANE_PUBLIC_URL — when empty, api-server returns RELATIVE
+# `/v1/sessions/<id>/...` URLs. The UI's Next.js rewrites in
+# ui/next.config.js then proxy those to the in-cluster data-plane Service,
+# which keeps the browser same-origin and sidesteps CORS preflight on
+# devbox-fronted UIs (the devbox gateway redirects unauthenticated
+# preflights, which preflight cannot follow).
+#
+# Override only if you have a stable, same-origin-or-CORS-friendly
+# data-plane URL the browser can hit directly.
+dataPlanePublicUrl: ""
+
+# Deploy-time masters for the two space-api guardrails whose dynamic flag the
+# `eppo` block below can only ever *close*. What they add is the ability to
+# turn a guardrail off on a bench with no flag provider.
+#
+# Empty rather than the binary's own default, and rendered either way: an
+# unrecognised value reads as "not configured", so an empty one leaves whichever
+# default the binary ships. Writing a value here would be a copy of a Rust
+# constant with nothing linking the two, and would silently override it the day
+# it changes. The client-concurrency mode accepts `off` as the hard off.
+clusterActivationAdmission:
+  enabled: ""
+clientConcurrency:
+  mode: ""
+
+eppo:
+  secretName: ""
+  secretKey: EPPO_SDK_KEY
+  sdkKey: ""
+  baseUrl: ""
+
+serviceAccount:
+  name: space-api
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+
+# BYOK: stamp volume_encryption on creates for byok_enabled orgs. On by
+# default in the bench (org enrollment still gates per-org).
+byokVolumeEncryption: "1"
+
+# Node-census residency discount. **Must equal
+# `reconcilers.nodeDrain.env.SPACE_NODE_DRAIN_NODE_CENSUS_RESIDENCY` in
+# `charts/space-cluster-controller-local/values.yaml`** — that chart turns the
+# discount ON here so the census-aware SQL runs on the bench. The resident
+# count it feeds gates `draining -> drained` in either drain mode, and
+# `local.gentle_drain_leaves_sandbox_resident` holds a node in `draining` for
+# ~20 ticks. That scenario asserts the drain, not the discount — it passes
+# either way — so what the bench buys is the query executing. The discount
+# itself is `node_drain/store/residency_tests.rs`, against real Postgres.
+#
+# On this bench api and cluster-controller are separate chart renders — via
+# `bootstrap.sh`'s `helm template | kubectl apply` or via Tilt — so one cannot
+# read the other's values the way the EKS chart has both containers render
+# from the controller's own key. Nothing in Helm can stop these two from drifting;
+# `scripts/tests/test_node_drain_activation_parity.py` is what holds them
+# equal.
+nodeCensusResidency: "true"

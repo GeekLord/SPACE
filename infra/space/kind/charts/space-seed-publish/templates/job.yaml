@@ -1,0 +1,74 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-template-publish
+  namespace: {{ .Release.Namespace }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-seed-publish
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-seed-publish
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    team: {{ .Values.datadogTeam | quote }}
+spec:
+  backoffLimit: 10
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: space-seed-publish
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      serviceAccountName: {{ .Release.Name }}-template-publish
+      restartPolicy: OnFailure
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: seed-publish
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            # Local Kind only; deployed services require authenticated internal RPC TLS.
+            - name: SPACE_INTERNAL_RPC_INSECURE_DEV
+              value: "true"
+            - name: SPACE_CLUSTER_API_TOKEN_PATH
+              value: "/var/run/space-publication/cluster-api.token"
+            - name: SPACE_INTERNAL_API_GRPC_ADDR
+              value: {{ .Values.internalApi.grpcAddr | quote }}
+            - name: SPACE_OBJECT_STORE_ENDPOINT
+              value: {{ .Values.s3.endpoint | quote }}
+            - name: SPACE_OBJECT_STORE_REGION
+              value: {{ .Values.s3.region | quote }}
+            - name: SPACE_OBJECT_STORE_BUCKET
+              value: {{ .Values.s3.bucket | quote }}
+            - name: SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.s3.credentialsSecretName }}
+                  key: SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID
+            - name: SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.s3.credentialsSecretName }}
+                  key: SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: publication-token
+              mountPath: /var/run/space-publication
+              readOnly: true
+      volumes:
+        - name: publication-token
+          projected:
+            defaultMode: 0444
+            sources:
+              - serviceAccountToken:
+                  path: cluster-api.token
+                  audience: space-cluster-api
+                  expirationSeconds: 3600

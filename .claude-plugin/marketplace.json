@@ -1,0 +1,15 @@
+{
+  "name": "pplx-space",
+  "owner": {
+    "name": "Perplexity AI"
+  },
+  "metadata": {
+    "description": "Claude Code plugins for SPACE development."
+  },
+  "plugins": [
+    {
+      "name": "pplx-space",
+      "source": "./.agents/plugins/pplx-space"
+    }
+  ]
+}

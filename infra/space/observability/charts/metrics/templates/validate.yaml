@@ -1,0 +1,8 @@
+{{- include "common.profileGuard" . }}
+{{- include "common.sharedGuards" . }}
+{{- if eq .Values.profile "shared" }}
+{{- include "common.sharedStorageGuard" (dict "storage" .Values.storage "key" "storage") }}
+{{- if .Values.collector.debug }}
+{{- fail "Diagnostic metric dumps are Kind-only" }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,2298 @@
+{
+  "uid": "space-main-health",
+  "title": "SPACE: Main Health",
+  "description": "SPACE health for a local cluster: request and create journeys, latency, state transitions, node disk, and the shim and sidecar services. Not a parity or production-readiness claim.",
+  "schemaVersion": 41,
+  "version": 1,
+  "editable": false,
+  "timezone": "browser",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "refresh": "30s",
+  "tags": [
+    "space",
+    "kind"
+  ],
+  "links": [
+    {
+      "title": "Main health",
+      "url": "/d/space-main-health",
+      "type": "link"
+    },
+    {
+      "title": "SPACE logs (optional Loki)",
+      "url": "/d/space-main-health-logs",
+      "type": "link"
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "Data availability and query semantics",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 5
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "SPACE application panels require metrics routed to the configured OTLP backend. Installing Grafana does not change producer routing.\n\n**No data does not imply healthy or zero.** Select a time range within the backend retention window. Counts use a sliding `$window` window; rates are per second and latencies remain milliseconds. Environment, cluster, service and version default to All. Optional logs open in a separate dashboard."
+      }
+    },
+    {
+      "id": 2,
+      "type": "row",
+      "title": "Local collection diagnostics",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "SPACE series seen in selected range",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 6,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Local collection diagnostic; not a source-dashboard widget.\nCounts stored series, including histogram streams, over the selected range; not a count of healthy services.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(last_over_time({__name__=~\"space_.+\",deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\"}[$__range]))",
+          "legendFormat": "series",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": false,
+          "instant": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "SPACE series received in last 2m",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 6,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Local collection diagnostic; not a source-dashboard widget.\nAt each evaluation time, counts series with a sample in the preceding two minutes. No data means no matching observations, not healthy idleness.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(last_over_time({__name__=~\"space_.+\",deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\"}[2m]))",
+          "legendFormat": "series",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": false,
+          "instant": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Collector accepted metric points / second",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 6,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Local collection diagnostic; not a source-dashboard widget.\nCollector-wide, intentionally not scoped by the SPACE filters.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(otelcol_receiver_accepted_metric_points[1m]))",
+          "legendFormat": "points/s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "row",
+      "title": "User Journeys",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 14,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Creates: attempts / $window",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 15,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Creates.\nSliding-window histogram observation count; includes pre-controller failures.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (surface,template_name) (histogram_count(increase(space_sandbox_api_latency_milliseconds{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\",op=\"create\"}[$window])))",
+          "legendFormat": "{{surface}} {{template_name}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Create Latency: p90",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 15,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Create Latency.\nAggregate histogram buckets before estimating p90. Source displays p90 only; unused p50/p99 queries were not added.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 4000
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.9, sum by (template_name) (rate(space_sandbox_api_latency_milliseconds{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\",op=\"create\",result=\"success\"}[$window])))",
+          "legendFormat": "{{template_name}} p90",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Create Error Rate %",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 15,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Create Error Rate %.\nNo Datadog fill(zero): an absent numerator or zero denominator is a gap, not proof of zero errors.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          },
+          "min": 0,
+          "max": 100
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * (sum (histogram_count(rate(space_sandbox_api_latency_milliseconds{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\",op=\"create\",result=\"error\"}[$window])))) / (sum (histogram_count(rate(space_sandbox_api_latency_milliseconds{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\",op=\"create\"}[$window]))) > 0)",
+          "legendFormat": "error %",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Reconnects: attempts / $window",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 23,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Reconnects.\nSliding-window increase; not fixed 60-second Datadog buckets.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum (increase(space_sandbox_reconnect_attempts_total{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\"}[$window]))",
+          "legendFormat": "attempts",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Reconnect Latency",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 23,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Reconnect Latency.\nWindowed native-histogram quantiles, without an additional 60s average rollup.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum (rate(space_sandbox_reconnect_duration_milliseconds{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\"}[$window])))",
+          "legendFormat": "p99",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum (rate(space_sandbox_reconnect_duration_milliseconds{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\"}[$window])))",
+          "legendFormat": "p95",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.9, sum (rate(space_sandbox_reconnect_duration_milliseconds{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\"}[$window])))",
+          "legendFormat": "p90",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        },
+        {
+          "refId": "D",
+          "expr": "histogram_quantile(0.75, sum (rate(space_sandbox_reconnect_duration_milliseconds{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\"}[$window])))",
+          "legendFormat": "p75",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        },
+        {
+          "refId": "E",
+          "expr": "histogram_quantile(0.5, sum (rate(space_sandbox_reconnect_duration_milliseconds{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\"}[$window])))",
+          "legendFormat": "p50",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Reconnect Bad Outcome Share %",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 23,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Reconnect Bad Outcome Rate %.\nEach outcome/entrypoint divided by all reconnect attempts, preserving the source's global denominator. Combine outcome selection instead of adding disjoint label sets; no autosmooth.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          },
+          "min": 0,
+          "max": 100
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * (sum by (outcome,entrypoint) (rate(space_sandbox_reconnect_attempts_total{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\",outcome=~\"exhausted|wake_failed|rejected\"}[$window]))) / scalar(sum (rate(space_sandbox_reconnect_attempts_total{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\"}[$window])) > 0)",
+          "legendFormat": "{{entrypoint}} {{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "row",
+      "title": "Top Level",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 31,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Sandbox Operation Errors / $window",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Sandbox Operation Errors.\nOperation errors may include route and step errors; not interchangeable with end-to-end HTTP errors.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (surface,reason,op) (increase(space_sandbox_api_error_total{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\"}[$window]))",
+          "legendFormat": "{{surface}} {{op}} {{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Space Guest Health",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 32,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Space Guest Health.\nAbsolute gauge count, despite Prometheus's unit-derived _ratio suffix. No weighted interpolation or zero fill; last-known values can remain up to the 5m lookback.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (deployment_environment_name,health,lifecycle) (space_sandbox_guest_health{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\"})",
+          "legendFormat": "{{deployment_environment_name}} {{health}} {{lifecycle}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Sandbox Ops: requests / second",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 32,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Sandbox Ops.\nSource table expanded into time-series panels; this is a rolling-window rate, not a whole-dashboard average.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (surface,op) (histogram_count(rate(space_sandbox_api_latency_milliseconds{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\"}[$window])))",
+          "legendFormat": "{{surface}} {{op}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Sandbox Ops: p50 latency",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Sandbox Ops.\nSource table expanded; windowed p50 is not an average of per-bucket percentiles.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (surface,op) (rate(space_sandbox_api_latency_milliseconds{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\"}[$window])))",
+          "legendFormat": "{{surface}} {{op}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Sandbox Ops: p90 latency",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 40,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Sandbox Ops.\nSource table expanded; windowed p90 is not an average of per-bucket percentiles.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.9, sum by (surface,op) (rate(space_sandbox_api_latency_milliseconds{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\"}[$window])))",
+          "legendFormat": "{{surface}} {{op}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Sandbox Ops: Error Rate %",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 40,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Sandbox Ops.\nMissing error series stays absent; no zero-fill. Denominator must be positive.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          },
+          "min": 0,
+          "max": 100
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * (sum by (surface,op) (histogram_count(rate(space_sandbox_api_latency_milliseconds{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\",result=\"error\"}[$window])))) / (sum by (surface,op) (histogram_count(rate(space_sandbox_api_latency_milliseconds{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\"}[$window]))) > 0)",
+          "legendFormat": "{{surface}} {{op}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "row",
+      "title": "Templates and Warm Pool",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 48,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 21,
+      "type": "stat",
+      "title": "Requested template tags: top 10 / selected range",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 49,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Requested template tags.\nTop ten estimated counts in the selected range. Requested tags remain product dimensions, not hard-coded customer values.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(10, sum by (template,requested_tag) (increase(space_sandbox_api_template_selector_requested_total{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\",surface=\"ecw\",op=\"create\"}[$__range])))",
+          "legendFormat": "{{template}} {{requested_tag}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": false,
+          "instant": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Sandbox Create Steps: p50 Latency",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 49,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Sandbox Create Steps - p50 Latency.\n\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (step) (rate(space_sandbox_api_step_latency_milliseconds{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\",op=\"create\"}[$window])))",
+          "legendFormat": "{{step}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Warm Pool: ready slots %",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 49,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Warm Pool .\nAbsolute gauges; no weighted interpolation. A desired count of zero yields no ratio.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          },
+          "min": 0,
+          "max": 100
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * (sum by (deployment_environment_name,template,content_hash) (space_warm_pool_slots{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\",state=\"ready\"})) / (sum by (deployment_environment_name,template,content_hash) (space_warm_pool_slots{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\",state=\"desired\"}) > 0)",
+          "legendFormat": "{{template}} {{content_hash}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Warm Pool Hit Rate %",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 57,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Warm Pool Hit / Miss.\nHit / (hit + miss), excluding errors as in source. Aggregating both outcomes in the denominator avoids adding disjoint series.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          },
+          "min": 0,
+          "max": 100
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * (sum by (template) (histogram_count(rate(space_warm_pool_acquire_duration_milliseconds{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\",outcome=\"hit\"}[$window])))) / (sum by (template) (histogram_count(rate(space_warm_pool_acquire_duration_milliseconds{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\",outcome=~\"hit|miss\"}[$window]))) > 0)",
+          "legendFormat": "{{template}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Warm Pool Promote Probe Failures %",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 57,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Promote failures.\nThe numerator's fixed outcome is dropped before dividing by content_hash; this avoids mismatched label sets.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          },
+          "min": 0,
+          "max": 100
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * (sum by (content_hash) (rate(space_warm_pool_promote_attempt_total{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\",outcome=\"probe_failed\"}[$window]))) / (sum by (content_hash) (rate(space_warm_pool_promote_attempt_total{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\"}[$window])) > 0)",
+          "legendFormat": "{{content_hash}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "type": "row",
+      "title": "Repairs and Restore",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 65,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Repairs & State Changes / $window",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 66,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Repairs & State Changes.\n\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (loop,sweep,outcome) (increase(space_cluster_reconciler_outcome_total{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\",mode!=\"dry_run\",outcome!~\"deferred|skipped|cas_lost|error\"}[$window]))",
+          "legendFormat": "{{loop}} {{sweep}} {{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 28,
+      "type": "timeseries",
+      "title": "Sandboxes Given Up / $window",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 66,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Sandboxes Given Up.\n\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome,reason) (increase(space_cluster_reconciler_outcome_total{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\",mode!=\"dry_run\",to_lifecycle=\"failed\"}[$window]))",
+          "legendFormat": "{{outcome}} {{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 29,
+      "type": "timeseries",
+      "title": "Successful Restores: cross-node share %",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 66,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Snapshot Restore % — In-Place vs Cross-Node.\nPreserves the source formula (cross-node / all successful restore flows), not a mutually exclusive count of user restores: a cross-node flow can also run an in-place load.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          },
+          "min": 0,
+          "max": 100
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * (sum (rate(space_snapshot_restore_completed_total{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\",result=\"success\",kind=\"cross_node\"}[$window]))) / (sum (rate(space_snapshot_restore_completed_total{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\",result=\"success\"}[$window])) > 0)",
+          "legendFormat": "cross-node %",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "In-Place Restore Latency",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 74,
+        "w": 8,
+        "h": 8
+      },
+      "description": "In-Place Restore Latency.\n\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum (rate(space_snapshot_restore_duration_milliseconds{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\",kind=\"in_place\"}[$window])))",
+          "legendFormat": "p50",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.9, sum (rate(space_snapshot_restore_duration_milliseconds{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\",kind=\"in_place\"}[$window])))",
+          "legendFormat": "p90",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Cross-Node Restore Latency",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 74,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Cross-Node Restore Latency.\nNo Datadog autosmooth. Includes successes and failures, matching the source filter.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum (rate(space_snapshot_restore_duration_milliseconds{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\",kind=\"cross_node\"}[$window])))",
+          "legendFormat": "p50",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.9, sum (rate(space_snapshot_restore_duration_milliseconds{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\",kind=\"cross_node\"}[$window])))",
+          "legendFormat": "p90",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.95, sum (rate(space_snapshot_restore_duration_milliseconds{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\",kind=\"cross_node\"}[$window])))",
+          "legendFormat": "p95",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 32,
+      "type": "row",
+      "title": "Builds",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 82,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Builds: completions / $window",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 83,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Builds.\n\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (result) (histogram_count(increase(space_template_build_latency_milliseconds{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\",op=\"build\"}[$window])))",
+          "legendFormat": "{{result}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 34,
+      "type": "timeseries",
+      "title": "Build Failures / $window",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 83,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Build Failures.\nSeparate source populations; do not add these series as if they were unique failed builds.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum (histogram_count(increase(space_template_build_latency_milliseconds{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\",op=\"build\",result!=\"success\"}[$window])))",
+          "legendFormat": "non-success build completions",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        },
+        {
+          "refId": "B",
+          "expr": "sum (increase(space_jobs_failed_total{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\",kind=\"template_build\",error_kind=\"permanent\"}[$window]))",
+          "legendFormat": "permanent job failures",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 35,
+      "type": "timeseries",
+      "title": "Build Latency By Template: mean",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 83,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Build Latency By Template.\nSample-weighted mean from native histogram sums/counts in the chosen window.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_avg(sum by (template) (rate(space_template_build_latency_milliseconds{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\",op=\"build\"}[$window])))",
+          "legendFormat": "{{template}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 36,
+      "type": "row",
+      "title": "Node Disk Metrics",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 91,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 37,
+      "type": "timeseries",
+      "title": "Templates",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 92,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Templates.\nPreserves source avg across reporting producers, not fleet total. Gauge silence is not zero; historical last-known values expire with lookback.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "avg (space_node_disk_templates_bytes{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\"})",
+          "legendFormat": "mean across reporting producers",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 38,
+      "type": "timeseries",
+      "title": "Snapshotted Sandboxes (suspend checkpoints)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 92,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Snapshotted Sandboxes (suspend checkpoints).\nPreserves source avg across reporting producers, not fleet total. Gauge silence is not zero; historical last-known values expire with lookback.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "avg (space_node_disk_snapshotted_sandbox_bytes{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\"})",
+          "legendFormat": "mean across reporting producers",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 39,
+      "type": "timeseries",
+      "title": "Btrfs Snapshots (rolling)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 92,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Btrfs Snapshots (rolling).\nPreserves source avg across reporting producers, not fleet total. Gauge silence is not zero; historical last-known values expire with lookback.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "avg (space_node_disk_btrfs_snapshot_bytes{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\"})",
+          "legendFormat": "mean across reporting producers",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 40,
+      "type": "timeseries",
+      "title": "Active Sandboxes",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 100,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Active Sandboxes.\nPreserves source avg across reporting producers, not fleet total. Gauge silence is not zero; historical last-known values expire with lookback.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "avg (space_node_disk_active_sandbox_bytes{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\"})",
+          "legendFormat": "mean across reporting producers",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 41,
+      "type": "timeseries",
+      "title": "Template Count",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 100,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Template Count.\nPreserves source avg across reporting producers, not fleet total. Gauge silence is not zero; historical last-known values expire with lookback.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "avg (space_node_disk_template_count{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\"})",
+          "legendFormat": "mean across reporting producers",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 42,
+      "type": "timeseries",
+      "title": "Snapshotted Sandbox Count",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 100,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Snapshotted Sandbox Count.\nPreserves source avg across reporting producers, not fleet total. Gauge silence is not zero; historical last-known values expire with lookback.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "avg (space_node_disk_snapshotted_sandbox_count{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\"})",
+          "legendFormat": "mean across reporting producers",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 43,
+      "type": "timeseries",
+      "title": "Btrfs Snapshot Count",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 108,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Btrfs Snapshot Count.\nPreserves source avg across reporting producers, not fleet total. Gauge silence is not zero; historical last-known values expire with lookback.\nMissing data is not zero. SPACE services must select OTLP and the local metrics-specific endpoint; installing this dashboard does not change routing.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false,
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "avg (space_node_disk_btrfs_snapshot_count{deployment_environment_name=~\"${environment:regex}\",cluster_id=~\"${cluster_id:regex}\",service_name=~\"${service:regex}\",service_version=~\"${version:regex}\"})",
+          "legendFormat": "mean across reporting producers",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "range": true,
+          "editorMode": "code",
+          "interval": "10s"
+        }
+      ]
+    },
+    {
+      "id": 44,
+      "type": "row",
+      "title": "Signals without a local data source",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 116,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 45,
+      "type": "text",
+      "title": "Not collected by this stack",
+      "gridPos": {
+        "x": 0,
+        "y": 117,
+        "w": 24,
+        "h": 9
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "These signals are intentionally **not replaced with invented metrics or zeros**:\n\n- **APM / `trace.*`, service summaries and daemon QPS:** need a trace backend or a reviewed span-metrics pipeline. Per-service daemon cards are consolidated into one panel here.\n- **`proc.space.*`, `system.processes.*`, Kubernetes health:** process and infrastructure integrations are not scraped by this Collector.\n- **Lifecycle census, stuck/failed counts, duplicate-session creates:** database-monitoring custom queries, not SPACE Rust OTLP metrics.\n- **Shim QPS / latency:** the Go shim metric path is not proven to feed this receiver; no guessed series are queried.\n- **Alerts / SLOs:** no paging, SLO or monitor migration.\n- **Client-side events and logs-minus-spans formulas:** out of scope; this deployment collects SPACE only, not client logs or spans.\n\nSee the companion **SPACE logs** dashboard for translated SPACE event panels."
+      }
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "environment",
+        "label": "Environment",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "space-prometheus"
+        },
+        "query": "label_values({__name__=~\"space_.+\"}, deployment_environment_name)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "cluster_id",
+        "label": "Cluster ID",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "space-prometheus"
+        },
+        "query": "label_values({__name__=~\"space_.+\"}, cluster_id)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "service",
+        "label": "Service",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "space-prometheus"
+        },
+        "query": "label_values({__name__=~\"space_.+\"}, service_name)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "version",
+        "label": "Version / run",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "space-prometheus"
+        },
+        "query": "label_values({__name__=~\"space_.+\"}, service_version)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "window",
+        "label": "Rate / count window",
+        "type": "custom",
+        "query": "1m,5m,15m",
+        "current": {
+          "text": "5m",
+          "value": "5m"
+        },
+        "options": [
+          {
+            "text": "1m",
+            "value": "1m",
+            "selected": false
+          },
+          {
+            "text": "5m",
+            "value": "5m",
+            "selected": true
+          },
+          {
+            "text": "15m",
+            "value": "15m",
+            "selected": false
+          }
+        ]
+      }
+    ]
+  }
+}

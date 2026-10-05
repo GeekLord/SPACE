@@ -1,0 +1,21 @@
+flowchart TD
+    push["push to main<br/>(main-ci.yml)"]:::gh
+    other["pull request, merge queue"]:::gh
+    manual["manual run<br/>(workflow_dispatch)"]:::gh
+    push -->|"publish: true, id-token: write<br/>and SPACE_ECR_PUSH_ROLE_ARN set"| job["artifact-ci bundle job<br/>x7 images, runner's python3,<br/>no tool installs, pinned BuildKit"]:::gh
+    other -->|"don't call artifact-ci"| no_job["no bundle build"]:::skip
+    manual -->|"no publish input"| build_only["build only,<br/>never publishes"]:::skip
+    job -->|"OIDC sub = repo:perplexityai@185426709/<br/>SPACE@1370731206:ref:refs/heads/main"| role["space-oss-image-push<br/>push-only IAM role"]:::aws
+    role --> skip{"commit tag<br/>already in ECR?"}:::logic
+    skip -->|no| buildpush["buildx build --push<br/>space/&lt;feature&gt;:&lt;sha&gt;<br/>(immutable)"]:::aws
+    skip -->|"yes (re-run): skip the build"| done["done"]:::skip
+    buildpush --> done
+    subgraph ecr["push role's own account: private ECR, no repo policy"]
+      repos["7 repos: IMMUTABLE, commit tags only<br/>keep newest 300, untagged 7 days"]:::aws
+    end
+    buildpush -.-> repos
+    classDef gh fill:#dbeafe,stroke:#1e40af,color:#111
+    classDef aws fill:#fde68a,stroke:#92400e,color:#111
+    classDef logic fill:#e9d5ff,stroke:#6b21a8,color:#111
+    classDef skip fill:#e5e7eb,stroke:#4b5563,color:#111
+    classDef fail fill:#fecaca,stroke:#991b1b,color:#111

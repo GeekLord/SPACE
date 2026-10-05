@@ -1,0 +1,19 @@
+# GLOBAL: This .dockerignore applies to ALL Docker builds using the repo root as
+# context. Currently only SPACE bundle images use root-context builds.
+# If you add a Dockerfile that needs .git/, target/, or other excluded paths,
+# use a subdirectory context or a per-build .dockerignore instead.
+#
+# Exclude generated artifacts that make the context unnecessarily large.
+.git
+.sl
+target
+ui/.next
+ui/node_modules
+infra/space/packer/utm/output
+infra/space/packer/utm/output-*
+infra/space/packer/aws/output
+infra/space/packer/aws/output-*
+**/*.qcow2
+**/*.raw
+**/efivars.fd
+**/.DS_Store

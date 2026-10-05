@@ -1,0 +1,95 @@
+syntax = "proto3";
+package space.net.policy.v1;
+
+option go_package = "github.com/perplexityai/SPACE/shim/proto/net/policy/v1;policyv1";
+
+enum EgressDefaultAction {
+  EGRESS_DEFAULT_ACTION_UNSPECIFIED = 0;
+  EGRESS_DEFAULT_ACTION_ALLOW = 1;
+  EGRESS_DEFAULT_ACTION_DENY = 2;
+}
+
+enum NetworkPolicyVersion {
+  NETWORK_POLICY_VERSION_UNSPECIFIED = 0;
+  NETWORK_POLICY_VERSION_V1 = 1;
+}
+
+enum NetworkPolicySource {
+  NETWORK_POLICY_SOURCE_UNSPECIFIED = 0;
+  NETWORK_POLICY_SOURCE_TEMPLATE = 1;
+  NETWORK_POLICY_SOURCE_OVERRIDE = 2;
+}
+
+enum PolicyAuthority {
+  POLICY_AUTHORITY_UNSPECIFIED = 0;
+  POLICY_AUTHORITY_CLUSTER = 1;
+  POLICY_AUTHORITY_LOCAL = 2;
+}
+
+enum NetworkPolicyApplyDecision {
+  NETWORK_POLICY_APPLY_DECISION_UNSPECIFIED = 0;
+  NETWORK_POLICY_APPLY_DECISION_SKIP = 1;
+  NETWORK_POLICY_APPLY_DECISION_APPLY = 2;
+  NETWORK_POLICY_APPLY_DECISION_REPAIR = 3;
+  NETWORK_POLICY_APPLY_DECISION_CONFLICT = 4;
+}
+
+enum TlsInterception {
+  TLS_INTERCEPTION_UNSPECIFIED = 0;
+  TLS_INTERCEPTION_OFF = 1;
+  TLS_INTERCEPTION_ON = 2;
+}
+
+message NetworkPolicyV1 {
+  NetworkPolicyVersion version = 1;
+  EgressDefaultAction egress_default_action = 2;
+  repeated EgressDestinationV1 allow = 3;
+  repeated EgressDestinationV1 deny = 4;
+  TlsInterception tls_interception = 5;
+  // Reference-only credential intent. Resolved secret values are never part
+  // of network policy and are delivered to a capable gateway separately.
+  repeated NetworkCredentialRuleV1 network_credential_rules = 6;
+  // Skip TLS termination after egress admission; this grants no network access.
+  repeated EgressDestinationV1 tls_interception_exemptions = 7;
+}
+
+message NetworkCredentialRuleV1 {
+  // Caller-chosen key, unique within this policy.
+  string rule_id = 1;
+  NetworkCredentialDestinationV1 destination = 2;
+  // Binding order is semantically irrelevant. Readers canonicalize by header
+  // name after validating each opaque credential-reference UUID.
+  repeated CredentialHeaderBindingV1 credential_header_bindings = 3;
+  // Admission requires a non-empty, duplicate-free set. Version one supports
+  // only GET and POST; every other method fails closed.
+  repeated NetworkCredentialHttpMethodV1 supported_http_methods = 4;
+}
+
+message CredentialHeaderBindingV1 {
+  string header_name = 1;
+  string credential_reference_id = 2;
+}
+
+enum NetworkCredentialHttpMethodV1 {
+  NETWORK_CREDENTIAL_HTTP_METHOD_V1_UNSPECIFIED = 0;
+  NETWORK_CREDENTIAL_HTTP_METHOD_V1_GET = 1;
+  NETWORK_CREDENTIAL_HTTP_METHOD_V1_POST = 2;
+}
+
+message NetworkCredentialDestinationV1 {
+  string exact_host = 1;
+  // Omitted means HTTPS port 443. It is not a wildcard.
+  optional uint32 port = 2;
+  // Omitted matches all safe request paths. A prefix is segment-aware: /v1
+  // matches /v1 and /v1/..., but not /v10. Query strings are not considered.
+  optional string path_prefix = 3;
+}
+
+message EgressDestinationV1 {
+  oneof destination {
+    string ip = 1;
+    string cidr = 2;
+    string domain = 3;
+    string wildcard_domain = 4;
+  }
+}

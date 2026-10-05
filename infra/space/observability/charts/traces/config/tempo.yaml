@@ -1,0 +1,43 @@
+stream_over_http_enabled: true
+server:
+  http_listen_port: 3200
+  http_server_read_timeout: 15s
+  http_server_write_timeout: 30s
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
+live_store:
+  wal:
+    path: /var/tempo/live-store/traces
+backend_scheduler:
+  provider:
+    retention:
+      interval: 5m
+    compaction:
+      compaction:
+        block_retention: {{ .Values.tempo.blockRetention }}
+backend_worker:
+  compaction:
+    block_retention: {{ .Values.tempo.blockRetention }}
+overrides:
+  defaults:
+    ingestion:
+      rate_limit_bytes: 2097152
+      burst_size_bytes: 4194304
+      max_traces_per_user: 1000
+    global:
+      max_bytes_per_trace: 1048576
+    read:
+      max_search_duration: {{ .Values.tempo.maxSearchDuration }}
+usage_report:
+  reporting_enabled: false

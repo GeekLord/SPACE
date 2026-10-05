@@ -1,0 +1,29 @@
+[package]
+name = "pplx-space-public-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pplx-space-common-core = { workspace = true }
+pplx-space-net-common = { workspace = true }
+regex = { workspace = true, optional = true }
+schemars = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"], optional = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true, features = ["serde-human-readable"] }
+uuid = { workspace = true, features = ["v7"] }
+
+[dev-dependencies]
+
+[features]
+default = []
+schema = ["dep:regex", "dep:schemars", "serde"]
+serde = ["dep:serde", "pplx-space-common-core/serde", "pplx-space-net-common/serde"]

@@ -1,0 +1,18 @@
+name = "Policy revocation closes active inspected connections"
+
+[[steps]]
+policy = { default = "deny", tls_interception = "on", allow = ["198.18.53.53", "allowed.127-0-0-1.dev"] }
+probes = [
+  { kind = "dns-udp", target = "198.18.53.53", host = "allowed.127-0-0-1.dev", expect = "answer" },
+  { kind = "tls", host = "allowed.127-0-0-1.dev", session = "http1", expect = "allow" },
+  { kind = "http2", host = "allowed.127-0-0-1.dev", session = "http2", expect = "allow" },
+  { kind = "wss", host = "allowed.127-0-0-1.dev", session = "websocket", expect = "allow" },
+]
+
+[[steps]]
+policy = { default = "deny", tls_interception = "on" }
+probes = [
+  { kind = "tls", host = "allowed.127-0-0-1.dev", session = "http1", connection = "existing", expect = "deny" },
+  { kind = "http2", host = "allowed.127-0-0-1.dev", session = "http2", connection = "existing", expect = "deny" },
+  { kind = "wss", host = "allowed.127-0-0-1.dev", session = "websocket", connection = "existing", expect = "deny" },
+]

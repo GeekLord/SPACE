@@ -1,0 +1,91 @@
+# Route every Agent component that the local chart enables to the in-cluster
+# test backend. This mirrors Datadog's own E2E Fake Intake configuration; keep
+# the endpoint list together so adding an Agent component cannot accidentally
+# send one telemetry product to SaaS while the others remain local.
+fakeintake:
+  enabled: true
+
+datadog:
+  datadog:
+    apiKeyExistingSecret: datadog-fakeintake-key
+    # Fail closed if a future Agent component adds an intake that is missing
+    # from the explicit overrides below. `.invalid` is reserved for exactly
+    # this kind of non-routable name and cannot resolve to Datadog SaaS.
+    site: local.invalid
+    env:
+      - name: DD_HOSTNAME
+        valueFrom:
+          fieldRef:
+            fieldPath: spec.nodeName
+      - name: DD_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_PROCESS_CONFIG_PROCESS_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_APM_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_LOGS_CONFIG_LOGS_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_AGENT_TELEMETRY_LOGS_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_ORCHESTRATOR_EXPLORER_ORCHESTRATOR_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_CONTAINER_IMAGE_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_CONTAINER_LIFECYCLE_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_DATA_STREAMS_FORWARDER_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_LOGS_CONFIG_USE_HTTP
+        value: "true"
+      - name: DD_SKIP_SSL_VALIDATION
+        value: "true"
+
+  clusterAgent:
+    env:
+      - name: DD_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_PROCESS_CONFIG_PROCESS_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_APM_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_LOGS_CONFIG_LOGS_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_AGENT_TELEMETRY_LOGS_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_ORCHESTRATOR_EXPLORER_ORCHESTRATOR_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_CONTAINER_IMAGE_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_CONTAINER_LIFECYCLE_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_DATA_STREAMS_FORWARDER_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_LOGS_CONFIG_USE_HTTP
+        value: "true"
+      - name: DD_SKIP_SSL_VALIDATION
+        value: "true"
+
+  clusterChecksRunner:
+    env:
+      - name: DD_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_PROCESS_CONFIG_PROCESS_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_APM_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_LOGS_CONFIG_LOGS_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_AGENT_TELEMETRY_LOGS_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_ORCHESTRATOR_EXPLORER_ORCHESTRATOR_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_CONTAINER_IMAGE_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_CONTAINER_LIFECYCLE_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_DATA_STREAMS_FORWARDER_DD_URL
+        value: http://datadog-fakeintake.kube-system.svc.cluster.local
+      - name: DD_LOGS_CONFIG_USE_HTTP
+        value: "true"
+      - name: DD_SKIP_SSL_VALIDATION
+        value: "true"

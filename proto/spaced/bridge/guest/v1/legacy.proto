@@ -1,0 +1,33 @@
+syntax = "proto3";
+package space.spaced.bridge.guest.v1;
+
+import "google/protobuf/timestamp.proto";
+import "spaced/operations/v1/operations.proto";
+
+// SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_0_1_4: remove host decoding after all
+// running/launchable/restorable guests support StatInfo/ListInfo. Remove these
+// definitions and guest legacy endpoints only when MIN_HOST is also 0.1.4.
+// Keep the field numbers and existing guest Stat/List paths unchanged until then.
+message LegacyStatResponse {
+  option deprecated = true;
+  space.spaced.operations.v1.FileType file_type = 1;
+  uint64 size_bytes = 2;
+  uint32 mode = 3;
+  optional google.protobuf.Timestamp modified_at = 4;
+  uint32 owner_uid = 5;
+  uint32 owner_gid = 6;
+  optional string symlink_target = 7;
+}
+
+message LegacyDirEntry {
+  option deprecated = true;
+  string name = 1;
+  string path = 2;
+  space.spaced.operations.v1.FileType file_type = 3;
+  uint64 size_bytes = 4;
+  uint32 mode = 5;
+  optional google.protobuf.Timestamp modified_at = 6;
+  uint32 owner_uid = 7;
+  uint32 owner_gid = 8;
+  optional string symlink_target = 9;
+}

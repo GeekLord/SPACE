@@ -1,0 +1,25 @@
+#!/bin/bash
+set -euxo pipefail
+
+${space_cache_nvme_mount}
+
+cat > /etc/eks/nodeadm.yaml <<'NODEADM'
+apiVersion: node.eks.aws/v1alpha1
+kind: NodeConfig
+spec:
+  cluster:
+    name: ${cluster_name}
+    apiServerEndpoint: ${cluster_endpoint}
+    certificateAuthority: ${cluster_ca_data}
+    cidr: ${cluster_service_cidr}
+  kubelet:
+    flags:
+      - --fail-swap-on=false
+    config:
+      # Disable kubelet's 5/s event rate limit. space-api consumes pod
+      # events for shim/scheduling failure detection; throttled events
+      # silently drop those signals. Events TTL ~1h so etcd stays bounded.
+      eventRecordQPS: 0
+NODEADM
+
+nodeadm init --config-source file:///etc/eks/nodeadm.yaml

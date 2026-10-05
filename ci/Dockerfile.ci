@@ -1,0 +1,193 @@
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+
+FROM public.ecr.aws/docker/library/rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922
+
+ARG CARGO_DENY_VERSION=0.20.2
+ARG CARGO_DENY_X86_64_SHA256=9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+ARG CARGO_NEXTEST_VERSION=0.9.133
+ARG CARGO_NEXTEST_X86_64_SHA256=a9f992321e8759818400d93abb9477b4b11422d18d216e8d208505bd73454103
+ARG CARGO_VET_VERSION=0.10.2
+ARG DEBIAN_SNAPSHOT=20260803T000000Z
+ARG DOCKER_BUILDX_VERSION=v0.30.1
+ARG DOCKER_BUILDX_X86_64_SHA256=c37114fcd034025ec68e224657c8a5a850df472ded3ddcbca75ad3a7ebb9710d
+ARG GO_VERSION=1.25.0
+ARG GO_X86_64_SHA256=2852af0cb20a13139b3448992e69b868e50ed0f8a1e5940ee1de9e19a123b613
+ARG HELM_VERSION=v3.18.0
+ARG HELM_X86_64_SHA256=961e587fc2c03807f8a99ac25ef063fa9e6915f1894729399cbb95d2a79af931
+ARG PROTOC_VERSION=35.0
+ARG PROTOC_X86_64_SHA256=a45cda0989c17dd950db55f6fbe1e5814c50fda08e87aa422980ac1f89dddbbc
+ARG PROTOC_GEN_GO_VERSION=v1.36.11
+ARG PROTOC_GEN_GO_GRPC_VERSION=v1.6.1
+ARG SCCACHE_VERSION=0.16.0
+ARG SCCACHE_X86_64_SHA256=aec995a83ad3dff3d14b6314e08858b7b73d35ca85a5bcf3d3a9ec07dee35588
+ARG UV_VERSION=0.12.18
+ARG UV_X86_64_SHA256=89eadd7c76fc063887959510d5ba0ab1264dfd5f1143b925ddb73021a40acf16
+ARG WILD_VERSION=0.9.0
+ARG WILD_X86_64_SHA256=deb6ee0e5caec798053ec4aafaba042e20a8edf91f08cb4d36268571cc628d3b
+
+RUN sed -i \
+      -e "s|http://deb.debian.org/debian$|https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}|" \
+      -e "s|http://deb.debian.org/debian-security$|https://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}|" \
+      /etc/apt/sources.list.d/debian.sources \
+    && apt-get -o Acquire::Check-Valid-Until=false update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      docker.io \
+      gettext-base \
+      gcc \
+      gnupg \
+      iproute2 \
+      jq \
+      libc6-dev \
+      make \
+      mold \
+      mount \
+      musl-tools \
+      nftables \
+      openssl \
+      procps \
+      python3 \
+      squashfs-tools \
+      awscli \
+      unzip \
+      util-linux \
+      zip \
+      zstd \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /space
+
+ENV PATH="/usr/local/go/bin:${PATH}"
+
+RUN set -eux; \
+    curl -fsSL --retry 5 --retry-all-errors "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
+      -o /tmp/go.tar.gz; \
+    printf '%s  %s\n' "${GO_X86_64_SHA256}" /tmp/go.tar.gz | sha256sum -c -; \
+    tar -xzf /tmp/go.tar.gz -C /usr/local; \
+    rm -f /tmp/go.tar.gz; \
+    GOBIN=/usr/local/bin go install \
+      "google.golang.org/protobuf/cmd/protoc-gen-go@${PROTOC_GEN_GO_VERSION}"; \
+    GOBIN=/usr/local/bin go install \
+      "google.golang.org/grpc/cmd/protoc-gen-go-grpc@${PROTOC_GEN_GO_GRPC_VERSION}"
+
+RUN set -eux; \
+    install -d /usr/local/lib/docker/cli-plugins; \
+    curl -fsSL --retry 5 --retry-all-errors \
+      "https://github.com/docker/buildx/releases/download/${DOCKER_BUILDX_VERSION}/buildx-${DOCKER_BUILDX_VERSION}.linux-amd64" \
+      -o /usr/local/lib/docker/cli-plugins/docker-buildx; \
+    printf '%s  %s\n' "${DOCKER_BUILDX_X86_64_SHA256}" /usr/local/lib/docker/cli-plugins/docker-buildx \
+      | sha256sum -c -; \
+    chmod 0755 /usr/local/lib/docker/cli-plugins/docker-buildx
+
+RUN set -eux; \
+    curl -fsSL --retry 5 --retry-all-errors \
+      "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
+      -o /tmp/helm.tar.gz; \
+    printf '%s  %s\n' "${HELM_X86_64_SHA256}" /tmp/helm.tar.gz | sha256sum -c -; \
+    tar -xzf /tmp/helm.tar.gz -C /tmp; \
+    install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm; \
+    rm -rf /tmp/helm.tar.gz /tmp/linux-amd64
+
+RUN set -eux; \
+    curl -fsSL --retry 5 --retry-all-errors \
+      "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" \
+      -o /tmp/protoc.zip; \
+    printf '%s  %s\n' "${PROTOC_X86_64_SHA256}" /tmp/protoc.zip | sha256sum -c -; \
+    unzip -q /tmp/protoc.zip -d /tmp/protoc; \
+    install -m 0755 /tmp/protoc/bin/protoc /usr/local/bin/protoc; \
+    cp -R /tmp/protoc/include/. /usr/local/include/; \
+    rm -rf /tmp/protoc /tmp/protoc.zip
+
+RUN set -eux; \
+    package="sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl"; \
+    curl -fsSL --retry 5 --retry-all-errors \
+      "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/${package}.tar.gz" \
+      -o /tmp/sccache.tar.gz; \
+    printf '%s  %s\n' "${SCCACHE_X86_64_SHA256}" /tmp/sccache.tar.gz | sha256sum -c -; \
+    tar -xzf /tmp/sccache.tar.gz -C /tmp; \
+    install -m 0755 "/tmp/${package}/sccache" /usr/local/bin/sccache; \
+    rm -rf /tmp/sccache.tar.gz "/tmp/${package}"
+
+RUN set -eux; \
+    package="wild-linker-${WILD_VERSION}-x86_64-unknown-linux-gnu"; \
+    curl -fsSL --retry 5 --retry-all-errors \
+      "https://github.com/wild-linker/wild/releases/download/${WILD_VERSION}/${package}.tar.gz" \
+      -o /tmp/wild.tar.gz; \
+    printf '%s  %s\n' "${WILD_X86_64_SHA256}" /tmp/wild.tar.gz | sha256sum -c -; \
+    tar -xzf /tmp/wild.tar.gz -C /tmp; \
+    install -m 0755 "/tmp/${package}/wild" /usr/local/bin/wild; \
+    rm -rf /tmp/wild.tar.gz "/tmp/${package}"
+
+# Install the toolchain rust-toolchain.toml pins, with its components and
+# targets, as the default, so jobs never download it at startup. Keep the base
+# image on the same release: a different one still works, but its toolchain
+# stays in the lower layer and every job pulls both. Register everything
+# through rustup. Copying files directly into the sysroot leaves rustup unaware
+# of them, so rust-toolchain.toml triggers a reinstall that collides with the
+# existing binaries at job startup.
+COPY rust-toolchain.toml /tmp/space-toolchain/rust-toolchain.toml
+RUN set -eux; \
+    cd /tmp/space-toolchain; \
+    rustup toolchain install --no-self-update; \
+    toolchain="$(rustup show active-toolchain | cut -d' ' -f1)"; \
+    rustup default "${toolchain}"; \
+    base="${RUST_VERSION}-x86_64-unknown-linux-gnu"; \
+    if [ "${toolchain}" != "${base}" ]; then rustup toolchain uninstall "${base}"; fi; \
+    cd /; \
+    rm -rf /tmp/space-toolchain
+
+RUN set -eux; \
+    curl -fsSL --retry 5 --retry-all-errors \
+      "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${CARGO_NEXTEST_VERSION}/cargo-nextest-${CARGO_NEXTEST_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+      -o /tmp/cargo-nextest.tar.gz; \
+    printf '%s  %s\n' "${CARGO_NEXTEST_X86_64_SHA256}" /tmp/cargo-nextest.tar.gz \
+      | sha256sum -c -; \
+    tar -xzf /tmp/cargo-nextest.tar.gz -C /usr/local/cargo/bin cargo-nextest; \
+    rm -f /tmp/cargo-nextest.tar.gz
+
+RUN set -eux; \
+    package="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl"; \
+    curl -fsSL --retry 5 --retry-all-errors \
+      "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${package}.tar.gz" \
+      -o /tmp/cargo-deny.tar.gz; \
+    printf '%s  %s\n' "${CARGO_DENY_X86_64_SHA256}" /tmp/cargo-deny.tar.gz | sha256sum -c -; \
+    tar -xzf /tmp/cargo-deny.tar.gz -C /tmp; \
+    install -m 0755 "/tmp/${package}/cargo-deny" /usr/local/cargo/bin/cargo-deny; \
+    rm -rf /tmp/cargo-deny.tar.gz "/tmp/${package}"
+
+# cargo-vet publishes no release binary for this version, so build it from its
+# locked crates.io source, as the dependency-check job did on every run.
+RUN cargo install --locked --version "${CARGO_VET_VERSION}" cargo-vet \
+    && rm -rf /usr/local/cargo/registry
+
+RUN set -eux; \
+    package="uv-x86_64-unknown-linux-gnu"; \
+    curl -fsSL --retry 5 --retry-all-errors \
+      "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${package}.tar.gz" \
+      -o /tmp/uv.tar.gz; \
+    printf '%s  %s\n' "${UV_X86_64_SHA256}" /tmp/uv.tar.gz | sha256sum -c -; \
+    tar -xzf /tmp/uv.tar.gz -C /tmp; \
+    install -m 0755 "/tmp/${package}/uv" "/tmp/${package}/uvx" /usr/local/bin/; \
+    rm -rf /tmp/uv.tar.gz "/tmp/${package}"
+
+RUN cargo nextest --version \
+    && cargo deny --version \
+    && cargo vet --version \
+    && cargo clippy --version \
+    && cargo fmt --version \
+    && aws --version \
+    && docker --version \
+    && docker buildx version \
+    && go version \
+    && helm version --short \
+    && jq --version \
+    && protoc --version \
+    && protoc-gen-go --version \
+    && protoc-gen-go-grpc --version \
+    && sccache --version \
+    && uv --version \
+    && wild --version \
+    && zstd --version \
+    && rustup component list --installed | grep -Fx clippy-x86_64-unknown-linux-gnu \
+    && rustup component list --installed | grep -Fx rustfmt-x86_64-unknown-linux-gnu \
+    && rustup target list --installed | grep -Fx aarch64-unknown-linux-musl

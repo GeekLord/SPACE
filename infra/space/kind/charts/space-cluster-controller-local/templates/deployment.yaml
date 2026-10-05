@@ -1,0 +1,227 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-cluster-controller
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-cluster-controller
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    team: {{ .Values.datadogTeam | quote }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    {{- if gt (int .Values.replicaCount) 1 }}
+    # Multi-replica needs a rolling update with the readiness gate doing the
+    # work: Recreate would tear both replicas down at once, which is the one
+    # window in which no reconciler runs at all.
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+    {{- else }}
+    type: Recreate
+    {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: space-cluster-controller
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      annotations:
+        ad.datadoghq.com/tags: '{"team":"{{ .Values.datadogTeam }}"}'
+      labels:
+        app.kubernetes.io/name: space-cluster-controller
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        team: {{ .Values.datadogTeam | quote }}
+    spec:
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: cluster-controller
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/space/bin/space-cluster-controller"]
+          env:
+            # Local Kind only; deployed services require authenticated internal RPC TLS.
+            - name: SPACE_INTERNAL_RPC_INSECURE_DEV
+              value: "true"
+            - name: SPACE_CLUSTER_API_TOKEN_PATH
+              value: "/var/run/space-publication/cluster-api.token"
+            # Datadog tracing — see datadog-agent-local chart. DD_AGENT_HOST
+            # routes to the node-local agent; absent the agent the tracer
+            # drops spans silently.
+            - name: SPACE_CLUSTER_ID
+              value: {{ .Values.clusterId | quote }}
+            {{- include "space-kind-telemetry.env" . | nindent 12 }}
+            - name: SPACE_K8S_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: SPACE_K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POSTGRES_CONNECTION_STRING
+              valueFrom:
+                secretKeyRef:
+                  name: space-postgres
+                  key: POSTGRES_CONNECTION_STRING
+            - name: SPACE_DB_USER_PASSWORD
+              value: {{ .Values.postgres.managedUserPassword | quote }}
+            - name: SPACE_DB_CREDS_PASSWORD
+              value: {{ .Values.postgres.managedCredentialsPassword | quote }}
+            # The public-operation dispatcher executes sandbox creates in this
+            # process, so the create-time volume_encryption stamp reads the
+            # BYOK switch here too (same value as the api chart).
+            - name: SPACE_BYOK_VOLUME_ENCRYPTION
+              value: {{ .Values.byokVolumeEncryption | quote }}
+            - name: SPACE_SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_SECS
+              value: {{ .Values.reconcilers.snapshotRetentionSweeper.minAgeSeconds | quote }}
+            - name: SPACE_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.internal.secretName }}
+                  key: SPACE_INTERNAL_TOKEN
+            - name: SPACE_INTERNAL_CONTROL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.internal.secretName }}
+                  key: SPACE_INTERNAL_CONTROL_TOKEN
+            # From the route-signing Secret, not `internal.secretName`: the
+            # api-local chart writes this material to its own Secret and never
+            # into `space-internal`, so reading it from there left the process
+            # exiting at startup with "route token signing configuration is
+            # missing". Matches how space-api-local and space-internal-api-local
+            # read the same three values; the key is mounted as a file below.
+            - name: SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH
+              value: /var/run/space-route-signing/signing-key.pem
+            - name: SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.spaceApiRouteToken.ed25519.signingSecretName }}
+                  key: {{ .Values.spaceApiRouteToken.ed25519.signingKeyId }}
+            - name: SPACE_API_ROUTE_ED25519_ISSUER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.spaceApiRouteToken.ed25519.signingSecretName }}
+                  key: {{ .Values.spaceApiRouteToken.ed25519.issuer }}
+            # Fork operations execute here, so ECW response credentials must
+            # use the same keyring and mint format as the API that serves them.
+            - name: SPACE_ECW_CREDENTIAL_KEY_PATH
+              value: /var/run/space-ecw-credential/ecw-credential-key
+            - name: SPACE_SNAPSHOT_BUCKET
+              value: {{ .Values.snapshotBucket | quote }}
+            - name: SPACE_SNAPSHOT_REGION
+              value: {{ .Values.snapshotRegion | quote }}
+            - name: AWS_REGION
+              value: {{ .Values.snapshotRegion | quote }}
+            - name: AWS_DEFAULT_REGION
+              value: {{ .Values.snapshotRegion | quote }}
+            - name: SPACE_SNAPSHOT_ENDPOINT
+              value: {{ .Values.snapshotEndpoint | quote }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.snapshotCredentialsSecretName }}
+                  key: SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.snapshotCredentialsSecretName }}
+                  key: SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY
+            # Cluster-controller bails at startup unless SubstrateAdapter resolves
+            # to KubernetesSubstrate, hence the K8s env block must match the
+            # api-server's exactly. The reconcilers themselves are agnostic to
+            # whether the node-api behind WorkerApi is the simulator or prod.
+            - name: SPACE_K8S_CONTROL_PLANE
+              value: "true"
+            # Namespace of the coordination.k8s.io Lease used for leader
+            # election (this pod's own namespace, where its lease RBAC is
+            # granted). Single-replica here, but the lease path still runs.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: SPACE_SANDBOX_NAMESPACE
+              value: {{ .Values.k8s.sandboxNamespace | quote }}
+            - name: SPACE_SANDBOX_POD_IMAGE
+              value: {{ .Values.k8s.sandboxPodImage | quote }}
+            - name: SPACE_SANDBOX_NODE_SELECTOR_KEY
+              value: {{ .Values.k8s.sandboxNodeSelectorKey | quote }}
+            - name: SPACE_SANDBOX_NODE_SELECTOR_VALUE
+              value: {{ .Values.k8s.sandboxNodeSelectorValue | quote }}
+            - name: SPACE_INTERNAL_SECRET_NAME
+              value: {{ .Values.internal.secretName | quote }}
+            # The cluster activation limiter's env master. This process runs
+            # the public-operation dispatcher, which builds its own
+            # ClusterSandboxAdmissionConfig::from_env(), so a bench that turns
+            # the guardrail off in space-api-local has to turn it off here too
+            # or this copy goes on shedding the queued creates that the switch
+            # was flipped to let through. Must
+            # equal `clusterActivationAdmission.enabled` in that chart; the AWS
+            # `space` chart renders one value into both deployments from
+            # `api.clusterActivationAdmission.enabled`.
+            - name: SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED
+              value: {{ .Values.clusterActivationAdmission.enabled | quote }}
+            {{- range $name, $reconciler := .Values.reconcilers }}
+            {{- range $key, $value := (default (dict) $reconciler.env) }}
+            {{- if ne $key "SPACE_SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_SECS" }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+          # Ready once the process has reached the Lease (won it, or been validly
+          # denied by a peer), which it signals by touching this file.
+          #
+          # Do not add a `livenessProbe` on this marker: the marker clears on the
+          # first failed lease call, so a probe would restart the pod on every
+          # transient blip. Liveness for the lease path is decided in-process.
+          readinessProbe:
+            exec:
+              command: ["test", "-f", "/tmp/space-cluster-controller-ready"]
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: publication-token
+              mountPath: /var/run/space-publication
+              readOnly: true
+            - name: route-signing
+              mountPath: /var/run/space-route-signing
+              readOnly: true
+            - name: ecw-credential
+              mountPath: /var/run/space-ecw-credential
+              readOnly: true
+      volumes:
+        - name: publication-token
+          projected:
+            defaultMode: 0444
+            sources:
+              - serviceAccountToken:
+                  path: cluster-api.token
+                  audience: space-cluster-api
+                  expirationSeconds: 3600
+        - name: route-signing
+          secret:
+            secretName: {{ .Values.spaceApiRouteToken.ed25519.signingSecretName }}
+            defaultMode: 0444
+            items:
+              - key: {{ .Values.spaceApiRouteToken.ed25519.signingKey }}
+                path: signing-key.pem
+        - name: ecw-credential
+          secret:
+            secretName: {{ .Values.internal.secretName }}
+            defaultMode: 0444
+            items:
+              - key: ecw-credential-key
+                path: ecw-credential-key

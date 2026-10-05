@@ -1,0 +1,5 @@
+apiVersion: v2
+name: common
+description: Shared contract for the opt-in SPACE observability charts
+type: library
+version: 0.1.0

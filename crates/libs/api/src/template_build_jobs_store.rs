@@ -1,0 +1,245 @@
+use std::str::FromStr;
+
+use pplx_space_common_core::{
+    sql,
+    types::{BuildRunId, BuildRunIdParseError, NodeId, OrgId, TemplateName},
+};
+use sqlx::PgPool;
+
+#[derive(Clone)]
+pub struct TemplateBuildJobsStore {
+    pool: PgPool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BuildJob {
+    pub daemon_job_id: BuildRunId,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct BuildSpec {
+    pub tags: Vec<String>,
+    pub cpu_count: Option<u32>,
+    pub memory_mb: Option<u32>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TemplateBuildJobsStoreError {
+    #[error("template build job storage failed: {0}")]
+    Storage(#[from] sqlx::Error),
+    #[error("stored template build job has an invalid daemon job ID: {0}")]
+    InvalidDaemonJobId(#[from] BuildRunIdParseError),
+    #[error("template build inputs belong to another organization")]
+    OwnershipConflict,
+}
+
+impl TemplateBuildJobsStoreError {
+    /// The wrapped `sqlx::Error`, when this is a storage failure rather than a
+    /// malformed stored row.
+    ///
+    /// Lives here rather than in each surface's error mapper so the variant
+    /// list is written once. Two surfaces classify this enum for contention
+    /// (the controller boundary and the ECW template-build handlers) and a
+    /// third variant that wrapped a `sqlx::Error` would otherwise have to be
+    /// remembered in both — a miss there fails open, reporting a lost lock
+    /// race as permanent.
+    pub(crate) fn as_sql(&self) -> Option<&sqlx::Error> {
+        match self {
+            Self::Storage(error) => Some(error),
+            Self::InvalidDaemonJobId(_) | Self::OwnershipConflict => None,
+        }
+    }
+}
+
+impl TemplateBuildJobsStore {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    pub(crate) async fn template_owner_matches(
+        &self,
+        template_name: &TemplateName,
+        org_id: OrgId,
+    ) -> Result<bool, sqlx::Error> {
+        template_build_owner_matches(&self.pool, template_name, org_id).await
+    }
+
+    pub(crate) async fn record_accepted_build(
+        &self,
+        org_id: OrgId,
+        template_name: &TemplateName,
+        client_build_id: Option<&str>,
+        daemon_job_id: BuildRunId,
+        builder_node_id: Option<NodeId>,
+    ) -> Result<(), TemplateBuildJobsStoreError> {
+        if !template_build_owner_matches(&self.pool, template_name, org_id).await? {
+            return Err(TemplateBuildJobsStoreError::OwnershipConflict);
+        }
+        let daemon_job_id_text = daemon_job_id.to_string();
+        let build_id = client_build_id.unwrap_or(&daemon_job_id_text);
+
+        let result = sqlx::query(sql!(
+            "INSERT INTO template_build_jobs (
+                 template_id,
+                 build_id,
+                 daemon_job_id,
+                 builder_node_id,
+                 org_id
+             )
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (template_id, build_id) DO UPDATE
+             SET daemon_job_id = EXCLUDED.daemon_job_id,
+                 builder_node_id = EXCLUDED.builder_node_id
+             WHERE template_build_jobs.org_id IS NULL OR template_build_jobs.org_id = EXCLUDED.org_id"
+        ))
+        .bind(template_name.as_str())
+        .bind(build_id)
+        .bind(&daemon_job_id_text)
+        .bind(builder_node_id.map(NodeId::as_uuid))
+        .bind(org_id.as_uuid())
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(TemplateBuildJobsStoreError::OwnershipConflict);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn lookup_build(
+        &self,
+        org_id: OrgId,
+        template_name: &TemplateName,
+        build_id: &str,
+    ) -> Result<Option<BuildJob>, TemplateBuildJobsStoreError> {
+        if !template_build_owner_matches(&self.pool, template_name, org_id).await? {
+            return Ok(None);
+        }
+        let daemon_job_id = sqlx::query_scalar::<_, String>(sql!(
+            "SELECT daemon_job_id
+             FROM template_build_jobs
+             WHERE template_id = $1
+               AND build_id = $2
+               AND (org_id = $3 OR org_id IS NULL)
+               AND daemon_job_id IS NOT NULL"
+        ))
+        .bind(template_name.as_str())
+        .bind(build_id)
+        .bind(org_id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        daemon_job_id
+            .map(|job_id| {
+                BuildRunId::from_str(&job_id).map(|daemon_job_id| BuildJob { daemon_job_id })
+            })
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn find_builder_node(
+        &self,
+        daemon_job_id: BuildRunId,
+    ) -> Result<Option<NodeId>, TemplateBuildJobsStoreError> {
+        sqlx::query_as::<_, (Option<uuid::Uuid>,)>(sql!(
+            "SELECT builder_node_id
+             FROM template_build_jobs
+             WHERE daemon_job_id = $1"
+        ))
+        .bind(daemon_job_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.and_then(|(builder_node_id,)| builder_node_id.map(NodeId::from_uuid)))
+        .map_err(Into::into)
+    }
+
+    pub(crate) async fn record_build_spec(
+        &self,
+        org_id: OrgId,
+        template_name: &TemplateName,
+        build_id: &str,
+        spec: BuildSpec,
+    ) -> Result<(), TemplateBuildJobsStoreError> {
+        if !template_build_owner_matches(&self.pool, template_name, org_id).await? {
+            return Err(TemplateBuildJobsStoreError::OwnershipConflict);
+        }
+        let result = sqlx::query(sql!(
+            "INSERT INTO template_build_jobs (template_id, build_id, cpu_count, memory_mb, tags, org_id)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (template_id, build_id) DO UPDATE
+             SET cpu_count = EXCLUDED.cpu_count,
+                 memory_mb = EXCLUDED.memory_mb,
+                 tags = EXCLUDED.tags
+             WHERE template_build_jobs.org_id IS NULL OR template_build_jobs.org_id = EXCLUDED.org_id"
+        ))
+        .bind(template_name.as_str())
+        .bind(build_id)
+        .bind(spec.cpu_count.map(|value| value as i32))
+        .bind(spec.memory_mb.map(|value| value as i32))
+        .bind(spec.tags)
+        .bind(org_id.as_uuid())
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(TemplateBuildJobsStoreError::OwnershipConflict);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn lookup_build_spec(
+        &self,
+        org_id: OrgId,
+        template_name: &TemplateName,
+        build_id: &str,
+    ) -> Result<Option<BuildSpec>, TemplateBuildJobsStoreError> {
+        if !template_build_owner_matches(&self.pool, template_name, org_id).await? {
+            return Ok(None);
+        }
+        let row = sqlx::query_as::<_, (Vec<String>, Option<i32>, Option<i32>)>(sql!(
+            "SELECT tags, cpu_count, memory_mb
+             FROM template_build_jobs
+             WHERE template_id = $1
+               AND build_id = $2
+               AND (org_id = $3 OR org_id IS NULL)"
+        ))
+        .bind(template_name.as_str())
+        .bind(build_id)
+        .bind(org_id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|(tags, cpu_count, memory_mb)| {
+            Ok(BuildSpec {
+                tags,
+                cpu_count: optional_i32_to_u32(cpu_count)?,
+                memory_mb: optional_i32_to_u32(memory_mb)?,
+            })
+        })
+        .transpose()
+    }
+}
+
+pub(crate) async fn template_build_owner_matches(
+    pool: &PgPool,
+    template_name: &TemplateName,
+    org_id: OrgId,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT NOT EXISTS (SELECT 1 FROM templates WHERE name = $1 AND org_id <> $2)"
+    ))
+    .bind(template_name.as_str())
+    .bind(org_id.as_uuid())
+    .fetch_one(pool)
+    .await
+}
+
+fn optional_i32_to_u32(value: Option<i32>) -> Result<Option<u32>, TemplateBuildJobsStoreError> {
+    value
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|error| sqlx::Error::Decode(Box::new(error)).into())
+}
+
+#[cfg(test)]
+mod tests;

@@ -1,0 +1,71 @@
+# syntax=docker/dockerfile:1.7
+#
+# Local kind seed-publish image.
+#
+# Plays the role the production builder plays for template distribution: it
+# carries one seed template build (rootfs.ext4 + metadata.json + manifest.json,
+# produced by infra/space/kind/scripts/build-seed.sh via the production seed
+# builder) and publishes it the way `space-builder publish` does —
+#
+#   1. upload the artifacts to the cluster object store (SeaweedFS locally,
+#      S3 in prod) under templates/<name>/<content_hash>/,
+#   2. register the template + release + tag + storage location through the
+#      real ClusterApi RPCs on space-internal-api.
+#
+# Worker nodes then obtain the seed through the production pull path:
+# template-manager prefetch → ClusterApi.FindTemplateRelease → volume-manager
+# PullFile from the storage URI. Nothing is side-staged onto workers.
+#
+# Build (repo root context + a named context holding the seed artifacts):
+#   docker build -f docker/Dockerfile.seed-publish \
+#     --build-context seed=$HOME/.space-devbox/space/seed/build \
+#     -t space-seed-publish:local .
+
+FROM public.ecr.aws/docker/library/debian:bookworm-slim AS grpcurl-downloader
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG TARGETARCH
+ARG GRPCURL_VERSION=1.9.3
+
+RUN set -eux; \
+      case "${TARGETARCH:-amd64}" in \
+        amd64) asset=grpcurl_${GRPCURL_VERSION}_linux_x86_64.tar.gz; sha256=a926b62a85787ccf73ef8736b3ae554f1242e39d92bb8767a79d6dd23b11d1d5 ;; \
+        arm64) asset=grpcurl_${GRPCURL_VERSION}_linux_arm64.tar.gz; sha256=b20a00c1cb82ab81ec32696766d4076e99b4cb5ca0823a71767ba64dbea0f263 ;; \
+        *) echo "unsupported TARGETARCH=${TARGETARCH}"; exit 1 ;; \
+      esac; \
+      curl -fsSL \
+        "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/${asset}" \
+        -o /grpcurl.tar.gz; \
+      printf '%s  %s\n' "${sha256}" /grpcurl.tar.gz | sha256sum -c -; \
+      tar -xzf /grpcurl.tar.gz -C /; \
+      chmod 0755 /grpcurl
+
+FROM public.ecr.aws/docker/library/debian:bookworm-slim
+
+LABEL org.opencontainers.image.title="space-seed-publish"
+LABEL org.opencontainers.image.description="SPACE local kind seed template publisher (S3 upload + ClusterApi release registration)."
+
+# awscli talks the real S3 protocol to SeaweedFS (sigv4, path-style).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      awscli ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=grpcurl-downloader /grpcurl /usr/local/bin/grpcurl
+
+# ClusterApi proto tree — grpcurl encodes the RPCs from source protos, so the
+# publish path speaks the same wire contract the Rust clients compile in.
+COPY proto /opt/space/proto
+
+COPY --from=seed rootfs.ext4   /opt/space/seed/rootfs.ext4
+COPY --from=seed metadata.json /opt/space/seed/metadata.json
+COPY --from=seed manifest.json /opt/space/seed/manifest.json
+
+COPY --chmod=0755 infra/space/kind/scripts/seed-publish-entry.sh /opt/space/bin/seed-publish-entry.sh
+# Shared manifest→proto execution-metadata converter; the entrypoint invokes
+# it when registering the release.
+COPY --chmod=0755 scripts/lib/manifest_execution_to_proto.py /opt/space/bin/manifest_execution_to_proto.py
+
+ENTRYPOINT ["/opt/space/bin/seed-publish-entry.sh"]

@@ -1,0 +1,39 @@
+name = "Missing identity and policy load failures close traffic, then recover"
+
+[[steps]]
+policy = { default = "allow" }
+probes = [
+  { kind = "tcp", session = "identity-loss", connection = "new", expect = "allow" },
+  { kind = "ingress", expect = "allow" },
+]
+
+[[steps]]
+state = "no-identity"
+probes = [
+  { kind = "tcp", session = "identity-loss", connection = "existing", expect = "deny" },
+  { kind = "tcp", expect = "deny" },
+  { kind = "udp", expect = "deny" },
+  { kind = "ingress", expect = "deny", code = 9 },
+]
+
+[[steps]]
+policy = { default = "allow" }
+probes = [
+  { kind = "tcp", session = "policy-loss", connection = "new", expect = "allow" },
+]
+
+[[steps]]
+state = "policy-error"
+probes = [
+  { kind = "tcp", session = "policy-loss", connection = "existing", expect = "deny" },
+  { kind = "tcp", expect = "deny" },
+  { kind = "udp", expect = "deny" },
+  { kind = "ingress", expect = "deny", code = 9 },
+]
+
+[[steps]]
+policy = { default = "allow" }
+probes = [
+  { kind = "tcp", expect = "allow" },
+  { kind = "ingress", expect = "allow" },
+]

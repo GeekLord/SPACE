@@ -1,0 +1,70 @@
+syntax = "proto3";
+package space.spaced.worker.v1;
+
+import "spaced/operations/v1/operations.proto";
+
+// Private inherited-socket protocol. The connection fixes Unix identity.
+// A worker has no public idempotency namespace and never retries a dispatch.
+service WorkerFilesystem {
+  rpc Ready(ReadyRequest) returns (ReadyResponse);
+  rpc Stat(space.spaced.operations.v1.StatRequest) returns (space.spaced.operations.v1.StatResponse);
+  rpc List(space.spaced.operations.v1.ListRequest) returns (stream space.spaced.operations.v1.FileInfo);
+  rpc Read(space.spaced.operations.v1.ReadRequest) returns (stream space.spaced.operations.v1.FileChunk);
+  rpc Write(stream WriteFrame) returns (MutationResult);
+  rpc WriteBatch(BatchCommand) returns (MutationResult);
+  rpc Mkdir(space.spaced.operations.v1.MkdirRequest) returns (space.spaced.operations.v1.MkdirResponse);
+  rpc Remove(space.spaced.operations.v1.RemoveRequest) returns (space.spaced.operations.v1.RemoveResponse);
+  rpc Rename(RenameCommand) returns (MutationResult);
+  rpc NormalizeWatchRoot(space.spaced.operations.v1.NormalizeWatchRootRequest) returns (space.spaced.operations.v1.NormalizeWatchRootResponse);
+  rpc Watch(space.spaced.operations.v1.WatchRequest) returns (stream space.spaced.operations.v1.FileEvent);
+  rpc CreateWatcher(space.spaced.operations.v1.CreateWatcherRequest) returns (space.spaced.operations.v1.CreateWatcherResponse);
+  rpc GetWatcherEvents(space.spaced.operations.v1.GetWatcherEventsRequest) returns (space.spaced.operations.v1.GetWatcherEventsResponse);
+  rpc RemoveWatcher(space.spaced.operations.v1.RemoveWatcherRequest) returns (space.spaced.operations.v1.RemoveWatcherResponse);
+  rpc EnableFileChanges(space.spaced.operations.v1.EnableFileChangesRequest) returns (space.spaced.operations.v1.EnableFileChangesResponse);
+  rpc DisableFileChanges(space.spaced.operations.v1.DisableFileChangesRequest) returns (space.spaced.operations.v1.DisableFileChangesResponse);
+  rpc GetModifiedFiles(space.spaced.operations.v1.GetModifiedFilesRequest) returns (space.spaced.operations.v1.GetModifiedFilesResponse);
+}
+
+message ReadyRequest {}
+message ReadyResponse { uint32 protocol_version = 1; }
+message WriteFrame {
+  oneof frame {
+    WriteStart open = 1;
+    bytes data = 2;
+    Finish finish = 3;
+    Abort abort = 4;
+  }
+}
+message WriteStart {
+  string execution_id = 1;
+  string path = 2;
+  bool append = 3;
+}
+message Finish {}
+message Abort {}
+message BatchCommand {
+  string execution_id = 1;
+  repeated space.spaced.operations.v1.WriteBatchEntry entries = 2;
+}
+message RenameCommand {
+  string execution_id = 1;
+  string old_path = 2;
+  string new_path = 3;
+}
+message MutationResult {
+  oneof outcome {
+    space.spaced.operations.v1.WriteResponse write = 1;
+    space.spaced.operations.v1.WriteBatchResponse batch = 2;
+    space.spaced.operations.v1.RenameResponse rename = 3;
+    OperationFailure failure = 4;
+    Abort interrupted = 5;
+    // Authoritative refusal before the executor polls any effectful work.
+    // Unlike failure, this permits releasing the router's retry reservation.
+    OperationFailure rejected_before_execution = 6;
+  }
+}
+// Operation errors are terminal replies, never confused with transport errors.
+message OperationFailure {
+  int32 code = 1;
+  string message = 2;
+}

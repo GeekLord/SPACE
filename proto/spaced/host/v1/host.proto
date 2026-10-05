@@ -1,0 +1,115 @@
+syntax = "proto3";
+package space.spaced.host.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+import "spaced/operations/v1/operations.proto";
+
+// Host-side API exposed by spaced-host-svc on a host-local UDS.
+service Meta {
+  rpc Ping(PingRequest) returns (PingResponse);
+  rpc IsConnected(IsConnectedRequest) returns (IsConnectedResponse);
+  rpc PingGuest(PingGuestRequest) returns (PingGuestResponse);
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  rpc WaitReady(WaitReadyRequest) returns (WaitReadyResponse);
+  rpc ConfigureProcessEnv(ConfigureProcessEnvRequest) returns (ConfigureProcessEnvResponse);
+  rpc NotifyResume(NotifyResumeRequest) returns (NotifyResumeResponse);
+  // Flush guest storage while keeping bridge connections available for a running VM.
+  // Use for disk-only snapshots. For any VM memory snapshot, use PrepareSuspend
+  // instead; it includes the final filesystem flush.
+  rpc FlushGuestFilesystems(FlushGuestFilesystemsRequest) returns (FlushGuestFilesystemsResponse);
+  // Prepare a running VM for a memory-bearing snapshot by flushing guest storage
+  // and invalidating cached host-to-guest bridge connections before returning.
+  // Callers must not also invoke FlushGuestFilesystems for the same snapshot.
+  rpc PrepareSuspend(PrepareSuspendRequest) returns (PrepareSuspendResponse);
+}
+
+service Process {
+  rpc Start(space.spaced.operations.v1.StartRequest) returns (stream space.spaced.operations.v1.ProcessEvent);
+  rpc ConnectProcess(space.spaced.operations.v1.ConnectProcessRequest) returns (stream space.spaced.operations.v1.ProcessEvent);
+  rpc ListProcesses(space.spaced.operations.v1.ListProcessesRequest) returns (stream space.spaced.operations.v1.ProcessInfo);
+  rpc SendSignal(space.spaced.operations.v1.SendSignalRequest) returns (space.spaced.operations.v1.SendSignalResponse);
+  rpc SendInput(space.spaced.operations.v1.SendInputRequest) returns (space.spaced.operations.v1.SendInputResponse);
+  rpc CloseStdin(space.spaced.operations.v1.CloseStdinRequest) returns (space.spaced.operations.v1.CloseStdinResponse);
+  rpc ResizePty(space.spaced.operations.v1.ResizePtyRequest) returns (space.spaced.operations.v1.ResizePtyResponse);
+  rpc Kill(space.spaced.operations.v1.KillRequest) returns (space.spaced.operations.v1.KillResponse);
+}
+
+// Loopback bridge management. Surfaces what spaced-guest-svc's
+// `Networking` service can do, but on the host side. sbx-mgr (and through
+// it, worker-api / api) calls these RPCs after node-mgr's
+// expose_port + allow_port have installed the host firewall path; the
+// implementation forwards via vsock to the in-VM agent.
+service Networking {
+  rpc OpenLoopbackBridge(space.spaced.operations.v1.OpenLoopbackBridgeRequest) returns (space.spaced.operations.v1.OpenLoopbackBridgeResponse);
+  rpc CloseLoopbackBridge(space.spaced.operations.v1.CloseLoopbackBridgeRequest) returns (space.spaced.operations.v1.CloseLoopbackBridgeResponse);
+}
+
+service Filesystem {
+  rpc Stat(space.spaced.operations.v1.StatRequest) returns (space.spaced.operations.v1.StatResponse);
+  rpc List(space.spaced.operations.v1.ListRequest) returns (stream space.spaced.operations.v1.FileInfo);
+  rpc Read(space.spaced.operations.v1.ReadRequest) returns (stream space.spaced.operations.v1.FileChunk);
+  rpc Write(stream space.spaced.operations.v1.WriteRequest) returns (space.spaced.operations.v1.WriteResponse);
+  rpc WriteBatch(space.spaced.operations.v1.WriteBatchRequest) returns (space.spaced.operations.v1.WriteBatchResponse);
+  rpc Mkdir(space.spaced.operations.v1.MkdirRequest) returns (space.spaced.operations.v1.MkdirResponse);
+  rpc Remove(space.spaced.operations.v1.RemoveRequest) returns (space.spaced.operations.v1.RemoveResponse);
+  rpc Rename(space.spaced.operations.v1.RenameRequest) returns (space.spaced.operations.v1.RenameResponse);
+  rpc NormalizeWatchRoot(space.spaced.operations.v1.NormalizeWatchRootRequest) returns (space.spaced.operations.v1.NormalizeWatchRootResponse);
+  rpc Watch(space.spaced.operations.v1.WatchRequest) returns (stream space.spaced.operations.v1.FileEvent);
+  rpc CreateWatcher(space.spaced.operations.v1.CreateWatcherRequest) returns (space.spaced.operations.v1.CreateWatcherResponse);
+  rpc GetWatcherEvents(space.spaced.operations.v1.GetWatcherEventsRequest) returns (space.spaced.operations.v1.GetWatcherEventsResponse);
+  rpc RemoveWatcher(space.spaced.operations.v1.RemoveWatcherRequest) returns (space.spaced.operations.v1.RemoveWatcherResponse);
+  rpc EnableFileChanges(space.spaced.operations.v1.EnableFileChangesRequest) returns (space.spaced.operations.v1.EnableFileChangesResponse);
+  rpc DisableFileChanges(space.spaced.operations.v1.DisableFileChangesRequest) returns (space.spaced.operations.v1.DisableFileChangesResponse);
+  rpc GetModifiedFiles(space.spaced.operations.v1.GetModifiedFilesRequest) returns (space.spaced.operations.v1.GetModifiedFilesResponse);
+}
+
+message PingRequest {}
+message PingResponse {}
+
+message IsConnectedRequest {}
+message IsConnectedResponse { bool connected = 1; }
+
+message PingGuestRequest {}
+message PingGuestResponse {}
+
+message GetStatusRequest {}
+message GetStatusResponse {
+  bool ready = 1;
+  google.protobuf.Duration guest_uptime = 2;
+  VersionInfo host_version = 3;
+  VersionInfo guest_version = 4;
+}
+
+message VersionInfo {
+  string version = 1;
+  string compatibility_family = 2;
+}
+
+message WaitReadyRequest { google.protobuf.Duration timeout = 1; }
+message WaitReadyResponse {
+  google.protobuf.Duration guest_uptime = 1;
+  optional uint64 mem_total_bytes = 2;
+  optional uint32 vcpu_count = 3;
+}
+
+message ConfigureProcessEnvRequest {
+  map<string, string> env = 1;
+}
+message ConfigureProcessEnvResponse {}
+
+
+message NotifyResumeRequest {
+  space.spaced.operations.v1.ResumeReason reason = 1;
+  google.protobuf.Timestamp host_time = 2;
+}
+message NotifyResumeResponse {
+  space.spaced.operations.v1.ClockSyncStatus clock_sync_status = 1;
+  bool ready = 2;
+}
+
+message FlushGuestFilesystemsRequest {}
+message FlushGuestFilesystemsResponse {}
+
+message PrepareSuspendRequest {}
+message PrepareSuspendResponse {}

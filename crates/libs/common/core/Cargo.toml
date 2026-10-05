@@ -1,0 +1,46 @@
+[package]
+name = "pplx-space-common-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aws-lc-rs = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+bytesize = { workspace = true }
+k8s-openapi = { workspace = true, features = ["v1_32"], optional = true }
+libc = { workspace = true }
+nix = { workspace = true, features = ["fs", "ioctl"] }
+pplx-space-net-common = { workspace = true }
+rusqlite = { workspace = true, optional = true }
+semver = { workspace = true }
+serde = { workspace = true, features = ["derive"], optional = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+sqlx = { workspace = true, features = ["postgres", "uuid"], optional = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["v5", "v7"] }
+
+[dev-dependencies]
+insta = { workspace = true, features = ["yaml"] }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+[features]
+default = []
+archive = ["dep:aws-lc-rs"]
+kubernetes = ["dep:base64", "dep:k8s-openapi", "dep:sha2", "serde", "pplx-space-net-common/serde"]
+serde = ["dep:serde", "dep:serde_json", "bytesize/serde", "uuid/serde"]
+sqlx = ["dep:sqlx"]
+rusqlite = ["dep:rusqlite"]
+# Compiles in the test-only environment overrides (see `env::test_hook`). Only
+# kind and smoke images and test builds enable it; release binaries cannot read
+# these variables, so they are not part of the public configuration surface.
+test-hooks = []

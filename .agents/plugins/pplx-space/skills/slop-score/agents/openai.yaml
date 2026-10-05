@@ -1,0 +1,4 @@
+interface:
+  display_name: "Engineering Slop (measured)"
+  short_description: "Measure structural burden: scan, justify, implement-and-measure"
+  default_prompt: "Use $slop-score to measure how much this repository's structure taxes ordinary development: run the whole-tree signature scan, a justification pass, and (if authorized) the implement-and-measure pass against a control; deliver the state card and maintenance map."

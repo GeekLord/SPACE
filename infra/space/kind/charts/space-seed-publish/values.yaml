@@ -1,0 +1,34 @@
+image:
+  repository: space-seed-publish
+  tag: local
+  pullPolicy: IfNotPresent
+
+datadogTeam: team-space
+
+# Cluster API (space-internal-api) the publish registers releases against.
+internalApi:
+  grpcAddr: space-internal-api:9800
+
+internal:
+  secretName: space-internal
+
+# Object store the seed artifacts are uploaded to. Same SeaweedFS the
+# node-stack's volume-manager pulls from; the storage URI registered with the
+# release carries the endpoint + path-style so the pull path needs no extra
+# config.
+s3:
+  endpoint: http://seaweedfs:8333
+  region: us-east-1
+  bucket: templates
+  credentialsSecretName: space-seaweedfs
+
+nodeSelector:
+  space.pplx.net/infra: "true"
+
+resources:
+  requests:
+    cpu: 25m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

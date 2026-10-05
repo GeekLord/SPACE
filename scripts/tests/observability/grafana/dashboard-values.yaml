@@ -1,0 +1,3 @@
+dashboards:
+  extraConfigMaps:
+    - metrics-contract

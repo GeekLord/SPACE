@@ -1,0 +1,12 @@
+name = "Ingress requires a signed token matching port, sandbox and current route"
+
+[[steps]]
+policy = { default = "deny" }
+probes = [
+  { kind = "ingress", token = "valid", expect = "allow" },
+  { kind = "ingress", token = "missing", expect = "deny" },
+  { kind = "ingress", token = "wrong-port", expect = "deny" },
+  { kind = "ingress", token = "wrong-sandbox", expect = "deny" },
+  { kind = "ingress", token = "stale-route", expect = "deny" },
+  { kind = "ingress", token = "invalid-signature", expect = "deny" },
+]

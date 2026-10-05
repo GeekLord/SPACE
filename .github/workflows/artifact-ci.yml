@@ -1,0 +1,155 @@
+name: Artifact CI
+
+on:
+  workflow_call:
+    inputs:
+      publish:
+        description: >-
+          Push the bundle images to the private ECR repositories in the OSS
+          account. Only `main` pushes: the push role trusts nothing else.
+        type: boolean
+        default: false
+  # Main CI calls this after every merge. Run it by hand on a branch that
+  # changes packaging; it reads main's cache and never writes it, and never
+  # publishes: a dispatched run has no `publish` input.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Inventory only; kept outside required aggregate dependencies.
+  quarantine_backlog:
+    if: github.repository == 'perplexityai/SPACE' && github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/quarantine-ci.yml
+    permissions:
+      contents: read
+
+  # Build every public bundle until path selection has its own tested planner,
+  # so a changed artifact cannot silently miss packaging coverage.
+  bundle_images:
+    if: github.repository == 'perplexityai/SPACE'
+    name: Build ${{ matrix.feature }} image
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    # Reads the third-party image mirror; see ci/mirrored-images.txt. The OIDC
+    # token is only exchanged when publishing, and the push role trusts only
+    # `main`; a caller must grant id-token: write for this job to start.
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Rust release builds retain the large runner for its build disk;
+          # the UI and rollout-manager bundles do not compile the workspace.
+          - feature: worker
+            runner: ubuntu-24.04-16core
+          - feature: builder
+            runner: ubuntu-24.04-16core
+          - feature: api
+            runner: ubuntu-24.04-16core
+          - feature: data-plane
+            runner: ubuntu-24.04-16core
+          - feature: cluster-controller
+            runner: ubuntu-24.04-16core
+          - feature: ui
+            runner: ubuntu-24.04
+          - feature: rollout-mng
+            runner: ubuntu-24.04
+    env:
+      CI: true
+      # Publishing stays off until SPACE_ECR_PUSH_ROLE_ARN is set from the
+      # oss-registry root's output; infra/space/aws/oss-registry/README.md has
+      # the setup.
+      SPACE_BUNDLE_PUBLISH: ${{ (inputs.publish && vars.SPACE_ECR_PUSH_ROLE_ARN != '') && '1' || '0' }}
+      # Merge-group refs are ephemeral: reuse main's cache without spending
+      # minutes exporting layers that no later run can read.
+      SPACE_BUNDLE_CACHE: >-
+        ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+        'enabled' || 'read-only' }}
+      SPACE_BUNDLE_CACHE_BACKEND: gha
+      SPACE_BUNDLE_RELEASE_LTO: thin
+      # Take each Dockerfile's listed bases from the GHCR mirror through
+      # --build-context options; the Dockerfiles, which the private pipeline
+      # also builds, keep their own FROM images.
+      SPACE_CI_IMAGE_MIRROR: ghcr
+
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The repository script invokes Buildx directly, so expose the ephemeral
+      # cache-service credentials that official Docker actions normally pass
+      # to BuildKit on its behalf.
+      - name: Expose the GitHub Actions cache to BuildKit
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      # Used for the registry login at the start of the build and the push at
+      # its end, so the session spans the job's timeout.
+      - name: Assume the ECR push role
+        if: env.SPACE_BUNDLE_PUBLISH == '1'
+        uses: ./.github/actions/assume-aws-role
+        with:
+          role-arn: ${{ vars.SPACE_ECR_PUSH_ROLE_ARN }}
+          session-name: space-image-push-${{ github.run_id }}-${{ matrix.feature }}
+          duration-seconds: "7200"
+
+      # The repositories live in the push role's own account, in the
+      # oss-registry root's region.
+      - name: Target the OSS account's registry
+        if: env.SPACE_BUNDLE_PUBLISH == '1'
+        env:
+          ROLE_ARN: ${{ vars.SPACE_ECR_PUSH_ROLE_ARN }}
+          REGION: ${{ vars.SPACE_ECR_REGION || 'us-east-1' }}
+        run: |
+          {
+            echo "AWS_REGION=${REGION}"
+            echo "SPACE_BUNDLE_TARGETS=oss"
+            echo "SPACE_BUNDLE_TARGET_ACCOUNTS={\"oss\":\"$(cut -d: -f5 <<<"${ROLE_ARN}")\"}"
+          } >>"${GITHUB_ENV}"
+
+      - name: Build ${{ matrix.feature }}${{ env.SPACE_BUNDLE_PUBLISH == '1' && ' and publish' || ' without publishing' }}
+        env:
+          FEATURE: ${{ matrix.feature }}
+        # The runner's own Python runs the standard-library-only script, and
+        # the build uses the runner's docker and aws, so no installer runs
+        # on the host after the push credentials exist. BuildKit is pinned by
+        # digest in the script.
+        run: python3 ci/scripts/run-space-bundle-builds.py "${FEATURE}"
+
+  shim_artifact:
+    if: github.repository == 'perplexityai/SPACE'
+    name: Build containerd shim artifact
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install the pinned Go toolchain and validate the shim
+        run: bash ci/scripts/run-shim-checks.sh
+
+      - name: Build the deployable Linux shim binary without publishing
+        working-directory: shim
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags "-s -w -X main.Version=${GITHUB_SHA}" \
+              -o containerd-shim-space-v2 .
+          sha256sum containerd-shim-space-v2

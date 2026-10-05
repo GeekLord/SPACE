@@ -1,0 +1,22 @@
+{{- include "common.profileGuard" . }}
+{{- include "common.sharedGuards" . }}
+{{- if not (or .Values.datasources.prometheus.enabled .Values.datasources.loki.enabled .Values.datasources.tempo.enabled) }}
+{{- fail "Enable at least one datasource" }}
+{{- end }}
+{{- range $name := list "prometheus" "loki" "tempo" }}
+{{- $source := index $.Values.datasources $name }}
+{{- if and $source.enabled (not $source.url) }}
+{{- fail (printf "datasources.%s.url is required when that datasource is enabled" $name) }}
+{{- end }}
+{{- end }}
+{{- if eq .Values.profile "shared" }}
+{{- if .Values.auth.anonymous }}
+{{- fail "Anonymous access is Kind-only; shared installs require auth.existingSecret" }}
+{{- end }}
+{{- if not .Values.auth.existingSecret }}
+{{- fail "Shared installs require auth.existingSecret naming an existing credentials Secret" }}
+{{- end }}
+{{- if .Values.persistence.enabled }}
+{{- include "common.sharedStorageGuard" (dict "storage" .Values.persistence "key" "persistence") }}
+{{- end }}
+{{- end }}

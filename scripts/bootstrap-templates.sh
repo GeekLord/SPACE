@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# Discover SPACE templates in a configured S3 bucket and register each one
+# as a template release in the cluster Postgres. Templates are NOT downloaded
+# to the local node — once the rows below exist, every worker's tmplmgr
+# prefetcher (or an on-demand `GetTemplate` driven by a sandbox create)
+# pulls the artifacts from S3 and installs them locally with the
+# subvolume + `received_uuid` shape.
+#
+# This script is intentionally idempotent and runs ONCE against the
+# cluster Postgres — not per-stack. The four rows it writes are the only
+# state the cluster needs to know a template exists and where to fetch
+# it from:
+#
+#   templates                          (name)
+#   template_releases                  (template_name + content_hash)
+#   template_release_tags              (latest → release_id)
+#   template_release_storage_locations (release_id → S3 URI)
+#
+# Bucket layout discovered:
+#
+#   s3://$BUCKET/<name>/manifest.json                       (flat / legacy)
+#   s3://$BUCKET/templates/<name>/sha256:.../manifest.json  (hashed / canonical)
+#
+# Templates that exist in both layouts use the hashed (canonical) one;
+# flat-only templates fall back to `s3://$BUCKET/<name>/manifest.json`.
+#
+# Env:
+#   TEMPLATE_BOOTSTRAP_BUCKET   — required; S3 bucket name (no scheme)
+#   TEMPLATE_BOOTSTRAP_NAMES    — optional; comma/space-separated list of
+#                                 template names. Skips bucket-root scan.
+#   TEMPLATE_BOOTSTRAP_FILTER   — optional; glob applied to discovered
+#                                 names when TEMPLATE_BOOTSTRAP_NAMES is
+#                                 unset (default: '*')
+#   POSTGRES_CONNECTION_STRING  — required; shared cluster DB
+#   AWS_REGION                  — optional; defaults to us-east-1
+#   AWS_PROFILE / AWS_*         — passed through to aws CLI
+set -euo pipefail
+
+LOG_PREFIX=bootstrap-templates
+log() { printf '[%s] %s\n' "$LOG_PREFIX" "$*" >&2; }
+die() { printf '[%s] ERROR: %s\n' "$LOG_PREFIX" "$*" >&2; exit 1; }
+
+[[ -n "${TEMPLATE_BOOTSTRAP_BUCKET:-}" ]] || die "TEMPLATE_BOOTSTRAP_BUCKET is required"
+[[ "$TEMPLATE_BOOTSTRAP_BUCKET" != *://* ]] || die "TEMPLATE_BOOTSTRAP_BUCKET must be a bucket name, not a URI"
+[[ -n "${POSTGRES_CONNECTION_STRING:-}" ]] || die "POSTGRES_CONNECTION_STRING is required"
+command -v aws  >/dev/null 2>&1 || die "aws CLI is required"
+command -v jq   >/dev/null 2>&1 || die "jq is required"
+command -v psql >/dev/null 2>&1 || die "psql is required"
+
+BUCKET="$TEMPLATE_BOOTSTRAP_BUCKET"
+FILTER="${TEMPLATE_BOOTSTRAP_FILTER:-*}"
+export AWS_REGION="${AWS_REGION:-us-east-1}"
+
+list_template_prefixes() {
+  # Flat-layout names: CommonPrefixes at the bucket root.
+  aws s3api list-objects-v2 \
+    --bucket "$BUCKET" \
+    --delimiter / \
+    --query 'CommonPrefixes[].Prefix' \
+    --output text \
+    | tr '\t' '\n' \
+    | sed 's:/$::' \
+    | grep -v '^$' || true
+}
+
+list_hashed_prefixes() {
+  # Hashed-layout names: CommonPrefixes under `templates/`.
+  aws s3api list-objects-v2 \
+    --bucket "$BUCKET" \
+    --prefix templates/ \
+    --delimiter / \
+    --query 'CommonPrefixes[].Prefix' \
+    --output text 2>/dev/null \
+    | tr '\t' '\n' \
+    | sed -E 's:templates/(.*)/$:\1:' \
+    | grep -v '^$' || true
+}
+
+# For a template `name`, locate the newest hashed-layout prefix by the
+# LastModified of its `metadata.json`. Echoes the full S3 prefix
+# (without trailing slash), or empty if no hashed build exists.
+latest_hashed_prefix() {
+  local name="$1"
+  aws s3api list-objects-v2 \
+    --bucket "$BUCKET" \
+    --prefix "templates/$name/" \
+    --query 'reverse(sort_by(Contents,&LastModified))[?ends_with(Key, `/metadata.json`)] | [0].Key' \
+    --output text 2>/dev/null \
+    | sed 's:/metadata.json$::' \
+    | grep -v '^None$' || true
+}
+
+register_template_in_postgres() {
+  local name="$1"
+  local hash="$2"
+  local storage_uri="$3"
+
+  # psql `-v` + `:'name'` placeholders quote values safely; never
+  # interpolate bash $vars directly into the SQL body.
+  psql "$POSTGRES_CONNECTION_STRING" -v ON_ERROR_STOP=1 \
+    -v name="$name" -v hash="$hash" -v storage_uri="$storage_uri" <<'SQL'
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM clusters WHERE singleton) THEN
+    RAISE EXCEPTION 'missing cluster singleton for template materialization';
+  END IF;
+END $$;
+
+WITH managing_cluster AS (
+  SELECT managing_org_id
+  FROM clusters
+  WHERE singleton
+),
+new_id AS (
+  -- gen_random_uuid is v4; flip the version nibble to satisfy the
+  -- templates_id_uuid_v7 check constraint. Ordering is not load-bearing
+  -- here, so we don't bother packing a real ms timestamp.
+  SELECT (substring(u::text, 1, 14) || '7' || substring(u::text, 16))::uuid AS id
+  FROM (SELECT gen_random_uuid() AS u) t
+)
+INSERT INTO templates (id, name, org_id, network_policy_json, network_policy_generation)
+SELECT
+  id,
+  :'name',
+  managing_org_id,
+  '{"version":"v1","egress":{"default_action":"deny"}}',
+  1
+FROM new_id
+CROSS JOIN managing_cluster
+ON CONFLICT (name) DO UPDATE
+SET org_id = COALESCE(templates.org_id, EXCLUDED.org_id)
+WHERE templates.org_id IS NULL;
+
+INSERT INTO template_releases (template_name, type, hash, org_id)
+SELECT :'name', 'fc', :'hash', org_id
+FROM templates
+WHERE name = :'name'
+ON CONFLICT (template_name, hash) DO UPDATE
+SET org_id = COALESCE(template_releases.org_id, EXCLUDED.org_id)
+WHERE template_releases.org_id IS NULL;
+
+INSERT INTO template_release_tags (template_release_id, template_name, tag)
+SELECT id, template_name, 'latest'
+FROM template_releases
+WHERE template_name = :'name' AND hash = :'hash'
+ON CONFLICT (template_name, tag) DO UPDATE
+SET template_release_id = EXCLUDED.template_release_id;
+
+INSERT INTO template_release_storage_locations (
+  template_release_id,
+  storage_connection_string,
+  org_id
+)
+SELECT id, :'storage_uri', org_id
+FROM template_releases
+WHERE template_name = :'name' AND hash = :'hash'
+ON CONFLICT (template_release_id, storage_connection_string) DO UPDATE
+SET org_id = COALESCE(
+  template_release_storage_locations.org_id,
+  EXCLUDED.org_id
+)
+WHERE template_release_storage_locations.org_id IS NULL;
+SQL
+}
+
+# Each install runs in a subshell so its `trap '…' EXIT` cleanup is
+# scoped to the call. RETURN traps on the parent shell are global, which
+# is the fragility psi-review-bot flagged in the previous shape.
+install_template() (
+  set -euo pipefail
+  local name="$1"
+  log "==> $name"
+
+  # Layout precedence: flat first (`s3://$BUCKET/<name>/manifest.json`)
+  # because the SPACE template build pipeline treats the flat path as
+  # the "latest blessed" copy, which for seed can be newer than the
+  # most-recent hashed-layout release. Fall back to hashed
+  # (`templates/<name>/sha256:.../manifest.json`) for templates that
+  # only publish a hashed build. Probing flat first only needs HeadObject
+  # /GetObject and works on creds that don't carry s3:ListBucket.
+  #
+  # Opt-in override: TEMPLATE_BOOTSTRAP_PREFER=hashed forces the hashed
+  # layout. Use this when the flat-layout copy in the bucket lacks the
+  # rootfs.ext4.zst variant that the worker's volmgr pull path expects
+  # (the kind harness hits this — its sandbox S3 only stages .zst under
+  # the hashed `templates/<name>/sha256:.../` prefix).
+  local s3_prefix="" hash
+  if [[ "${TEMPLATE_BOOTSTRAP_PREFER:-flat}" == "hashed" ]]; then
+    s3_prefix="$(latest_hashed_prefix "$name")"
+    if [[ -z "$s3_prefix" ]]; then
+      log "$name: TEMPLATE_BOOTSTRAP_PREFER=hashed set but no hashed-layout release found — skipping"
+      return 0
+    fi
+  elif aws s3 ls "s3://$BUCKET/$name/manifest.json" >/dev/null 2>&1; then
+    s3_prefix="$name"
+  else
+    s3_prefix="$(latest_hashed_prefix "$name")"
+    if [[ -z "$s3_prefix" ]]; then
+      log "$name: no manifest.json under flat or hashed layout — skipping"
+      return 0
+    fi
+  fi
+
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  aws s3 cp "s3://$BUCKET/$s3_prefix/manifest.json" "$tmp/manifest.json" >/dev/null \
+    || { log "$name: failed to fetch manifest.json from s3://$BUCKET/$s3_prefix/"; return 0; }
+
+  hash="$(jq -r '.content_hash // empty' "$tmp/manifest.json")"
+  [[ -n "$hash" ]] || { log "$name: manifest.json missing content_hash — skipping"; return 0; }
+
+  local storage_uri="s3://$BUCKET/$s3_prefix/?region=$AWS_REGION"
+  register_template_in_postgres "$name" "$hash" "$storage_uri" >&2
+  log "$name: registered $hash (storage=$storage_uri)"
+  printf '%s\n' "$hash"
+)
+
+main() {
+  local prefixes name hash registered=0
+  if [[ -n "${TEMPLATE_BOOTSTRAP_NAMES:-}" ]]; then
+    prefixes="$(printf '%s' "$TEMPLATE_BOOTSTRAP_NAMES" | tr ', ' '\n')"
+  else
+    prefixes="$(printf '%s\n%s\n' \
+      "$(list_template_prefixes)" \
+      "$(list_hashed_prefixes)" \
+      | sort -u)"
+  fi
+  [[ -n "$prefixes" ]] || die "no template names resolved"
+
+  while read -r name; do
+    [[ -z "$name" ]] && continue
+    [[ "$name" == "templates" ]] && continue  # parent prefix, not a template
+    # shellcheck disable=SC2254
+    case "$name" in
+      $FILTER)
+        hash="$(install_template "$name")"
+        if [[ -n "$hash" ]]; then
+          registered=$((registered + 1))
+        fi
+        ;;
+      *) log "skipping $name (filter=$FILTER)" ;;
+    esac
+  done <<< "$prefixes"
+
+  (( registered > 0 )) || die "no templates registered from bucket $BUCKET; check bucket access, template names, and manifests"
+  log "done: registered $registered template(s)"
+}
+
+main "$@"

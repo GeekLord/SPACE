@@ -1,0 +1,3 @@
+interface:
+  display_name: "SPACE Template Lifecycle"
+  short_description: "Template build, publish, kernel, and SSH workflows"

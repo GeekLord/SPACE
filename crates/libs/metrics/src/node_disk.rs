@@ -1,0 +1,219 @@
+//! Node-local `/space/cache` disk occupancy as seen by the node-ctl
+//! SSD-headroom tier reconcile (the signal behind the `ssd-headroom-tier`
+//! Kubernetes node label that biases sandbox placement).
+
+use crate::emit::{counter, gauge, tag};
+
+/// Free fraction of the `/space/cache` filesystem in `[0.0, 1.0]`,
+/// measured once per node-ctl reconcile tick.
+pub fn ssd_free_fraction(value: f64) {
+    gauge("node.ssd_free_fraction", value, &[]);
+}
+
+pub fn sandbox_admission_available_fraction(value: f64) {
+    gauge("node.sandbox_admission.ssd_available_fraction", value, &[]);
+}
+
+pub fn sandbox_admission_available_bytes(bytes: u64) {
+    gauge(
+        "node.sandbox_admission.ssd_available_bytes",
+        bytes as f64,
+        &[],
+    );
+}
+
+pub fn sandbox_admission_effective_available_bytes(bytes: u64) {
+    gauge(
+        "node.sandbox_admission.ssd_effective_available_bytes",
+        bytes as f64,
+        &[],
+    );
+}
+
+pub fn sandbox_admission_pending_reservation_bytes(bytes: u64) {
+    gauge(
+        "node.sandbox_admission.ssd_pending_reservation_bytes",
+        bytes as f64,
+        &[],
+    );
+}
+
+pub fn sandbox_admission_btrfs_allocation_pressure(pressure_type: &str, active: bool) {
+    gauge(
+        "node.sandbox_admission.btrfs_allocation_pressure",
+        if active { 1.0 } else { 0.0 },
+        &[tag("pressure_type", pressure_type)],
+    );
+}
+
+/// Usage-keyed headroom tier (`0..=3`) advertised on the Kubernetes Node via
+/// the `space.pplx.net/ssd-headroom-tier` label.
+pub fn ssd_headroom_tier(tier: u8) {
+    gauge("node.ssd_headroom_tier", f64::from(tier), &[]);
+}
+
+/// Btrfs-exclusive bytes held by locally cached template directories.
+pub fn templates_bytes(bytes: u64) {
+    gauge("node_disk.templates_bytes", bytes as f64, &[]);
+}
+
+/// Btrfs-exclusive bytes held by suspended sandbox snapshot directories.
+pub fn snapshotted_sandbox_bytes(bytes: u64) {
+    gauge("node_disk.snapshotted_sandbox_bytes", bytes as f64, &[]);
+}
+
+/// Btrfs-exclusive bytes held by active sandbox instance directories.
+pub fn active_sandbox_bytes(bytes: u64) {
+    gauge("node_disk.active_sandbox_bytes", bytes as f64, &[]);
+}
+
+/// Btrfs-exclusive bytes held by rolling/named sandbox btrfs snapshots.
+pub fn btrfs_snapshot_bytes(bytes: u64) {
+    gauge("node_disk.btrfs_snapshot_bytes", bytes as f64, &[]);
+}
+
+/// Count of locally cached template directories.
+pub fn template_count(count: u64) {
+    gauge("node_disk.template_count", count as f64, &[]);
+}
+
+/// Count of suspended sandboxes with a local snapshot directory.
+pub fn snapshotted_sandbox_count(count: u64) {
+    gauge("node_disk.snapshotted_sandbox_count", count as f64, &[]);
+}
+
+/// Count of rolling/named sandbox btrfs snapshot directories.
+pub fn btrfs_snapshot_count(count: u64) {
+    gauge("node_disk.btrfs_snapshot_count", count as f64, &[]);
+}
+
+/// Count of path measurements that succeeded during the latest node-manager
+/// node disk metrics tick.
+pub fn measurement_success_count(count: u64) {
+    gauge("node_disk.measurement_success_count", count as f64, &[]);
+}
+
+/// Count of target paths that disappeared before measurement during the latest
+/// node-manager node disk metrics tick.
+pub fn measurement_missing_count(count: u64) {
+    gauge("node_disk.measurement_missing_count", count as f64, &[]);
+}
+
+/// Count of path measurements that errored during the latest node-manager node
+/// disk metrics tick.
+pub fn measurement_error_count(count: u64) {
+    gauge("node_disk.measurement_error_count", count as f64, &[]);
+}
+
+/// Bytes in the `/space/cache` btrfs unallocated pool — the only space
+/// metadata chunk growth can draw from. Zero here with full metadata chunks
+/// wedges the filesystem (subvolume deletes fail `EROFS`).
+pub fn btrfs_unallocated_bytes(bytes: u64) {
+    gauge("node_disk.btrfs_unallocated_bytes", bytes as f64, &[]);
+}
+
+/// Free bytes trapped inside allocated data block groups — what a data
+/// balance could return to the unallocated pool.
+pub fn btrfs_data_slack_bytes(bytes: u64) {
+    gauge("node_disk.btrfs_data_slack_bytes", bytes as f64, &[]);
+}
+
+/// Free bytes inside allocated metadata block groups.
+pub fn btrfs_metadata_available_bytes(bytes: u64) {
+    gauge(
+        "node_disk.btrfs_metadata_available_bytes",
+        bytes as f64,
+        &[],
+    );
+}
+
+/// `1` while the balance reconciler's trigger predicate holds (unallocated
+/// pool below the low watermark with reclaimable data-chunk slack), whether
+/// or not balancing is armed on the node.
+pub fn btrfs_balance_needed(needed: bool) {
+    gauge(
+        "node_disk.btrfs_balance_needed",
+        if needed { 1.0 } else { 0.0 },
+        &[],
+    );
+}
+
+/// Balance stages started by the reconciler, tagged by the data-chunk
+/// `usage` filter percentage.
+pub fn btrfs_balance_stage_runs(dusage: u8) {
+    counter(
+        "node_disk.btrfs_balance_stage_runs",
+        1,
+        &[tag("dusage", dusage)],
+    );
+}
+
+/// Unallocated bytes recovered by one completed balance reconcile pass.
+pub fn btrfs_balance_reclaimed_bytes(bytes: u64) {
+    counter("node_disk.btrfs_balance_reclaimed_bytes", bytes, &[]);
+}
+
+/// Balance passes that exhausted the stage ladder with the unallocated pool
+/// still below the low watermark (the node needs eviction/drain, not
+/// balance).
+pub fn btrfs_balance_ineffective() {
+    counter("node_disk.btrfs_balance_ineffective", 1, &[]);
+}
+
+/// Whether aggregate sandbox I/O reservation has explicit configuration.
+pub fn sandbox_io_reservation_configured(configured: bool) {
+    gauge(
+        "node_disk.sandbox_io_reservation.configured",
+        if configured { 1.0 } else { 0.0 },
+        &[],
+    );
+}
+
+/// Whether aggregate sandbox I/O throttling is currently enabled.
+pub fn sandbox_io_reservation_enabled(enabled: bool) {
+    gauge(
+        "node_disk.sandbox_io_reservation.enabled",
+        if enabled { 1.0 } else { 0.0 },
+        &[],
+    );
+}
+
+pub fn sandbox_io_reservation_device_count(count: u64) {
+    gauge(
+        "node_disk.sandbox_io_reservation.device_count",
+        count as f64,
+        &[],
+    );
+}
+
+pub fn sandbox_io_read_iops_max(value: u64) {
+    gauge(
+        "node_disk.sandbox_io_reservation.read_iops_max",
+        value as f64,
+        &[],
+    );
+}
+
+pub fn sandbox_io_write_iops_max(value: u64) {
+    gauge(
+        "node_disk.sandbox_io_reservation.write_iops_max",
+        value as f64,
+        &[],
+    );
+}
+
+pub fn sandbox_io_read_bandwidth_mib_per_sec_max(value: u64) {
+    gauge(
+        "node_disk.sandbox_io_reservation.read_bandwidth_mib_per_sec_max",
+        value as f64,
+        &[],
+    );
+}
+
+pub fn sandbox_io_write_bandwidth_mib_per_sec_max(value: u64) {
+    gauge(
+        "node_disk.sandbox_io_reservation.write_bandwidth_mib_per_sec_max",
+        value as f64,
+        &[],
+    );
+}

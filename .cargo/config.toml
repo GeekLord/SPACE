@@ -1,0 +1,14 @@
+[alias]
+lint = "clippy --workspace --locked -- -D warnings"
+
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-musl-gcc"
+rustflags = [
+  "-C", "link-arg=-fuse-ld=mold",
+]
+
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"
+rustflags = [
+  "-C", "link-arg=-fuse-ld=mold",
+]

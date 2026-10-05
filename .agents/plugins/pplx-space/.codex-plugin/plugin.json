@@ -1,0 +1,24 @@
+{
+  "name": "pplx-space",
+  "version": "0.2.31",
+  "description": "SPACE development, validation, infrastructure, and operations workflows.",
+  "author": {
+    "name": "Perplexity AI"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "SPACE",
+    "shortDescription": "SPACE development, validation, and operations workflows",
+    "longDescription": "Repository-owned SPACE workflows consolidated into task-domain skills for code quality, Rust, Go, data stores, infrastructure, templates, validation, and observability.",
+    "developerName": "Perplexity AI",
+    "category": "DevOps",
+    "capabilities": [
+      "Development",
+      "Validation",
+      "Operations"
+    ],
+    "defaultPrompt": [
+      "Use the matching SPACE skill to develop, validate, or operate this change."
+    ]
+  }
+}

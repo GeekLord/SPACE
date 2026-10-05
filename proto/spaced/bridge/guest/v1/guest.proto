@@ -1,0 +1,91 @@
+syntax = "proto3";
+package space.spaced.bridge.guest.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+import "spaced/operations/v1/operations.proto";
+// SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_0_1_4: also requires MIN_HOST 0.1.4.
+import public "spaced/bridge/guest/v1/legacy.proto";
+
+// Host→guest bridge hosted by spaced-guest-svc.
+service Meta {
+  rpc Ping(PingRequest) returns (PingResponse);
+  rpc WaitReady(WaitReadyRequest) returns (WaitReadyResponse);
+  rpc ConfigureProcessEnv(ConfigureProcessEnvRequest) returns (ConfigureProcessEnvResponse);
+  rpc NotifyResume(NotifyResumeRequest) returns (NotifyResumeResponse);
+  rpc FlushFilesystems(FlushFilesystemsRequest) returns (FlushFilesystemsResponse);
+}
+
+service Process {
+  rpc Start(space.spaced.operations.v1.StartRequest) returns (stream space.spaced.operations.v1.ProcessEvent);
+  rpc ConnectProcess(space.spaced.operations.v1.ConnectProcessRequest) returns (stream space.spaced.operations.v1.ProcessEvent);
+  rpc ListProcesses(space.spaced.operations.v1.ListProcessesRequest) returns (stream space.spaced.operations.v1.ProcessInfo);
+  rpc SendSignal(space.spaced.operations.v1.SendSignalRequest) returns (space.spaced.operations.v1.SendSignalResponse);
+  rpc SendInput(space.spaced.operations.v1.SendInputRequest) returns (space.spaced.operations.v1.SendInputResponse);
+  rpc CloseStdin(space.spaced.operations.v1.CloseStdinRequest) returns (space.spaced.operations.v1.CloseStdinResponse);
+  rpc ResizePty(space.spaced.operations.v1.ResizePtyRequest) returns (space.spaced.operations.v1.ResizePtyResponse);
+}
+
+// In-guest bridging of explicitly-exposed TCP ports. spaced-host-svc calls
+// these RPCs after the host-side firewall (`expose_port` + `allow_port`)
+// has installed the DNAT into vpeer_ip:port; the in-guest agent then makes
+// 127.0.0.1-bound listeners reachable on the VM's external interface.
+service Networking {
+  rpc OpenLoopbackBridge(space.spaced.operations.v1.OpenLoopbackBridgeRequest) returns (space.spaced.operations.v1.OpenLoopbackBridgeResponse);
+  rpc CloseLoopbackBridge(space.spaced.operations.v1.CloseLoopbackBridgeRequest) returns (space.spaced.operations.v1.CloseLoopbackBridgeResponse);
+}
+
+service Filesystem {
+  // SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_0_1_4: also requires MIN_HOST 0.1.4.
+  rpc Stat(space.spaced.operations.v1.StatRequest) returns (LegacyStatResponse) { option deprecated = true; }
+  rpc List(space.spaced.operations.v1.ListRequest) returns (stream LegacyDirEntry) { option deprecated = true; }
+  rpc StatInfo(space.spaced.operations.v1.StatRequest) returns (space.spaced.operations.v1.StatResponse);
+  rpc ListInfo(space.spaced.operations.v1.ListRequest) returns (stream space.spaced.operations.v1.FileInfo);
+  rpc Read(space.spaced.operations.v1.ReadRequest) returns (stream space.spaced.operations.v1.FileChunk);
+  rpc Write(stream space.spaced.operations.v1.WriteRequest) returns (space.spaced.operations.v1.WriteResponse);
+  rpc WriteBatch(space.spaced.operations.v1.WriteBatchRequest) returns (space.spaced.operations.v1.WriteBatchResponse);
+  rpc Mkdir(space.spaced.operations.v1.MkdirRequest) returns (space.spaced.operations.v1.MkdirResponse);
+  rpc Remove(space.spaced.operations.v1.RemoveRequest) returns (space.spaced.operations.v1.RemoveResponse);
+  rpc Rename(space.spaced.operations.v1.RenameRequest) returns (space.spaced.operations.v1.RenameResponse);
+  rpc NormalizeWatchRoot(space.spaced.operations.v1.NormalizeWatchRootRequest) returns (space.spaced.operations.v1.NormalizeWatchRootResponse);
+  rpc Watch(space.spaced.operations.v1.WatchRequest) returns (stream space.spaced.operations.v1.FileEvent);
+  rpc CreateWatcher(space.spaced.operations.v1.CreateWatcherRequest) returns (space.spaced.operations.v1.CreateWatcherResponse);
+  rpc GetWatcherEvents(space.spaced.operations.v1.GetWatcherEventsRequest) returns (space.spaced.operations.v1.GetWatcherEventsResponse);
+  rpc RemoveWatcher(space.spaced.operations.v1.RemoveWatcherRequest) returns (space.spaced.operations.v1.RemoveWatcherResponse);
+  rpc EnableFileChanges(space.spaced.operations.v1.EnableFileChangesRequest) returns (space.spaced.operations.v1.EnableFileChangesResponse);
+  rpc DisableFileChanges(space.spaced.operations.v1.DisableFileChangesRequest) returns (space.spaced.operations.v1.DisableFileChangesResponse);
+  rpc GetModifiedFiles(space.spaced.operations.v1.GetModifiedFilesRequest) returns (space.spaced.operations.v1.GetModifiedFilesResponse);
+}
+
+message PingRequest {}
+message PingResponse {}
+
+message WaitReadyRequest { google.protobuf.Duration timeout = 1; }
+message WaitReadyResponse {
+  bool ready = 1;
+  google.protobuf.Duration guest_uptime = 2;
+  string version = 3;
+  string compatibility_family = 4;
+  optional uint64 mem_total_bytes = 5;
+  optional uint32 vcpu_count = 6;
+}
+
+message ConfigureProcessEnvRequest {
+  map<string, string> env = 1;
+}
+message ConfigureProcessEnvResponse {}
+
+
+message NotifyResumeRequest {
+  space.spaced.operations.v1.ResumeReason reason = 1;
+  google.protobuf.Timestamp host_time = 2;
+}
+
+
+message NotifyResumeResponse {
+  space.spaced.operations.v1.ClockSyncStatus clock_sync_status = 1;
+  bool ready = 2;
+}
+
+message FlushFilesystemsRequest {}
+message FlushFilesystemsResponse {}

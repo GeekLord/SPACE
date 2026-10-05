@@ -1,0 +1,26 @@
+[package]
+name = "pplx-space-placement"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+jiff = { workspace = true }
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "uuid"] }
+thiserror = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+
+# internal
+pplx-space-common-core = { workspace = true, features = ["sqlx"] }
+
+[dev-dependencies]
+futures-util = { workspace = true }
+pplx-space-db-test-fixtures = { workspace = true }
+pplx-space-test-env = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

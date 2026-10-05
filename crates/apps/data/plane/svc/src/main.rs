@@ -1,0 +1,89 @@
+use std::time::Duration;
+
+use clap::Parser;
+use pplx_space_data_plane_server::{
+    DEFAULT_ATTACH_DEADLINE_MS, DEFAULT_BACKEND_CHANNEL_POOL_SIZE, DEFAULT_LISTEN,
+    DEFAULT_MAX_ATTACHED_STREAMS, DEFAULT_MAX_ATTACHED_STREAMS_PER_ORG,
+    DEFAULT_MAX_ATTACHED_STREAMS_PER_SANDBOX, DEFAULT_REVOCATION_CHECK_INTERVAL_MS,
+    DEFAULT_ROUTE_CACHE_TTL_MS, DEFAULT_UNAUTHENTICATED_UPGRADE_CAP_PER_IP, DataPlaneConfig,
+};
+
+const SERVICE_NAME: &str = "space-data-plane";
+
+#[derive(Parser)]
+#[command(
+    name = "space-data-plane-svc",
+    about = "SPACE public data-plane stream gateway",
+    version,
+    disable_version_flag = true
+)]
+struct Cli {
+    /// Print version.
+    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
+    _version: (),
+
+    /// Listen address.
+    #[arg(long, default_value = DEFAULT_LISTEN)]
+    listen: String,
+
+    /// First-frame attach deadline for upgraded sockets without a header token.
+    #[arg(long, default_value_t = DEFAULT_ATTACH_DEADLINE_MS)]
+    attach_deadline_ms: u64,
+
+    /// Maximum unauthenticated upgraded sockets per source IP.
+    #[arg(long, default_value_t = DEFAULT_UNAUTHENTICATED_UPGRADE_CAP_PER_IP)]
+    unauthenticated_upgrade_cap_per_ip: usize,
+
+    /// Maximum authenticated attached native streams per replica.
+    #[arg(long, default_value_t = DEFAULT_MAX_ATTACHED_STREAMS)]
+    max_attached_streams: usize,
+
+    /// Maximum authenticated attached native streams per org on this replica.
+    #[arg(long, default_value_t = DEFAULT_MAX_ATTACHED_STREAMS_PER_ORG)]
+    max_attached_streams_per_org: usize,
+
+    /// Maximum authenticated attached native streams per sandbox on this replica.
+    #[arg(long, default_value_t = DEFAULT_MAX_ATTACHED_STREAMS_PER_SANDBOX)]
+    max_attached_streams_per_sandbox: usize,
+
+    /// HTTP/2 channels kept per backend node-api endpoint.
+    #[arg(long, default_value_t = DEFAULT_BACKEND_CHANNEL_POOL_SIZE)]
+    backend_channel_pool_size: usize,
+
+    /// Interval between revocation checks for long-lived attached streams.
+    #[arg(long, default_value_t = DEFAULT_REVOCATION_CHECK_INTERVAL_MS)]
+    revocation_check_interval_ms: u64,
+
+    /// Short-lived TTL for token-scoped route resolution cache entries.
+    #[arg(long, default_value_t = DEFAULT_ROUTE_CACHE_TTL_MS)]
+    route_cache_ttl_ms: u64,
+}
+
+impl From<Cli> for DataPlaneConfig {
+    fn from(cli: Cli) -> Self {
+        Self {
+            listen: cli.listen,
+            attach_deadline: Duration::from_millis(cli.attach_deadline_ms),
+            unauthenticated_upgrade_cap_per_ip: cli.unauthenticated_upgrade_cap_per_ip,
+            max_attached_streams: cli.max_attached_streams,
+            max_attached_streams_per_org: cli.max_attached_streams_per_org,
+            max_attached_streams_per_sandbox: cli.max_attached_streams_per_sandbox,
+            backend_channel_pool_size: cli.backend_channel_pool_size,
+            revocation_check_interval: Duration::from_millis(
+                cli.revocation_check_interval_ms.max(1),
+            ),
+            route_cache_ttl: Duration::from_millis(cli.route_cache_ttl_ms.max(1)),
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let telemetry = pplx_space_common_svc::init_service(SERVICE_NAME)?;
+    let shutdown_token = pplx_space_common_svc::shutdown_token();
+
+    let result = pplx_space_data_plane_server::run(cli.into(), shutdown_token).await;
+    pplx_space_common_svc::shutdown_telemetry(telemetry).await;
+    Ok(result?)
+}

@@ -1,0 +1,571 @@
+
+# cargo-vet audits file
+
+[audits]
+
+[[trusted.anyhow]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2026-07-18"
+end = "2027-09-24"
+notes = "dtolnay release account for named serde, error-handling, and proc-macro crates; includes locked releases from 2026-07-18."
+
+[[trusted.aws-config]]
+criteria = "safe-to-deploy"
+user-id = 160111 # AWS SDK Rust Bot (aws-sdk-rust-ci)
+start = "2026-09-04"
+end = "2027-09-24"
+notes = "AWS SDK Rust CI release account for named SDK and Smithy crates; includes locked releases from 2026-09-04."
+
+[[trusted.aws-credential-types]]
+criteria = "safe-to-deploy"
+user-id = 160111 # AWS SDK Rust Bot (aws-sdk-rust-ci)
+start = "2026-07-08"
+end = "2027-09-24"
+notes = "AWS SDK Rust CI release account for named SDK and Smithy crates; includes locked releases from 2026-07-08."
+
+[[trusted.aws-runtime]]
+criteria = "safe-to-deploy"
+user-id = 160111 # AWS SDK Rust Bot (aws-sdk-rust-ci)
+start = "2026-09-04"
+end = "2027-09-24"
+notes = "AWS SDK Rust CI release account for named SDK and Smithy crates; includes locked releases from 2026-09-04."
+
+[[trusted.aws-sdk-acmpca]]
+criteria = "safe-to-deploy"
+user-id = 160111 # AWS SDK Rust Bot (aws-sdk-rust-ci)
+start = "2026-09-04"
+end = "2027-09-24"
+notes = "AWS SDK Rust CI release account for named SDK and Smithy crates; includes locked releases from 2026-09-04."
+
+[[trusted.aws-sdk-ecr]]
+criteria = "safe-to-deploy"
+user-id = 160111 # AWS SDK Rust Bot (aws-sdk-rust-ci)
+start = "2026-09-04"
+end = "2027-09-24"
+notes = "AWS SDK Rust CI release account for named SDK and Smithy crates; includes locked releases from 2026-09-04."
+
+[[trusted.aws-sdk-s3]]
+criteria = "safe-to-deploy"
+user-id = 160111 # AWS SDK Rust Bot (aws-sdk-rust-ci)
+start = "2026-09-11"
+end = "2027-09-24"
+notes = "AWS SDK Rust CI release account for named SDK and Smithy crates; includes locked releases from 2026-09-11."
+
+[[trusted.aws-sdk-secretsmanager]]
+criteria = "safe-to-deploy"
+user-id = 160111 # AWS SDK Rust Bot (aws-sdk-rust-ci)
+start = "2026-09-04"
+end = "2027-09-24"
+notes = "AWS SDK Rust CI release account for named SDK and Smithy crates; includes locked releases from 2026-09-04."
+
+[[trusted.aws-sdk-sso]]
+criteria = "safe-to-deploy"
+user-id = 160111 # AWS SDK Rust Bot (aws-sdk-rust-ci)
+start = "2026-09-04"
+end = "2027-09-24"
+notes = "AWS SDK Rust CI release account for named SDK and Smithy crates; includes locked releases from 2026-09-04."
+
+[[trusted.aws-sdk-ssooidc]]
+criteria = "safe-to-deploy"
+user-id = 160111 # AWS SDK Rust Bot (aws-sdk-rust-ci)
+start = "2026-09-04"
+end = "2027-09-24"
+notes = "AWS SDK Rust CI release account for named SDK and Smithy crates; includes locked releases from 2026-09-04."
+
+[[trusted.aws-sdk-sts]]
+criteria = "safe-to-deploy"
+user-id = 160111 # AWS SDK Rust Bot (aws-sdk-rust-ci)
+start = "2026-09-04"
+end = "2027-09-24"
+notes = "AWS SDK Rust CI release account for named SDK and Smithy crates; includes locked releases from 2026-09-04."
+
+[[trusted.aws-sigv4]]
+criteria = "safe-to-deploy"
+user-id = 160111 # AWS SDK Rust Bot (aws-sdk-rust-ci)
+start = "2026-07-08"
+end = "2027-09-24"
+notes = "AWS SDK Rust CI release account for named SDK and Smithy crates; includes locked releases from 2026-07-08."
+
+[[trusted.aws-smithy-async]]
+criteria = "safe-to-deploy"
+user-id = 160111 # AWS SDK Rust Bot (aws-sdk-rust-ci)
+start = "2026-07-07"
+end = "2027-09-24"
+notes = "AWS SDK Rust CI release account for named SDK and Smithy crates; includes locked releases from 2026-07-07."
+
+[[trusted.aws-smithy-checksums]]
+criteria = "safe-to-deploy"
+user-id = 160111 # AWS SDK Rust Bot (aws-sdk-rust-ci)
+start = "2026-07-07"
+end = "2027-09-24"
+notes = "AWS SDK Rust CI release account for named SDK and Smithy crates; includes locked releases from 2026-07-07."
+
+[[trusted.aws-smithy-eventstream]]
+criteria = "safe-to-deploy"
+user-id = 160111 # AWS SDK Rust Bot (aws-sdk-rust-ci)
+start = "2026-08-12"
+end = "2027-09-24"
+notes = "AWS SDK Rust CI release account for named SDK and Smithy crates; includes locked releases from 2026-08-12."
+
+[[trusted.aws-smithy-http]]
+criteria = "safe-to-deploy"
+user-id = 160111 # AWS SDK Rust Bot (aws-sdk-rust-ci)
+start = "2026-07-07"
+end = "2027-09-24"
+notes = "AWS SDK Rust CI release account for named SDK and Smithy crates; includes locked releases from 2026-07-07."
+
+[[trusted.aws-smithy-http-client]]
+criteria = "safe-to-deploy"
+user-id = 160111 # AWS SDK Rust Bot (aws-sdk-rust-ci)
+start = "2026-08-19"
+end = "2027-09-24"
+notes = "AWS SDK Rust CI release account for named SDK and Smithy crates; includes locked releases from 2026-08-19."
+
+[[trusted.aws-smithy-json]]
+criteria = "safe-to-deploy"
+user-id = 160111 # AWS SDK Rust Bot (aws-sdk-rust-ci)
+start = "2026-07-07"
+end = "2027-09-24"
+notes = "AWS SDK Rust CI release account for named SDK and Smithy crates; includes locked releases from 2026-07-07."
+
+[[trusted.aws-smithy-observability]]
+criteria = "safe-to-deploy"
+user-id = 160111 # AWS SDK Rust Bot (aws-sdk-rust-ci)
+start = "2026-07-07"
+end = "2027-09-24"
+notes = "AWS SDK Rust CI release account for named SDK and Smithy crates; includes locked releases from 2026-07-07."
+
+[[trusted.aws-smithy-query]]
+criteria = "safe-to-deploy"
+user-id = 160111 # AWS SDK Rust Bot (aws-sdk-rust-ci)
+start = "2026-07-14"
+end = "2027-09-24"
+notes = "AWS SDK Rust CI release account for named SDK and Smithy crates; includes locked releases from 2026-07-14."
+
+[[trusted.aws-smithy-runtime]]
+criteria = "safe-to-deploy"
+user-id = 160111 # AWS SDK Rust Bot (aws-sdk-rust-ci)
+start = "2026-08-19"
+end = "2027-09-24"
+notes = "AWS SDK Rust CI release account for named SDK and Smithy crates; includes locked releases from 2026-08-19."
+
+[[trusted.aws-smithy-runtime-api]]
+criteria = "safe-to-deploy"
+user-id = 160111 # AWS SDK Rust Bot (aws-sdk-rust-ci)
+start = "2026-09-03"
+end = "2027-09-24"
+notes = "AWS SDK Rust CI release account for named SDK and Smithy crates; includes locked releases from 2026-09-03."
+
+[[trusted.aws-smithy-runtime-api-macros]]
+criteria = "safe-to-deploy"
+user-id = 160111 # AWS SDK Rust Bot (aws-sdk-rust-ci)
+start = "2026-07-07"
+end = "2027-09-24"
+notes = "AWS SDK Rust CI release account for named SDK and Smithy crates; includes locked releases from 2026-07-07."
+
+[[trusted.aws-smithy-schema]]
+criteria = "safe-to-deploy"
+user-id = 160111 # AWS SDK Rust Bot (aws-sdk-rust-ci)
+start = "2026-07-07"
+end = "2027-09-24"
+notes = "AWS SDK Rust CI release account for named SDK and Smithy crates; includes locked releases from 2026-07-07."
+
+[[trusted.aws-smithy-types]]
+criteria = "safe-to-deploy"
+user-id = 160111 # AWS SDK Rust Bot (aws-sdk-rust-ci)
+start = "2026-09-03"
+end = "2027-09-24"
+notes = "AWS SDK Rust CI release account for named SDK and Smithy crates; includes locked releases from 2026-09-03."
+
+[[trusted.aws-smithy-xml]]
+criteria = "safe-to-deploy"
+user-id = 160111 # AWS SDK Rust Bot (aws-sdk-rust-ci)
+start = "2026-07-14"
+end = "2027-09-24"
+notes = "AWS SDK Rust CI release account for named SDK and Smithy crates; includes locked releases from 2026-07-14."
+
+[[trusted.aws-types]]
+criteria = "safe-to-deploy"
+user-id = 160111 # AWS SDK Rust Bot (aws-sdk-rust-ci)
+start = "2026-09-04"
+end = "2027-09-24"
+notes = "AWS SDK Rust CI release account for named SDK and Smithy crates; includes locked releases from 2026-09-04."
+
+[[trusted.axum]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2026-04-14"
+end = "2027-09-24"
+notes = "Darksonn release account for named Tokio, Bytes, and Axum crates; includes locked releases from 2026-04-14."
+
+[[trusted.bytes]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2026-07-08"
+end = "2027-09-24"
+notes = "Darksonn release account for named Tokio, Bytes, and Axum crates; includes locked releases from 2026-07-08."
+
+[[trusted.clap]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2026-09-14"
+end = "2027-09-24"
+notes = "epage release account for named clap crates; includes locked releases from 2026-09-14."
+
+[[trusted.clap_builder]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2026-09-14"
+end = "2027-09-24"
+notes = "epage release account for named clap crates; includes locked releases from 2026-09-14."
+
+[[trusted.clap_derive]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2026-09-14"
+end = "2027-09-24"
+notes = "epage release account for named clap crates; includes locked releases from 2026-09-14."
+
+[[trusted.clap_lex]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2026-09-14"
+end = "2027-09-24"
+notes = "epage release account for named clap crates; includes locked releases from 2026-09-14."
+
+[[trusted.futures]]
+criteria = "safe-to-deploy"
+user-id = 33035 # Taiki Endo (taiki-e)
+start = "2026-08-11"
+end = "2027-09-24"
+notes = "taiki-e release account for named futures-rs crates; includes locked releases from 2026-08-11."
+
+[[trusted.futures-channel]]
+criteria = "safe-to-deploy"
+user-id = 33035 # Taiki Endo (taiki-e)
+start = "2026-08-11"
+end = "2027-09-24"
+notes = "taiki-e release account for named futures-rs crates; includes locked releases from 2026-08-11."
+
+[[trusted.futures-core]]
+criteria = "safe-to-deploy"
+user-id = 33035 # Taiki Endo (taiki-e)
+start = "2026-08-11"
+end = "2027-09-24"
+notes = "taiki-e release account for named futures-rs crates; includes locked releases from 2026-08-11."
+
+[[trusted.futures-executor]]
+criteria = "safe-to-deploy"
+user-id = 33035 # Taiki Endo (taiki-e)
+start = "2026-08-11"
+end = "2027-09-24"
+notes = "taiki-e release account for named futures-rs crates; includes locked releases from 2026-08-11."
+
+[[trusted.futures-io]]
+criteria = "safe-to-deploy"
+user-id = 33035 # Taiki Endo (taiki-e)
+start = "2026-08-11"
+end = "2027-09-24"
+notes = "taiki-e release account for named futures-rs crates; includes locked releases from 2026-08-11."
+
+[[trusted.futures-macro]]
+criteria = "safe-to-deploy"
+user-id = 33035 # Taiki Endo (taiki-e)
+start = "2026-08-11"
+end = "2027-09-24"
+notes = "taiki-e release account for named futures-rs crates; includes locked releases from 2026-08-11."
+
+[[trusted.futures-sink]]
+criteria = "safe-to-deploy"
+user-id = 33035 # Taiki Endo (taiki-e)
+start = "2026-08-11"
+end = "2027-09-24"
+notes = "taiki-e release account for named futures-rs crates; includes locked releases from 2026-08-11."
+
+[[trusted.futures-task]]
+criteria = "safe-to-deploy"
+user-id = 33035 # Taiki Endo (taiki-e)
+start = "2026-08-11"
+end = "2027-09-24"
+notes = "taiki-e release account for named futures-rs crates; includes locked releases from 2026-08-11."
+
+[[trusted.futures-util]]
+criteria = "safe-to-deploy"
+user-id = 33035 # Taiki Endo (taiki-e)
+start = "2026-08-11"
+end = "2027-09-24"
+notes = "taiki-e release account for named futures-rs crates; includes locked releases from 2026-08-11."
+
+[[trusted.globset]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2026-08-04"
+end = "2027-09-24"
+notes = "BurntSushi release account for named Regex and Glob crates; includes locked releases from 2026-08-04."
+
+[[trusted.h2]]
+criteria = "safe-to-deploy"
+user-id = 359 # Sean McArthur (seanmonstar)
+start = "2026-08-24"
+end = "2027-09-24"
+notes = "seanmonstar release account for named HTTP and network crates; includes locked releases from 2026-08-24."
+
+[[trusted.http]]
+criteria = "safe-to-deploy"
+user-id = 359 # Sean McArthur (seanmonstar)
+start = "2024-03-04"
+end = "2027-09-24"
+notes = "seanmonstar release account for named HTTP and network crates; includes locked releases from 2024-03-04."
+
+[[trusted.http-body]]
+criteria = "safe-to-deploy"
+user-id = 359 # Sean McArthur (seanmonstar)
+start = "2023-12-08"
+end = "2027-09-24"
+notes = "seanmonstar release account for named HTTP and network crates; includes locked releases from 2023-12-08."
+
+[[trusted.http-body-util]]
+criteria = "safe-to-deploy"
+user-id = 359 # Sean McArthur (seanmonstar)
+start = "2026-08-12"
+end = "2027-09-24"
+notes = "seanmonstar release account for named HTTP and network crates; includes locked releases from 2026-08-12."
+
+[[trusted.httparse]]
+criteria = "safe-to-deploy"
+user-id = 359 # Sean McArthur (seanmonstar)
+start = "2025-03-03"
+end = "2027-09-24"
+notes = "seanmonstar release account for named HTTP and network crates; includes locked releases from 2025-03-03."
+
+[[trusted.hyper]]
+criteria = "safe-to-deploy"
+user-id = 359 # Sean McArthur (seanmonstar)
+start = "2026-08-28"
+end = "2027-09-24"
+notes = "seanmonstar release account for named HTTP and network crates; includes locked releases from 2026-08-28."
+
+[[trusted.hyper-util]]
+criteria = "safe-to-deploy"
+user-id = 359 # Sean McArthur (seanmonstar)
+start = "2026-02-02"
+end = "2027-09-24"
+notes = "seanmonstar release account for named HTTP and network crates; includes locked releases from 2026-02-02."
+
+[[trusted.itoa]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2026-03-20"
+end = "2027-09-24"
+notes = "dtolnay release account for named serde, error-handling, and proc-macro crates; includes locked releases from 2026-03-20."
+
+[[trusted.jiff]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2026-09-12"
+end = "2027-09-24"
+notes = "BurntSushi release account for named Jiff crates; includes locked releases from 2026-09-12."
+
+[[trusted.jiff-core]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2026-09-12"
+end = "2027-09-24"
+notes = "BurntSushi release account for named Jiff crates; includes locked releases from 2026-09-12."
+
+[[trusted.jiff-static]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2026-09-12"
+end = "2027-09-24"
+notes = "BurntSushi release account for named Jiff crates; includes locked releases from 2026-09-12."
+
+[[trusted.jiff-tzdb]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2026-07-09"
+end = "2027-09-24"
+notes = "BurntSushi release account for named Jiff crates; includes locked releases from 2026-07-09."
+
+[[trusted.jiff-tzdb-platform]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2025-03-23"
+end = "2027-09-24"
+notes = "BurntSushi release account for named Jiff crates; includes locked releases from 2025-03-23."
+
+[[trusted.proc-macro2]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2026-07-19"
+end = "2027-09-24"
+notes = "dtolnay release account for named serde, error-handling, and proc-macro crates; includes locked releases from 2026-07-19."
+
+[[trusted.quote]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2026-07-19"
+end = "2027-09-24"
+notes = "dtolnay release account for named serde, error-handling, and proc-macro crates; includes locked releases from 2026-07-19."
+
+[[trusted.regex]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2026-07-15"
+end = "2027-09-24"
+notes = "BurntSushi release account for named Regex and Glob crates; includes locked releases from 2026-07-15."
+
+[[trusted.regex-automata]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2026-08-04"
+end = "2027-09-24"
+notes = "BurntSushi release account for named Regex and Glob crates; includes locked releases from 2026-08-04."
+
+[[trusted.regex-lite]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2026-02-03"
+end = "2027-09-24"
+notes = "BurntSushi release account for named Regex and Glob crates; includes locked releases from 2026-02-03."
+
+[[trusted.regex-syntax]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2026-06-09"
+end = "2027-09-24"
+notes = "BurntSushi release account for named Regex and Glob crates; includes locked releases from 2026-06-09."
+
+[[trusted.reqwest]]
+criteria = "safe-to-deploy"
+user-id = 359 # Sean McArthur (seanmonstar)
+start = "2025-12-22"
+end = "2027-09-24"
+notes = "seanmonstar release account for named HTTP and network crates; includes locked releases from 2025-12-22."
+
+[[trusted.ryu]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2026-02-08"
+end = "2027-09-24"
+notes = "dtolnay release account for named serde, error-handling, and proc-macro crates; includes locked releases from 2026-02-08."
+
+[[trusted.serde]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2026-07-18"
+end = "2027-09-24"
+notes = "dtolnay release account for named serde, error-handling, and proc-macro crates; includes locked releases from 2026-07-18."
+
+[[trusted.serde_core]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2026-07-18"
+end = "2027-09-24"
+notes = "dtolnay release account for named serde, error-handling, and proc-macro crates; includes locked releases from 2026-07-18."
+
+[[trusted.serde_derive]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2026-07-18"
+end = "2027-09-24"
+notes = "dtolnay release account for named serde, error-handling, and proc-macro crates; includes locked releases from 2026-07-18."
+
+[[trusted.serde_json]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2026-07-20"
+end = "2027-09-24"
+notes = "dtolnay release account for named serde, error-handling, and proc-macro crates; includes locked releases from 2026-07-20."
+
+[[trusted.syn]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2023-02-24"
+end = "2027-09-24"
+notes = "dtolnay release account for named serde, error-handling, and proc-macro crates; includes locked releases from 2023-02-24."
+
+[[trusted.thiserror]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2024-11-10"
+end = "2027-09-24"
+notes = "dtolnay release account for named serde, error-handling, and proc-macro crates; includes locked releases from 2024-11-10."
+
+[[trusted.thiserror-impl]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2024-11-10"
+end = "2027-09-24"
+notes = "dtolnay release account for named serde, error-handling, and proc-macro crates; includes locked releases from 2024-11-10."
+
+[[trusted.tokio]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2026-07-20"
+end = "2027-09-24"
+notes = "Darksonn release account for named Tokio, Bytes, and Axum crates; includes locked releases from 2026-07-20."
+
+[[trusted.tokio-macros]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2026-07-29"
+end = "2027-09-24"
+notes = "Darksonn release account for named Tokio, Bytes, and Axum crates; includes locked releases from 2026-07-29."
+
+[[trusted.tokio-stream]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2026-07-22"
+end = "2027-09-24"
+notes = "Darksonn release account for named Tokio, Bytes, and Axum crates; includes locked releases from 2026-07-22."
+
+[[trusted.tokio-util]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2026-07-21"
+end = "2027-09-24"
+notes = "Darksonn release account for named Tokio, Bytes, and Axum crates; includes locked releases from 2026-07-21."
+
+[[trusted.tower]]
+criteria = "safe-to-deploy"
+user-id = 359 # Sean McArthur (seanmonstar)
+start = "2026-01-12"
+end = "2027-09-24"
+notes = "seanmonstar release account for named HTTP and network crates; includes locked releases from 2026-01-12."
+
+[[trusted.tower-http]]
+criteria = "safe-to-deploy"
+user-id = 359 # Sean McArthur (seanmonstar)
+start = "2026-05-18"
+end = "2027-09-24"
+notes = "seanmonstar release account for named HTTP and network crates; includes locked releases from 2026-05-18."
+
+[[trusted.tracing]]
+criteria = "safe-to-deploy"
+user-id = 172786 # Hayden Stainsby (hds)
+start = "2025-12-18"
+end = "2027-09-24"
+notes = "hds release account for named tracing crates; includes locked releases from 2025-12-18."
+
+[[trusted.tracing-attributes]]
+criteria = "safe-to-deploy"
+user-id = 172786 # Hayden Stainsby (hds)
+start = "2025-11-26"
+end = "2027-09-24"
+notes = "hds release account for named tracing crates; includes locked releases from 2025-11-26."
+
+[[trusted.tracing-core]]
+criteria = "safe-to-deploy"
+user-id = 172786 # Hayden Stainsby (hds)
+start = "2025-12-18"
+end = "2027-09-24"
+notes = "hds release account for named tracing crates; includes locked releases from 2025-12-18."
+
+[[trusted.tracing-subscriber]]
+criteria = "safe-to-deploy"
+user-id = 172786 # Hayden Stainsby (hds)
+start = "2026-03-13"
+end = "2027-09-24"
+notes = "hds release account for named tracing crates; includes locked releases from 2026-03-13."

@@ -1,0 +1,99 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: traces-config
+data:
+  collector.yaml: |
+{{ tpl (.Files.Get "config/collector.yaml") . | indent 4 }}
+  tempo.yaml: |
+{{ tpl (.Files.Get "config/tempo.yaml") . | indent 4 }}
+---
+{{- if not .Values.storage.existingClaim }}
+{{ include "common.pvc" (dict "name" "tempo-data" "storage" .Values.storage) }}
+---
+{{- end }}
+{{- range $name := list "collector" "tempo" }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+spec:
+  type: ClusterIP
+  selector: {app: {{ $name }}}
+  ports:
+    - {name: otlp-grpc, port: 4317, targetPort: 4317}
+    {{- if eq $name "tempo" }}
+    - {name: http, port: 3200, targetPort: 3200}
+    {{- else }}
+    - {name: internal-metrics, port: 8888, targetPort: 8888}
+    {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: {{ $name }}}
+  template:
+    metadata:
+      labels:
+{{ include "common.podLabels" (dict "app" $name "profile" $.Values.profile "owner" "traces") | indent 8 }}
+      annotations:
+        checksum/config: {{ tpl ($.Files.Get (printf "config/%s.yaml" $name)) $ | sha256sum }}
+    spec:
+{{- include "common.scheduling" $.Values.scheduling | nindent 6 }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: {{ $name }}
+          image: {{ include "traces.image" (dict "root" $ "name" $name) | quote }}
+          securityContext:
+{{ include "common.containerSecurityContext" . | indent 12 }}
+          {{- if eq $name "collector" }}
+          args: ["--config=/etc/space/collector.yaml"]
+          env:
+            - {name: GOMEMLIMIT, value: 205MiB}
+          resources:
+{{ toYaml $.Values.collector.resources | indent 12 }}
+          readinessProbe:
+            httpGet: {path: /, port: 13133}
+            periodSeconds: 2
+          livenessProbe:
+            httpGet: {path: /, port: 13133}
+            initialDelaySeconds: 30
+          {{- else }}
+          args: ["-target=all", "-config.file=/etc/space/tempo.yaml"]
+          env:
+            - {name: GOMEMLIMIT, value: 1536MiB}
+          resources:
+{{ toYaml $.Values.tempo.resources | indent 12 }}
+          readinessProbe:
+            httpGet: {path: /ready, port: 3200}
+            periodSeconds: 3
+          startupProbe:
+            httpGet: {path: /ready, port: 3200}
+            periodSeconds: 3
+            failureThreshold: 60
+          {{- end }}
+          volumeMounts:
+            - {name: config, mountPath: /etc/space, readOnly: true}
+            {{- if eq $name "tempo" }}
+            - {name: data, mountPath: /var/tempo}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap: {name: traces-config}
+        {{- if eq $name "tempo" }}
+        - name: data
+          persistentVolumeClaim: {claimName: {{ include "common.claimName" (dict "name" "tempo-data" "storage" $.Values.storage) | quote }}}
+        {{- end }}
+---
+{{- end }}

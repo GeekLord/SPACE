@@ -1,0 +1,630 @@
+{
+  "uid": "space-main-health-logs",
+  "title": "SPACE: Main Health logs",
+  "description": "Read-only Loki companion to the SPACE health dashboard. SPACE logs only; no third-party ingestion, traces, or vendor pipeline enrichment.",
+  "schemaVersion": 41,
+  "version": 1,
+  "editable": false,
+  "timezone": "browser",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "refresh": "30s",
+  "tags": [
+    "space",
+    "kind",
+    "logs"
+  ],
+  "links": [
+    {
+      "title": "Main health",
+      "url": "/d/space-main-health",
+      "type": "link"
+    },
+    {
+      "title": "SPACE logs (optional Loki)",
+      "url": "/d/space-main-health-logs",
+      "type": "link"
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "Logs without Explore permissions",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 5
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Read-only panels work with Viewer access. Select the namespace and transport containing the services being investigated; host journals use **namespace = host** and **transport = journal**.\n\nOriginal JSON is retained; fields are parsed at query time. Counts use a sliding `$window` window and are bounded by backend retention. Missing event series can mean no matching events or incomplete collection: use **SPACE log volume** and **Recent SPACE logs** as positive controls."
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "SPACE log volume / $window",
+      "datasource": {
+        "type": "loki",
+        "uid": "space-loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Additional local collection view.\nPositive control, including non-JSON lines. This is log delivery, not service health.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service, source) (count_over_time({source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"}[$window]))",
+          "datasource": {
+            "type": "loki",
+            "uid": "space-loki"
+          },
+          "queryType": "range",
+          "editorMode": "code",
+          "legendFormat": "{{service}} {{source}}",
+          "maxLines": 500
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Warnings and errors / $window",
+      "datasource": {
+        "type": "loki",
+        "uid": "space-loki"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 5,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Additional local collection view.\nJSON level is case-sensitive. Absence is not filled with zero.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service, level) (count_over_time({source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"} | json level=\"level\" | level=~\"WARN|ERROR\" | __error__=\"\" [$window]))",
+          "datasource": {
+            "type": "loki",
+            "uid": "space-loki"
+          },
+          "queryType": "range",
+          "editorMode": "code",
+          "legendFormat": "{{service}} {{level}}",
+          "maxLines": 500
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "logs",
+      "title": "Recent SPACE logs",
+      "datasource": {
+        "type": "loki",
+        "uid": "space-loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 13,
+        "w": 24,
+        "h": 8
+      },
+      "description": "Additional local collection view.\nOriginal container/journal lines. Up to 500 newest matching records; expand a line for original JSON and structured metadata. No line_format rewriting.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"}",
+          "datasource": {
+            "type": "loki",
+            "uid": "space-loki"
+          },
+          "queryType": "range",
+          "editorMode": "code",
+          "legendFormat": "{{service}}",
+          "maxLines": 500
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Sandbox Fail Reasons and Errors / $window",
+      "datasource": {
+        "type": "loki",
+        "uid": "space-loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 21,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Sandbox Fail Reasons and Errors.\nSPACE sandbox_failed domain events. Error/reason are parsed at query time only; broad error messages can still create query-time cardinality. No Datadog Flex tier.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason, error, service) (count_over_time({source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"} | json event_type=\"event_type\", reason=\"reason\", error=\"error\" | event_type=\"sandbox_failed\" | __error__=\"\"[$window]))",
+          "datasource": {
+            "type": "loki",
+            "uid": "space-loki"
+          },
+          "queryType": "range",
+          "editorMode": "code",
+          "legendFormat": "{{service}} {{reason}} {{error}}",
+          "maxLines": 500
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Sandbox failure reasons: top 10 / selected range",
+      "datasource": {
+        "type": "loki",
+        "uid": "space-loki"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 21,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Sandbox Fail Reasons and Errors Top List.\nRequires nonempty reason/error to match the source missing-field exclusions; top ten across the selected range.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(10, sum by (reason, error) (count_over_time({source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"} | json event_type=\"event_type\", reason=\"reason\", error=\"error\" | event_type=\"sandbox_failed\" | __error__=\"\" | reason!=\"\" | error!=\"\" [$__range])))",
+          "datasource": {
+            "type": "loki",
+            "uid": "space-loki"
+          },
+          "queryType": "instant",
+          "editorMode": "code",
+          "legendFormat": "{{reason}} {{error}}",
+          "maxLines": 500
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Connect 5xx: top 10 sandboxes / selected range",
+      "datasource": {
+        "type": "loki",
+        "uid": "space-loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 29,
+        "w": 12,
+        "h": 8
+      },
+      "description": "/connect 500s and 502s.\nThe source >=500 filter includes every 5xx, not just 500/502. Uses the emitted url.path when a parent-span route is absent. Sandbox IDs are parsed at query time, never indexed.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(10, sum by (sandbox_id) (count_over_time({source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"} | json event_type=\"event_type\", sandbox_id=\"sandbox_id\", status=`[\"http.response.status_code\"]`, path=`[\"url.path\"]`, route=`span[\"http.route\"]` | event_type=\"ecw_sandbox_api_request\" | (route=\"/sandboxes/{sandboxID}/connect\" or path=~\"/sandboxes/[^/]+/connect\") | sandbox_id!=\"\" | status>=500 | __error__=\"\" [$__range])))",
+          "datasource": {
+            "type": "loki",
+            "uid": "space-loki"
+          },
+          "queryType": "instant",
+          "editorMode": "code",
+          "legendFormat": "{{sandbox_id}}",
+          "maxLines": 500
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Unique sandboxes with connect errors / $window",
+      "datasource": {
+        "type": "loki",
+        "uid": "space-loki"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 29,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Unique Sandboxes that users are unable to connect to repeatedly.\nDistinct IDs with >=1 matching failed request in each sliding window. The source title says repeatedly, but its cardinality query does not require repeated failures; this panel does not imply that either.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count by (status) (sum by (status, sandbox_id) (count_over_time({source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"} | json event_type=\"event_type\", sandbox_id=\"sandbox_id\", status=`[\"http.response.status_code\"]`, path=`[\"url.path\"]`, route=`span[\"http.route\"]` | event_type=\"ecw_sandbox_api_request\" | (route=\"/sandboxes/{sandboxID}/connect\" or path=~\"/sandboxes/[^/]+/connect\") | sandbox_id!=\"\" | status>=400 | __error__=\"\" [$window])))",
+          "datasource": {
+            "type": "loki",
+            "uid": "space-loki"
+          },
+          "queryType": "range",
+          "editorMode": "code",
+          "legendFormat": "HTTP {{status}}",
+          "maxLines": 500
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Sandbox Activations by Boot Type / $window",
+      "datasource": {
+        "type": "loki",
+        "uid": "space-loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 37,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Sandbox Activations by Boot Type.\nExtracts JSON source as event_source; source is already the container/journal transport label. Avoids confusing the two.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (boot_type) (count_over_time({source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"} | json event_stream=\"event_stream\", event_type=\"event_type\", event_source=\"source\", boot_type=\"boot_type\", execution_generation=\"execution_generation\" | event_stream=\"space.sandbox\" | event_type=\"runtime_activated\" | event_source=\"sbx_manager\" | __error__=\"\" [$window]))",
+          "datasource": {
+            "type": "loki",
+            "uid": "space-loki"
+          },
+          "queryType": "range",
+          "editorMode": "code",
+          "legendFormat": "{{boot_type}}",
+          "maxLines": 500
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Fresh runtime activations with generation > 1 / $window",
+      "datasource": {
+        "type": "loki",
+        "uid": "space-loki"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 37,
+        "w": 12,
+        "h": 8
+      },
+      "description": "WIP Workspace Wipes.\nPreserves the source WIP Workspace Wipes predicate. This is a diagnostic proxy, not proof that a user's workspace was wiped.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(count_over_time({source=~\"${transport:regex}\",namespace=~\"${namespace:regex}\",environment=~\"${environment:regex}\",cluster=~\"${cluster_id:regex}\",service=~\"${service:regex}\"} | json event_stream=\"event_stream\", event_type=\"event_type\", event_source=\"source\", boot_type=\"boot_type\", execution_generation=\"execution_generation\" | event_stream=\"space.sandbox\" | event_type=\"runtime_activated\" | event_source=\"sbx_manager\" | boot_type=\"fresh\" | execution_generation>1 | __error__=\"\" [$window]))",
+          "datasource": {
+            "type": "loki",
+            "uid": "space-loki"
+          },
+          "queryType": "range",
+          "editorMode": "code",
+          "legendFormat": "activations",
+          "maxLines": 500
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "text",
+      "title": "Source coverage limits",
+      "gridPos": {
+        "x": 0,
+        "y": 45,
+        "w": 24,
+        "h": 3
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "A **5xx minus successful spans** formula cannot be reproduced from logs alone: successful requests may not be logged, and no spans are collected here. Client-side events are out of scope. No current-emitter guarantee is made for panels whose source selector is not present in this checkout."
+      }
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "environment",
+        "label": "Environment",
+        "type": "query",
+        "datasource": {
+          "type": "loki",
+          "uid": "space-loki"
+        },
+        "query": "label_values(environment)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "cluster_id",
+        "label": "Cluster ID",
+        "type": "query",
+        "datasource": {
+          "type": "loki",
+          "uid": "space-loki"
+        },
+        "query": "label_values(cluster)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "service",
+        "label": "Service",
+        "type": "query",
+        "datasource": {
+          "type": "loki",
+          "uid": "space-loki"
+        },
+        "query": "label_values(service)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "namespace",
+        "label": "Namespace",
+        "type": "query",
+        "datasource": {
+          "type": "loki",
+          "uid": "space-loki"
+        },
+        "query": "label_values(namespace)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "space",
+          "value": "space"
+        }
+      },
+      {
+        "name": "transport",
+        "label": "Transport (avoid duplicate sources)",
+        "type": "custom",
+        "query": "container,journal",
+        "current": {
+          "text": "container",
+          "value": "container"
+        },
+        "includeAll": true,
+        "allValue": "container|journal",
+        "multi": false
+      },
+      {
+        "name": "window",
+        "label": "Rate / count window",
+        "type": "custom",
+        "query": "1m,5m,15m",
+        "current": {
+          "text": "5m",
+          "value": "5m"
+        },
+        "options": [
+          {
+            "text": "1m",
+            "value": "1m",
+            "selected": false
+          },
+          {
+            "text": "5m",
+            "value": "5m",
+            "selected": true
+          },
+          {
+            "text": "15m",
+            "value": "15m",
+            "selected": false
+          }
+        ]
+      }
+    ]
+  }
+}

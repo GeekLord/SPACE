@@ -1,0 +1,278 @@
+syntax = "proto3";
+package space.template.manager.v1;
+
+import "net/policy/v1/policy.proto";
+import "sandbox/manager/v1/manager.proto";
+import "execution/v1/execution.proto";
+
+service TemplateManager {
+  // Create a pool for a template.
+  rpc CreatePool(CreatePoolRequest) returns (CreatePoolResponse);
+
+  // Delete a pool.
+  rpc DeletePool(DeletePoolRequest) returns (DeletePoolResponse);
+
+  // Get pool status.
+  rpc PoolStatus(PoolStatusRequest) returns (PoolStatusResponse);
+
+  // Delete a template (all builds, snapshots, and tags).
+  rpc DeleteTemplate(DeleteTemplateRequest) returns (DeleteTemplateResponse);
+
+  // List all templates with snapshot/pool status.
+  rpc ListTemplates(ListTemplatesRequest) returns (ListTemplatesResponse);
+
+  // ── Template transfer / versioning ─────────────────────────────────────────
+
+  // Register a template on disk (compute hash, create digest dir, index in DB).
+  rpc RegisterTemplate(RegisterTemplateRequest) returns (RegisterTemplateResponse);
+
+  // Import a template from a stream of chunks.
+  rpc ImportTemplate(stream ImportTemplateRequest) returns (ImportTemplateResponse);
+
+  // Export a template as a stream of chunks.
+  rpc ExportTemplate(ExportTemplateRequest) returns (stream ExportTemplateChunk);
+
+  // Get template build metadata, resolve tag/hash, match snapshot.
+  rpc GetTemplate(GetTemplateRequest) returns (GetTemplateResponse);
+
+  // Delete a specific build (refuses if referenced by sandboxes/pools).
+  rpc DeleteTemplateBuild(DeleteTemplateBuildRequest) returns (DeleteTemplateBuildResponse);
+
+  // Update operational template settings.
+  rpc UpdateTemplateSettings(UpdateTemplateSettingsRequest) returns (UpdateTemplateSettingsResponse);
+
+  // Persist and reconcile desired base-snapshot policy for a template.
+  rpc UpdateTemplateSnapshotPolicy(UpdateTemplateSnapshotPolicyRequest) returns (UpdateTemplateSnapshotPolicyResponse);
+}
+
+message CreatePoolRequest {
+  string template = 1;
+  optional uint32 target_count = 2;
+  string boot_mode = 3;  // "snapshot" or "cold"
+  optional uint32 vcpu = 4;
+  optional uint32 memory_mib = 5;
+}
+
+message CreatePoolResponse {}
+
+message DeletePoolRequest {
+  string template = 1;
+}
+
+message DeletePoolResponse {
+  repeated string deleted_sandbox_ids = 1;
+}
+
+message PoolStatusRequest {
+  optional string template = 1;
+}
+
+message PoolStatusResponse {
+  repeated PoolInfo pools = 1;
+}
+
+message PoolInfo {
+  string template = 1;
+  uint32 target_count = 2;
+  uint32 current_count = 3;
+  uint32 pending_count = 4;
+  repeated string sandbox_ids = 5;
+}
+
+message DeleteTemplateRequest {
+  string template = 1;
+}
+
+message DeleteTemplateResponse {}
+
+message ListTemplatesRequest {}
+
+message ListTemplatesResponse {
+  repeated TemplateFullInfo templates = 1;
+}
+
+message TemplateFullInfo {
+  string name = 1;
+  bool has_base_snapshot = 2;
+  optional uint32 pool_target = 3;
+  uint32 pool_current = 4;
+  // Logical expanded rootfs artifact size from build metadata or object transfer.
+  optional uint64 artifact_size_bytes = 5;
+  optional uint64 base_snapshot_size_bytes = 6;
+  optional string built_at = 7;
+  optional string content_hash = 8;
+  optional string runtime = 9;
+  optional string arch = 10;
+  repeated SnapshotInfo snapshots = 11;
+  optional space.sandbox.manager.v1.AutoLifecyclePolicy default_auto_lifecycle = 12;
+  optional space.net.policy.v1.NetworkPolicyV1 network_policy = 13;
+  optional bool ensure_base_snapshot = 14;
+  optional uint32 snapshot_vcpu = 15;
+  optional uint32 snapshot_memory_mib = 16;
+  uint64 network_policy_generation = 17;
+  optional uint32 vcpu = 18;
+  optional uint32 memory_mib = 19;
+  optional uint32 disk_size_mb = 20;
+  // Node-local allocated bytes for the materialized template rootfs cache.
+  optional uint64 cache_size_bytes = 21;
+  space.net.policy.v1.PolicyAuthority network_policy_authority = 22;
+  space.net.policy.v1.PolicyAuthority auto_lifecycle_authority = 23;
+  optional space.execution.v1.ExecutionMetadata execution = 24;
+}
+
+// ── Template versioning messages ───────────────────────────────────────────
+
+// Identifies a template. Used in requests and responses.
+// In requests: name is required; content_hash and tag are optional selectors.
+// In responses: name and content_hash are always set (resolved).
+message TemplateRef {
+  string name = 1;
+  optional string content_hash = 2;     // exact build hash
+  optional string tag = 3;              // build alias
+}
+
+message SnapshotInfo {
+  uint32 vcpu = 1;
+  uint32 memory_mib = 2;
+  string snapshot_hash = 3;
+}
+
+message RegisterTemplateRequest {
+  TemplateRef template = 1;             // name required, tag optional
+  optional space.net.policy.v1.NetworkPolicyV1 network_policy = 2;
+  // Build-scoped staging directory to import from, as a single path
+  // component under the template's name directory (must begin with
+  // "build.importing."). Lets concurrent builds of one template register
+  // from isolated workspaces. When absent, the legacy flat layout
+  // ({name}/rootfs.ext4 + metadata.json) is scanned instead.
+  //
+  // Ownership/retry contract: the caller owns the staging directory and
+  // removes it only after receiving a successful response. The service
+  // never deletes it, so retrying the same request after a lost response
+  // is safe and returns the already-published digest.
+  optional string staging_dir = 3;
+}
+
+message RegisterTemplateResponse {
+  TemplateRef template = 1;             // resolved: name + content_hash + tag
+  string build_date = 2;
+}
+
+message GetTemplateRequest {
+  TemplateRef template = 1;             // name required, content_hash or tag optional
+  optional uint32 vcpu = 2;            // match snapshot with this vcpu
+  optional uint32 memory_mib = 3;      // match snapshot with this memory
+  optional string caller_org_id = 4;   // authorize before cache lookup or pull
+}
+
+message GetTemplateResponse {
+  TemplateRef template = 1;             // resolved: name + content_hash
+  string build_date = 2;
+  // Logical expanded rootfs artifact size from build metadata or object transfer.
+  uint64 artifact_size_bytes = 3;
+  string state = 4;
+  string runtime = 5;
+  string arch = 6;
+  string manifest_json = 7;
+  string template_dir = 9;
+  optional string snapshot_dir = 10;
+  optional string snapshot_hash = 11;
+  optional uint32 snapshot_vcpu = 12;
+  optional uint32 snapshot_memory_mib = 13;
+  repeated SnapshotInfo available_snapshots = 14;
+  optional space.sandbox.manager.v1.AutoLifecyclePolicy default_auto_lifecycle = 15;
+  optional space.net.policy.v1.NetworkPolicyV1 network_policy = 16;
+  uint64 network_policy_generation = 17;
+  space.net.policy.v1.PolicyAuthority network_policy_authority = 18;
+  space.net.policy.v1.PolicyAuthority auto_lifecycle_authority = 19;
+  optional string authorized_org_id = 20;
+}
+
+message UpdateTemplateSettingsRequest {
+  string template = 1;
+  space.sandbox.manager.v1.AutoLifecyclePolicy default_auto_lifecycle = 2;
+  space.net.policy.v1.NetworkPolicyV1 network_policy = 3;
+  uint64 network_policy_generation = 4;
+  space.net.policy.v1.PolicyAuthority network_policy_authority = 5;
+  space.net.policy.v1.PolicyAuthority auto_lifecycle_authority = 6;
+}
+
+message UpdateTemplateSettingsResponse {
+  space.net.policy.v1.NetworkPolicyApplyDecision network_policy_apply_decision = 1;
+}
+
+message UpdateTemplateSnapshotPolicyRequest {
+  string template = 1;
+  bool ensure_base_snapshot = 2;
+  optional uint32 snapshot_vcpu = 3;
+  optional uint32 snapshot_memory_mib = 4;
+}
+
+message UpdateTemplateSnapshotPolicyResponse {
+  bool reconciled = 1;
+  bool snapshot_built = 2;
+  optional string content_hash = 3;
+  optional string error = 4;
+  bool snapshot_deleted = 5;
+}
+
+message ExportTemplateRequest {
+  TemplateRef template = 1;             // name required, content_hash or tag to resolve
+  bool include_snapshot = 2;
+  optional uint32 snapshot_vcpu = 3;
+  optional uint32 snapshot_memory_mib = 4;
+}
+
+message ExportTemplateChunk {
+  oneof payload {
+    ExportTemplateHeader header = 1;
+    FileChunk chunk = 2;
+  }
+}
+
+message ExportTemplateHeader {
+  TemplateRef template = 1;             // resolved: name + content_hash
+  bytes metadata_json = 2;
+  bool includes_snapshot = 3;
+  optional uint32 snapshot_vcpu = 4;
+  optional uint32 snapshot_memory_mib = 5;
+  bytes manifest_json = 6;
+  optional string rootfs_hash = 7;       // sha256 of streamed rootfs.ext4 bytes, or expanded rootfs digest for transfer-pack streams
+}
+
+message ImportTemplateRequest {
+  oneof payload {
+    ImportTemplateHeader header = 1;
+    FileChunk chunk = 2;
+  }
+}
+
+message ImportTemplateHeader {
+  TemplateRef template = 1;             // name + content_hash required
+  bytes metadata_json = 2;
+  bool include_snapshot = 3;
+  optional uint32 snapshot_vcpu = 4;
+  optional uint32 snapshot_memory_mib = 5;
+  bytes manifest_json = 6;
+  // When true, import waits for base-snapshot policy reconciliation.
+  optional bool block_on_snapshot_policy_achieved = 7;
+  optional string rootfs_hash = 8;       // sha256 of streamed rootfs.ext4 bytes, or expanded rootfs digest for transfer-pack streams
+}
+
+message ImportTemplateResponse {
+  TemplateRef template = 1;             // resolved: name + content_hash
+}
+
+// Identifies which file a chunk belongs to and its position.
+message FileChunk {
+  string file_name = 1;
+  bytes data = 2;
+  uint64 offset = 3;
+  bool eof = 4;
+}
+
+message DeleteTemplateBuildRequest {
+  TemplateRef template = 1;             // name + content_hash required
+}
+
+message DeleteTemplateBuildResponse {}

@@ -1,0 +1,28 @@
+name: Kind Pull CI
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/kind-ci.yml
+      - .github/workflows/kind-pull-ci.yml
+      - .github/workflows/main-ci.yml
+      - infra/space/kind/**
+      - scripts/tests/smoke-kind-*.sh
+      - space_smoke/**
+      - Tiltfile
+      - docker/Dockerfile.rust-build-kind
+      - crates/libs/sbx/mgr/server/src/service/activation_support.rs
+
+# Includes same-repository PRs: no package write token. The read token reaches
+# the third-party image mirror and the main-produced layer cache; once both
+# are public, forks read them anonymously. A missing or inaccessible cache can
+# use the existing read-only Actions cache bridge; if both miss, build cold.
+# Neither case permits publication from PRs.
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  kind_smoke:
+    if: github.repository == 'perplexityai/SPACE'
+    uses: ./.github/workflows/kind-ci.yml

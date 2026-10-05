@@ -1,0 +1,455 @@
+{
+  "uid": "space-metrics",
+  "title": "SPACE: local metrics contract",
+  "schemaVersion": 39,
+  "version": 2,
+  "editable": false,
+  "refresh": "10s",
+  "time": {
+    "from": "now-20m",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "version",
+        "label": "Synthetic run",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "space-prometheus"
+        },
+        "query": "label_values(space_node_mgr_loop_devices_created_total, service_version)",
+        "refresh": 1,
+        "sort": 2,
+        "multi": false,
+        "includeAll": false
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Counter totals",
+      "type": "timeseries",
+      "description": "Kernel/device ratio 1:2; Collector state loss resets accumulated values.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "space_node_mgr_loop_devices_created_total{service_version=~\"$version\"}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "legendFormat": "{{instance}} {{kind}} A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Counter rates",
+      "type": "timeseries",
+      "description": "Kernel rate per producer: 0.4 → idle → 1 → 0.2 → 0.6/s. Window extrapolation is not an audit ledger.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(space_node_mgr_loop_devices_created_total{service_version=~\"$version\"}[1m])",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "legendFormat": "{{instance}} {{kind}} A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Gauge: positive / zero / silence / recovery",
+      "type": "timeseries",
+      "description": "7 → 0 → silence for 8m → 11. Lookback carries the last observation for 5m; no null-to-zero filling.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "space_node_mgr_cleanup_operation_in_flight_ratio{service_version=~\"$version\"}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "legendFormat": "{{instance}} {{kind}} A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Histogram counts",
+      "type": "timeseries",
+      "description": "Each active tick: 4 timing and 3 vCPU samples per producer. The state-like distribution is not a gauge.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_count(space_sandbox_state_convergence_duration_ms_milliseconds{service_version=~\"$version\"})",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "legendFormat": "{{instance}} {{kind}} A"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_count(space_sandbox_guest_vcpu_count{service_version=~\"$version\"})",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "legendFormat": "{{instance}} {{kind}} B"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Timing mean / p50 / p95",
+      "type": "timeseries",
+      "description": "[1,2,4,8] ms: mean 3.75; observed p50 3.9143 and p95 7.9654. Bucket interpolation is not the raw-sample median. Values remain milliseconds.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_avg(space_sandbox_state_convergence_duration_ms_milliseconds{service_version=~\"$version\"})",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "legendFormat": "{{instance}} {{kind}} A"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.5, space_sandbox_state_convergence_duration_ms_milliseconds{service_version=~\"$version\"})",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "legendFormat": "{{instance}} {{kind}} B"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.95, space_sandbox_state_convergence_duration_ms_milliseconds{service_version=~\"$version\"})",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "legendFormat": "{{instance}} {{kind}} C"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "vCPU distribution mean / p95",
+      "type": "timeseries",
+      "description": "Samples [2,4,8]: mean 14/3, p95 near 8. Sample history, not a guest's current size.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_avg(space_sandbox_guest_vcpu_count{service_version=~\"$version\"})",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "legendFormat": "{{instance}} {{kind}} A"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, space_sandbox_guest_vcpu_count{service_version=~\"$version\"})",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "legendFormat": "{{instance}} {{kind}} B"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Histogram sums",
+      "type": "timeseries",
+      "description": "15 ms or 14 vCPUs per active tick. Different units: compare each only to its own count.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_sum(space_sandbox_state_convergence_duration_ms_milliseconds{service_version=~\"$version\"})",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "legendFormat": "{{instance}} {{kind}} A"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_sum(space_sandbox_guest_vcpu_count{service_version=~\"$version\"})",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "legendFormat": "{{instance}} {{kind}} B"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Exporter queue / capacity",
+      "type": "timeseries",
+      "description": "128 requests, one consumer, 30s retry budget. Queue is not durable.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "otelcol_exporter_queue_size{exporter=\"otlp_http\"}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "legendFormat": "{{instance}} {{kind}} A"
+        },
+        {
+          "refId": "B",
+          "expr": "otelcol_exporter_queue_capacity{exporter=\"otlp_http\"}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "legendFormat": "{{instance}} {{kind}} B"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Collector RSS / heap",
+      "type": "timeseries",
+      "description": "512MiB pod limit; 256MiB heap threshold; GOMEMLIMIT 205MiB.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "otelcol_process_memory_rss",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "legendFormat": "{{instance}} {{kind}} A"
+        },
+        {
+          "refId": "B",
+          "expr": "otelcol_process_runtime_heap_alloc_bytes",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "legendFormat": "{{instance}} {{kind}} B"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Counter resets",
+      "type": "timeseries",
+      "description": "Compute per-producer rates before aggregation. Do not compare raw totals across Collector restarts.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "space-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "resets(space_node_mgr_loop_devices_created_total{service_version=~\"$version\"}[15m])",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "space-prometheus"
+          },
+          "legendFormat": "{{instance}} {{kind}} A"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,53 @@
+# Shared installs require real authentication and explicit datasource URLs.
+# Kind uses profiles/kind.yaml.
+profile: shared
+auth:
+  # Kind-only. Anonymous Viewer with no login form; rejected by the shared profile.
+  anonymous: false
+  # Name of an existing Secret in this namespace holding the admin credentials.
+  # Create and rotate it through the cluster's normal secret process; never put
+  # credentials in a values file or in source control.
+  existingSecret: ""
+  userKey: admin-user
+  passwordKey: admin-password
+datasources:
+  prometheus:
+    enabled: true
+    url: ""
+  loki:
+    enabled: false
+    url: ""
+  tempo:
+    enabled: false
+    url: ""
+# Optional operator-owned ConfigMaps containing additional dashboard JSON files.
+# Their lifecycle is independent of this release.
+dashboards:
+  extraConfigMaps: []
+# Dashboards are provisioned read-only from this chart. Persistence keeps
+# accounts, sessions and annotations across restarts; it is not required for
+# the provisioned views.
+persistence:
+  enabled: false
+  size: 1Gi
+  storageClassName: null
+  existingClaim: ""
+  retain: true
+  # Used only when persistence is disabled.
+  emptyDirSizeLimit: 256Mi
+scheduling:
+  nodeSelector: {}
+  tolerations: []
+networkPolicy:
+  enabled: true
+  # Peers permitted to reach the UI on :3000.
+  uiPeers: []
+  # Full NetworkPolicy egress rules reaching the backends, which normally live
+  # in other namespaces. DNS to kube-system CoreDNS is always allowed.
+  backendEgress: []
+  additionalEgress: []
+resources:
+  requests: {cpu: 100m, memory: 256Mi}
+  limits: {cpu: 500m, memory: 1Gi, ephemeral-storage: 512Mi}
+# Pinned multi-platform digest; version verified 2026-09-23.
+image: grafana/grafana:13.2.2@sha256:ac461fb352abc50da10a51c7d02462e9c05488f11f53f14b3ad79a8145f638a0

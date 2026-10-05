@@ -1,0 +1,6 @@
+apiVersion: v2
+name: space-secrets-bootstrap
+description: External-secrets plumbing for the space namespace, installed from Terraform
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

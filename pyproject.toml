@@ -1,0 +1,14 @@
+[project]
+name = "space-smoke"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "e2b==2.21.1",
+    "opentelemetry-exporter-otlp-proto-grpc==1.44.0",
+    "opentelemetry-sdk==1.44.0",
+]
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true

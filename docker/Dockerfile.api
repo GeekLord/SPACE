@@ -1,0 +1,92 @@
+# syntax=docker/dockerfile:1.7
+
+ARG SPACE_RUST_BUILD_IMAGE=space-rust-build-api:local
+FROM ${SPACE_RUST_BUILD_IMAGE} AS rust-build
+
+# uv's release image, pinned by its multi-platform index digest. uv's install
+# script downloads from GitHub releases without retrying, and a reset connection
+# either failed the build or, piped into sh, left the stage without uv. An image
+# is a registry pull like the bases, which the Kind bring-up retries
+# (infra/space/kind/scripts/pull-base-images.sh).
+FROM ghcr.io/astral-sh/uv:0.9.9@sha256:f6e3549ed287fee0ddde2460a2a74a2d74366f84b04aaa34c1f19fec40da8652 AS uv
+
+# The smoke suites' Python environment, resolved once here so the in-cluster
+# smoke Job needs no package index at run time — a post-deploy gate must not be
+# able to fail on a PyPI blip. The requirement list is derived from the suites'
+# own PEP 723 headers and the space_smoke lock rather than written down, so a
+# suite that changes a pin moves this environment with it.
+FROM public.ecr.aws/docker/library/debian:bookworm-slim AS smoke-build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      python3 \
+      python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=uv /uv /uvx /usr/local/bin/
+
+WORKDIR /src
+COPY pyproject.toml uv.lock ./
+COPY space_smoke ./space_smoke
+COPY scripts/tests ./scripts/tests
+COPY scripts/space-cluster-smoke.py scripts/smoke-image-requirements.py ./scripts/
+
+RUN uv export --frozen --no-hashes --no-emit-project --format requirements-txt \
+      > /tmp/project-requirements.txt \
+    && python3 scripts/smoke-image-requirements.py \
+      --project-requirements /tmp/project-requirements.txt > /tmp/requirements.txt \
+    && python3 -m venv /space/smoke/venv \
+    && /space/smoke/venv/bin/pip install \
+      --no-cache-dir --disable-pip-version-check --require-virtualenv \
+      -r /tmp/requirements.txt
+
+FROM public.ecr.aws/docker/library/debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      bash \
+      ca-certificates \
+      python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --system --gid 952 space-api \
+    && useradd --system --uid 952 --gid 952 --create-home --home-dir /space space-api
+
+WORKDIR /space
+
+LABEL org.opencontainers.image.title="space-api"
+LABEL org.opencontainers.image.description="Deployable SPACE API image."
+
+COPY --from=rust-build /artifacts/bin/space-api-svc /space/bin/space-api-svc
+COPY --from=rust-build /artifacts/bin/space-db-migrator /space/bin/space-db-migrator
+# Deploy-phase template bootstrap, alongside the migrator for the same reason:
+# both are one-shot Jobs the deploy pipeline runs from this image rather than
+# separate images, ECR repos, and build targets.
+COPY --from=rust-build /artifacts/bin/space-template-publish /space/bin/space-template-publish
+COPY --chmod=0755 scripts/space-db-migrate.sh /space/bin/space-db-migrate.sh
+COPY --chmod=0755 scripts/space-db-bootstrap-roles.sh /space/bin/space-db-bootstrap-roles.sh
+COPY --chmod=0755 scripts/space-db-provision.sh /space/bin/space-db-provision.sh
+
+RUN chown -R space-api:space-api /space
+
+# The in-cluster smoke Job, here for the same reason as the migrator and the
+# template-publish binary: one-shot Jobs the deploy pipeline runs from this
+# image rather than separate images, ECR repos, and build targets. The suites
+# are copied unchanged — this image carries the runner, not a second copy of
+# the scenarios.
+#
+# After the recursive chown, and owned at copy time: a `chown -R` over ~60 MB
+# of virtualenv rewrites every one of those files into a new layer, doubling
+# what the image costs to pull.
+COPY --from=smoke-build --chown=space-api:space-api /space/smoke/venv /space/smoke/venv
+COPY --chown=space-api:space-api pyproject.toml /space/smoke/suites/pyproject.toml
+COPY --chown=space-api:space-api space_smoke /space/smoke/suites/space_smoke
+COPY --chown=space-api:space-api scripts/tests /space/smoke/suites/scripts/tests
+COPY --chown=space-api:space-api scripts/space-cluster-smoke.py /space/smoke/suites/scripts/space-cluster-smoke.py
+
+ARG SPACE_GIT_SHA=unknown
+LABEL org.opencontainers.image.revision="${SPACE_GIT_SHA}"
+RUN mkdir -p /etc/space && printf '%s\n' "${SPACE_GIT_SHA}" > /etc/space/build-git-sha
+
+USER space-api
+
+EXPOSE 8080

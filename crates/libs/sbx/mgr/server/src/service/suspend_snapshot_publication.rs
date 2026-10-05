@@ -1,0 +1,748 @@
+use std::path::{Path, PathBuf};
+
+use pplx_space_common_core::types::{
+    ArtifactKind, ArtifactOrigin, ContentHash, DEFAULT_GUEST_USER, ExecutionMetadata,
+    LocalArtifactId, RuntimeKind, SandboxId, SandboxOwner, SandboxRuntimeLabel, TemplateName,
+};
+
+use crate::snapshot_restore::RecoveredSandboxRowFieldsError;
+use crate::state::SandboxState;
+
+pub(super) const LOCAL_SNAPSHOT_DIR: &str = "snapshot";
+const SUSPEND_STAGING_PARENT_DIR: &str = "snapshots";
+pub(super) const SUSPEND_STAGING_PREFIX: &str = ".suspend-publish-";
+
+pub(super) fn canonical_suspend_snapshot_dir(sandbox_dir: &Path) -> PathBuf {
+    sandbox_dir.join(LOCAL_SNAPSHOT_DIR)
+}
+
+pub(super) fn suspend_snapshot_staging_parent_dir(sandbox_dir: &Path) -> PathBuf {
+    sandbox_dir.join(SUSPEND_STAGING_PARENT_DIR)
+}
+
+pub(super) fn suspend_snapshot_staging_dir(
+    sandbox_dir: &Path,
+    local_artifact_id: LocalArtifactId,
+) -> PathBuf {
+    suspend_snapshot_staging_parent_dir(sandbox_dir)
+        .join(format!("{SUSPEND_STAGING_PREFIX}{local_artifact_id}"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CanonicalSuspendSnapshotArtifact {
+    pub(super) local_artifact_id: LocalArtifactId,
+    pub(super) path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StagedSuspendSnapshotArtifact {
+    pub(super) local_artifact_id: LocalArtifactId,
+    pub(super) staging_dir: PathBuf,
+}
+
+pub(super) struct RecoveredSandboxRowFields {
+    pub(super) template: TemplateName,
+    pub(super) template_hash: Option<ContentHash>,
+    pub(super) user: SandboxOwner,
+    pub(super) runtime: RuntimeKind,
+    pub(super) snapshots_enabled: bool,
+    pub(super) rootfs_size_mb: Option<u32>,
+    pub(super) disk_io_limits: pplx_space_common_core::types::DiskIoLimits,
+    // The artifact marker carries the immutable encryption setting across nodes.
+    pub(super) volume_encryption: bool,
+    pub(super) process_env: std::collections::BTreeMap<String, String>,
+    pub(super) auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy,
+}
+
+impl RecoveredSandboxRowFields {
+    pub(super) fn with_insert_params<R>(
+        &self,
+        id: &str,
+        uuid8: &SandboxRuntimeLabel,
+        state: SandboxState,
+        rootfs_size_fallback_mb: Option<u32>,
+        bind: impl FnOnce(crate::db::InsertSandboxParams<'_>) -> R,
+    ) -> R {
+        let template_hash = self.template_hash.map(|hash| hash.to_string());
+        bind(crate::db::InsertSandboxParams {
+            id,
+            uuid8,
+            state,
+            template: self.template.as_str(),
+            template_hash: template_hash.as_deref(),
+            user: &self.user,
+            runtime: self.runtime.alias(),
+            snapshots_enabled: self.snapshots_enabled,
+            rootfs_size_mb: self.rootfs_size_mb.or(rootfs_size_fallback_mb),
+            disk_io_limits: self.disk_io_limits,
+            pool_template: None,
+            volume_encryption: self.volume_encryption,
+            process_env: &self.process_env,
+            auto_lifecycle: &self.auto_lifecycle,
+            network_policy_override: None,
+            network_policy_generation: 0,
+            network_policy_authority: crate::db::PolicyAuthority::Cluster,
+            auto_lifecycle_authority: crate::db::PolicyAuthority::Cluster,
+        })
+    }
+}
+
+pub(super) struct ValidatedSuspendSnapshotArtifact {
+    pub(super) execution: ExecutionMetadata,
+    pub(super) row: RecoveredSandboxRowFields,
+    pub(super) local_artifact_id: LocalArtifactId,
+    pub(super) snapshot_dir: PathBuf,
+}
+
+pub(super) struct ValidatedSuspendSnapshotMetadata {
+    metadata: crate::snapshot_upload::SnapshotMeta,
+    pub(super) execution: ExecutionMetadata,
+    pub(super) row: RecoveredSandboxRowFields,
+    pub(super) local_artifact_id: LocalArtifactId,
+    pub(super) snapshot_dir: PathBuf,
+}
+
+impl ValidatedSuspendSnapshotMetadata {
+    pub(super) fn into_artifact(self) -> ValidatedSuspendSnapshotArtifact {
+        ValidatedSuspendSnapshotArtifact {
+            execution: self.execution,
+            row: self.row,
+            local_artifact_id: self.local_artifact_id,
+            snapshot_dir: self.snapshot_dir,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum SuspendSnapshotPublicationDecision {
+    CanonicalReady(CanonicalSuspendSnapshotArtifact),
+    StagedComplete(StagedSuspendSnapshotArtifact),
+    RuntimeLiveWithoutUsableArtifact,
+    RuntimeGoneWithoutUsableArtifact,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SuspendSnapshotValidationError {
+    #[error("read snapshot metadata from {snapshot_dir} failed: {source}")]
+    ReadMetadata {
+        snapshot_dir: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("parse snapshot metadata from {snapshot_dir} failed: {source}")]
+    ParseMetadata {
+        snapshot_dir: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error(
+        "snapshot metadata in {snapshot_dir} names sandbox {actual_sandbox_id} instead of {expected_sandbox_id}"
+    )]
+    SandboxIdentityMismatch {
+        snapshot_dir: String,
+        expected_sandbox_id: SandboxId,
+        actual_sandbox_id: String,
+    },
+    #[error("snapshot directory {snapshot_dir} has no local artifact id")]
+    MissingArtifactIdentity { snapshot_dir: String },
+    #[error("snapshot directory {snapshot_dir} is not a full suspend artifact")]
+    ArtifactShapeMismatch { snapshot_dir: String },
+    #[error("invalid recovered sandbox row fields in {snapshot_dir}: {source}")]
+    InvalidRecoveredRowFields {
+        snapshot_dir: String,
+        #[source]
+        source: RecoveredSandboxRowFieldsError,
+    },
+    #[error("snapshot directory {snapshot_dir} is missing required artifact file {artifact}")]
+    MissingArtifact {
+        snapshot_dir: String,
+        artifact: &'static str,
+    },
+    #[error("stat suspend artifact {path} failed: {source}")]
+    StatArtifact {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("suspend artifact {path} is not a regular file")]
+    ArtifactNotRegular { path: PathBuf },
+    #[error("suspend artifact size overflowed u64")]
+    ArtifactSizeOverflow,
+    #[error(
+        "snapshot metadata in {snapshot_dir} declares {declared_bytes} bytes but required files contain {actual_bytes}"
+    )]
+    ArtifactSizeMismatch {
+        snapshot_dir: String,
+        declared_bytes: u64,
+        actual_bytes: u64,
+    },
+    #[error(transparent)]
+    HostArchitecture(#[from] super::tail_support::RuntimeArtifactReadError),
+    #[error("invalid snapshot execution metadata in {snapshot_dir}: {source}")]
+    InvalidExecutionMetadata {
+        snapshot_dir: String,
+        #[source]
+        source: crate::snapshot_upload::SnapshotRuntimeMetadataError,
+    },
+    #[error(
+        "snapshot source runtime {declared_runtime} disagrees with execution runtime {execution_runtime}"
+    )]
+    RuntimeMismatch {
+        declared_runtime: RuntimeKind,
+        execution_runtime: RuntimeKind,
+    },
+}
+
+impl SuspendSnapshotValidationError {
+    pub(super) fn is_unsafe_evidence(&self) -> bool {
+        match self {
+            Self::ReadMetadata { source, .. } | Self::StatArtifact { source, .. } => {
+                source.kind() == std::io::ErrorKind::NotFound
+            }
+            Self::HostArchitecture(_) => false,
+            _ => true,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SuspendSnapshotPublicationError {
+    #[error(transparent)]
+    Validation(#[from] SuspendSnapshotValidationError),
+    #[error("snapshot directory {snapshot_dir} has no parent")]
+    MissingParent { snapshot_dir: String },
+    #[error("create snapshot parent {parent} failed: {source}")]
+    CreateParent {
+        parent: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("retire existing snapshot directory {snapshot_dir} failed: {source}")]
+    RetireExisting {
+        snapshot_dir: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("snapshot directory {snapshot_dir} is not the expected artifact {local_artifact_id}")]
+    ArtifactIdMismatch {
+        snapshot_dir: String,
+        local_artifact_id: LocalArtifactId,
+    },
+    #[error("staged snapshot directory {staging_dir} is missing")]
+    MissingStaged { staging_dir: String },
+    #[error("list suspend staging parent {staging_parent} failed: {source}")]
+    ListStagingParent {
+        staging_parent: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("remove duplicate staged snapshot directory {staging_dir} failed: {source}")]
+    RemoveDuplicateStaged {
+        staging_dir: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("publish staged snapshot {staging_dir} as {snapshot_dir} failed: {source}")]
+    PublishStaged {
+        staging_dir: String,
+        snapshot_dir: String,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum CanonicalSuspendSnapshotRecoveryError {
+    #[error("interrupted suspend publication staging remains at {staging_dir}")]
+    StagingResidue { staging_dir: String },
+    #[error(transparent)]
+    Publication(#[from] SuspendSnapshotPublicationError),
+    #[error(transparent)]
+    Validation(#[from] SuspendSnapshotValidationError),
+}
+
+impl CanonicalSuspendSnapshotRecoveryError {
+    pub(super) fn is_unsafe_evidence(&self) -> bool {
+        match self {
+            Self::StagingResidue { .. } => true,
+            Self::Publication(_) => false,
+            Self::Validation(error) => error.is_unsafe_evidence(),
+        }
+    }
+}
+
+fn path_label(path: &Path) -> String {
+    path.display().to_string()
+}
+
+fn suspended_snapshot_dir_metadata(
+    snapshot_dir: &Path,
+) -> Result<crate::snapshot_upload::SnapshotMeta, SuspendSnapshotValidationError> {
+    let bytes =
+        std::fs::read(snapshot_dir.join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME))
+            .map_err(|source| SuspendSnapshotValidationError::ReadMetadata {
+                snapshot_dir: path_label(snapshot_dir),
+                source,
+            })?;
+    serde_json::from_slice(&bytes).map_err(|source| SuspendSnapshotValidationError::ParseMetadata {
+        snapshot_dir: path_label(snapshot_dir),
+        source,
+    })
+}
+
+pub(super) fn recovered_sandbox_row_fields(
+    metadata: &crate::snapshot_upload::SnapshotMeta,
+) -> Result<RecoveredSandboxRowFields, RecoveredSandboxRowFieldsError> {
+    let (user, snapshots_enabled, process_env, auto_lifecycle) = match metadata.sandbox.as_ref() {
+        Some(sandbox) => (
+            SandboxOwner::parse(sandbox.owner.clone())?,
+            sandbox.snapshots_enabled,
+            sandbox.process_env.clone(),
+            sandbox.auto_lifecycle.clone(),
+        ),
+        None => (
+            SandboxOwner::parse(DEFAULT_GUEST_USER)?,
+            true,
+            std::collections::BTreeMap::new(),
+            pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+        ),
+    };
+    Ok(RecoveredSandboxRowFields {
+        template: TemplateName::parse(metadata.source.template_id.clone())?,
+        template_hash: metadata
+            .source
+            .content_hash
+            .as_deref()
+            .map(str::parse)
+            .transpose()?,
+        user,
+        runtime: RuntimeKind::parse(&metadata.source.runtime)?,
+        snapshots_enabled,
+        rootfs_size_mb: metadata.source.rootfs_size_mib,
+        disk_io_limits: pplx_space_common_core::types::DiskIoLimits::try_from_optional(
+            metadata.source.disk_io_max_operations_per_sec,
+            metadata.source.disk_io_max_bandwidth_mib_per_sec,
+        )?,
+        volume_encryption: metadata.encrypted,
+        process_env,
+        auto_lifecycle,
+    })
+}
+
+pub(super) fn validate_suspend_snapshot_metadata(
+    snapshot_dir: &Path,
+    expected_sandbox_id: Option<SandboxId>,
+) -> Result<ValidatedSuspendSnapshotMetadata, SuspendSnapshotValidationError> {
+    let metadata = suspended_snapshot_dir_metadata(snapshot_dir)?;
+    if let Some(expected_sandbox_id) = expected_sandbox_id
+        && metadata.sandbox_id != expected_sandbox_id.to_string()
+    {
+        return Err(SuspendSnapshotValidationError::SandboxIdentityMismatch {
+            snapshot_dir: path_label(snapshot_dir),
+            expected_sandbox_id,
+            actual_sandbox_id: metadata.sandbox_id,
+        });
+    }
+    let local_artifact_id = metadata.local_artifact_id.ok_or_else(|| {
+        SuspendSnapshotValidationError::MissingArtifactIdentity {
+            snapshot_dir: path_label(snapshot_dir),
+        }
+    })?;
+    if metadata.artifact_kind != Some(ArtifactKind::Full)
+        || metadata.artifact_origin != Some(ArtifactOrigin::Suspend)
+    {
+        return Err(SuspendSnapshotValidationError::ArtifactShapeMismatch {
+            snapshot_dir: path_label(snapshot_dir),
+        });
+    }
+    let row = recovered_sandbox_row_fields(&metadata).map_err(|source| {
+        SuspendSnapshotValidationError::InvalidRecoveredRowFields {
+            snapshot_dir: path_label(snapshot_dir),
+            source,
+        }
+    })?;
+
+    let execution = metadata
+        .execution_metadata(super::tail_support::host_architecture()?)
+        .map_err(
+            |source| SuspendSnapshotValidationError::InvalidExecutionMetadata {
+                snapshot_dir: path_label(snapshot_dir),
+                source,
+            },
+        )?
+        .into_execution();
+    if row.runtime != execution.runtime().kind {
+        return Err(SuspendSnapshotValidationError::RuntimeMismatch {
+            declared_runtime: row.runtime,
+            execution_runtime: execution.runtime().kind,
+        });
+    }
+
+    Ok(ValidatedSuspendSnapshotMetadata {
+        metadata,
+        execution,
+        row,
+        local_artifact_id,
+        snapshot_dir: snapshot_dir.to_path_buf(),
+    })
+}
+
+pub(super) fn validate_suspend_snapshot_artifact_files(
+    snapshot: &ValidatedSuspendSnapshotMetadata,
+) -> Result<(), SuspendSnapshotValidationError> {
+    let metadata = &snapshot.metadata;
+    let artifacts = if metadata.encrypted {
+        crate::snapshot_upload::encrypted_vm_artifacts()
+    } else {
+        crate::snapshot_upload::vm_artifacts_for_format(crate::snapshot_upload::format_from_meta(
+            metadata,
+        ))
+    };
+    let mut actual_bytes = 0_u64;
+    for artifact in artifacts {
+        let path = snapshot.snapshot_dir.join(artifact.local_name);
+        let file = match std::fs::symlink_metadata(&path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Err(SuspendSnapshotValidationError::MissingArtifact {
+                    snapshot_dir: path_label(&snapshot.snapshot_dir),
+                    artifact: artifact.local_name,
+                });
+            }
+            Err(source) => {
+                return Err(SuspendSnapshotValidationError::StatArtifact { path, source });
+            }
+        };
+        if !file.file_type().is_file() {
+            return Err(SuspendSnapshotValidationError::ArtifactNotRegular { path });
+        }
+        actual_bytes = actual_bytes
+            .checked_add(file.len())
+            .ok_or(SuspendSnapshotValidationError::ArtifactSizeOverflow)?;
+    }
+    if actual_bytes != metadata.size_bytes {
+        return Err(SuspendSnapshotValidationError::ArtifactSizeMismatch {
+            snapshot_dir: path_label(&snapshot.snapshot_dir),
+            declared_bytes: metadata.size_bytes,
+            actual_bytes,
+        });
+    }
+
+    Ok(())
+}
+
+pub(super) fn validate_recoverable_suspend_snapshot_dir(
+    snapshot_dir: &Path,
+    expected_sandbox_id: Option<SandboxId>,
+) -> Result<ValidatedSuspendSnapshotArtifact, SuspendSnapshotValidationError> {
+    let metadata = validate_suspend_snapshot_metadata(snapshot_dir, expected_sandbox_id)?;
+    validate_suspend_snapshot_artifact_files(&metadata)?;
+    Ok(metadata.into_artifact())
+}
+
+/// Validate the one canonical artifact that may safely anchor a recovery.
+/// Staging residue is deliberately rejected: it represents an unresolved
+/// publication generation, so choosing either directory would destroy evidence.
+pub(super) fn validate_canonical_suspend_snapshot_for_recovery(
+    cache_dir: &Path,
+    sandbox_id: SandboxId,
+) -> Result<ValidatedSuspendSnapshotArtifact, CanonicalSuspendSnapshotRecoveryError> {
+    let sandbox_dir = cache_dir.join(sandbox_id.to_string());
+    if let Some(staging_dir) = find_suspend_snapshot_staging_residue(&sandbox_dir)? {
+        return Err(CanonicalSuspendSnapshotRecoveryError::StagingResidue {
+            staging_dir: path_label(&staging_dir),
+        });
+    }
+    let snapshot_dir = canonical_suspend_snapshot_dir(&sandbox_dir);
+    Ok(validate_recoverable_suspend_snapshot_dir(
+        &snapshot_dir,
+        Some(sandbox_id),
+    )?)
+}
+
+pub(super) fn validate_complete_suspend_snapshot_dir(
+    snapshot_dir: &Path,
+) -> Result<LocalArtifactId, SuspendSnapshotValidationError> {
+    Ok(validate_recoverable_suspend_snapshot_dir(snapshot_dir, None)?.local_artifact_id)
+}
+
+pub(super) fn ensure_complete_suspend_snapshot_dir(
+    snapshot_dir: &Path,
+    local_artifact_id: LocalArtifactId,
+) -> Result<(), SuspendSnapshotPublicationError> {
+    let actual = validate_complete_suspend_snapshot_dir(snapshot_dir)?;
+    if actual != local_artifact_id {
+        return Err(SuspendSnapshotPublicationError::ArtifactIdMismatch {
+            snapshot_dir: path_label(snapshot_dir),
+            local_artifact_id,
+        });
+    }
+    Ok(())
+}
+
+pub(super) fn publish_suspend_snapshot_dir(
+    staging_dir: &Path,
+    snapshot_dir: &Path,
+    local_artifact_id: LocalArtifactId,
+) -> Result<(), SuspendSnapshotPublicationError> {
+    let parent =
+        snapshot_dir
+            .parent()
+            .ok_or_else(|| SuspendSnapshotPublicationError::MissingParent {
+                snapshot_dir: path_label(snapshot_dir),
+            })?;
+    std::fs::create_dir_all(parent).map_err(|source| {
+        SuspendSnapshotPublicationError::CreateParent {
+            parent: path_label(parent),
+            source,
+        }
+    })?;
+
+    if snapshot_dir.exists() {
+        match validate_complete_suspend_snapshot_dir(snapshot_dir) {
+            Ok(existing_artifact_id) if existing_artifact_id == local_artifact_id => {
+                if staging_dir.exists() {
+                    ensure_complete_suspend_snapshot_dir(staging_dir, local_artifact_id)?;
+                    std::fs::remove_dir_all(staging_dir).map_err(|source| {
+                        SuspendSnapshotPublicationError::RemoveDuplicateStaged {
+                            staging_dir: path_label(staging_dir),
+                            source,
+                        }
+                    })?;
+                }
+                return Ok(());
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+
+    if !staging_dir.exists() {
+        return Err(SuspendSnapshotPublicationError::MissingStaged {
+            staging_dir: path_label(staging_dir),
+        });
+    }
+    ensure_complete_suspend_snapshot_dir(staging_dir, local_artifact_id)?;
+
+    let retired_dir = parent.join(format!(".snapshot-retired-{local_artifact_id}"));
+    let _ = std::fs::remove_dir_all(&retired_dir);
+    let retired_existing = match std::fs::rename(snapshot_dir, &retired_dir) {
+        Ok(()) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => {
+            return Err(SuspendSnapshotPublicationError::RetireExisting {
+                snapshot_dir: path_label(snapshot_dir),
+                source: err,
+            });
+        }
+    };
+
+    if let Err(err) = std::fs::rename(staging_dir, snapshot_dir) {
+        if retired_existing && let Err(restore_err) = std::fs::rename(&retired_dir, snapshot_dir) {
+            tracing::error!(
+                old_snapshot_dir = %retired_dir.display(),
+                snapshot_dir = %snapshot_dir.display(),
+                error = %restore_err,
+                "failed to restore prior local snapshot after publication error"
+            );
+        }
+        return Err(SuspendSnapshotPublicationError::PublishStaged {
+            staging_dir: path_label(staging_dir),
+            snapshot_dir: path_label(snapshot_dir),
+            source: err,
+        });
+    }
+
+    if retired_existing && let Err(err) = std::fs::remove_dir_all(&retired_dir) {
+        tracing::warn!(
+            retired_snapshot_dir = %retired_dir.display(),
+            error = %err,
+            "failed to remove retired local snapshot after publication"
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn find_complete_suspend_snapshot_staging_dir(
+    sandbox_dir: &Path,
+) -> Result<Option<StagedSuspendSnapshotArtifact>, SuspendSnapshotPublicationError> {
+    let staging_parent = suspend_snapshot_staging_parent_dir(sandbox_dir);
+    let entries = match std::fs::read_dir(&staging_parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(SuspendSnapshotPublicationError::ListStagingParent {
+                staging_parent: path_label(&staging_parent),
+                source,
+            });
+        }
+    };
+    let mut paths = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(SUSPEND_STAGING_PREFIX))
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        match validate_complete_suspend_snapshot_dir(&path) {
+            Ok(local_artifact_id) => {
+                return Ok(Some(StagedSuspendSnapshotArtifact {
+                    local_artifact_id,
+                    staging_dir: path,
+                }));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    staging_dir = %path.display(),
+                    %error,
+                    "skipping incomplete suspend publication staging directory"
+                );
+            }
+        }
+    }
+    Ok(None)
+}
+
+pub(super) fn find_suspend_snapshot_staging_residue(
+    sandbox_dir: &Path,
+) -> Result<Option<PathBuf>, SuspendSnapshotPublicationError> {
+    let staging_parent = suspend_snapshot_staging_parent_dir(sandbox_dir);
+    let entries = match std::fs::read_dir(&staging_parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(SuspendSnapshotPublicationError::ListStagingParent {
+                staging_parent: path_label(&staging_parent),
+                source,
+            });
+        }
+    };
+    for entry in entries {
+        let path = entry
+            .map_err(
+                |source| SuspendSnapshotPublicationError::ListStagingParent {
+                    staging_parent: path_label(&staging_parent),
+                    source,
+                },
+            )?
+            .path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(SUSPEND_STAGING_PREFIX))
+        {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+pub(super) fn classify_suspend_snapshot_publication(
+    sandbox_dir: &Path,
+    expected_canonical_artifact_id: Option<LocalArtifactId>,
+    runtime_live: bool,
+) -> Result<SuspendSnapshotPublicationDecision, SuspendSnapshotPublicationError> {
+    if runtime_live {
+        return Ok(SuspendSnapshotPublicationDecision::RuntimeLiveWithoutUsableArtifact);
+    }
+
+    let snapshot_dir = canonical_suspend_snapshot_dir(sandbox_dir);
+    if snapshot_dir.exists()
+        && let Some(expected) = expected_canonical_artifact_id
+    {
+        match validate_complete_suspend_snapshot_dir(&snapshot_dir) {
+            Ok(local_artifact_id) if expected == local_artifact_id => {
+                return Ok(SuspendSnapshotPublicationDecision::CanonicalReady(
+                    CanonicalSuspendSnapshotArtifact {
+                        local_artifact_id,
+                        path: snapshot_dir,
+                    },
+                ));
+            }
+            Ok(local_artifact_id) => {
+                tracing::warn!(
+                    snapshot_dir = %snapshot_dir.display(),
+                    expected_local_artifact_id = %expected,
+                    found_local_artifact_id = %local_artifact_id,
+                    "refusing interrupted suspend recovery with mismatched canonical artifact"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    snapshot_dir = %snapshot_dir.display(),
+                    %error,
+                    "refusing interrupted suspend recovery with invalid canonical artifact"
+                );
+            }
+        }
+    }
+
+    if let Some(staged) = find_complete_suspend_snapshot_staging_dir(sandbox_dir)? {
+        return Ok(SuspendSnapshotPublicationDecision::StagedComplete(staged));
+    }
+
+    if expected_canonical_artifact_id.is_none() && snapshot_dir.exists() {
+        match validate_complete_suspend_snapshot_dir(&snapshot_dir) {
+            Ok(local_artifact_id) => {
+                return Ok(SuspendSnapshotPublicationDecision::CanonicalReady(
+                    CanonicalSuspendSnapshotArtifact {
+                        local_artifact_id,
+                        path: snapshot_dir,
+                    },
+                ));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    snapshot_dir = %snapshot_dir.display(),
+                    %error,
+                    "refusing interrupted suspend recovery with invalid unpinned canonical artifact"
+                );
+            }
+        }
+    }
+
+    Ok(SuspendSnapshotPublicationDecision::RuntimeGoneWithoutUsableArtifact)
+}
+
+#[cfg(test)]
+pub(super) fn write_full_suspend_artifact(
+    snapshot_dir: &Path,
+    sandbox_id: &str,
+    local_artifact_id: LocalArtifactId,
+    payload: &[u8],
+) -> pplx_space_common_core::types::ExecutionMetadata {
+    let architecture = std::env::consts::ARCH.parse().unwrap();
+    let execution = pplx_space_common_core::types::SnapshotExecutionMetadata::new(
+        pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(architecture, vec![]),
+    )
+    .unwrap();
+    std::fs::create_dir_all(snapshot_dir).unwrap();
+    std::fs::write(snapshot_dir.join("vmstate"), payload).unwrap();
+    std::fs::write(snapshot_dir.join("memory"), payload).unwrap();
+    std::fs::write(snapshot_dir.join("rootfs.ext4"), payload).unwrap();
+    let meta = serde_json::json!({
+        "version": crate::snapshot_upload::SNAPSHOT_METADATA_VERSION,
+        "execution": execution.execution(),
+        "sandbox_id": sandbox_id,
+        "size_bytes": payload.len() * 3,
+        "created_at": "2026-05-25T00:00:00Z",
+        "source": {
+            "runtime": "fc",
+            "template_id": "seed"
+        },
+        "local_artifact_id": local_artifact_id,
+        "artifact_kind": "full",
+        "artifact_origin": "suspend"
+    });
+    std::fs::write(
+        snapshot_dir.join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME),
+        serde_json::to_vec_pretty(&meta).unwrap(),
+    )
+    .unwrap();
+    execution.into_execution()
+}
+
+#[cfg(test)]
+mod tests;

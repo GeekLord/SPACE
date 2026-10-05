@@ -1,0 +1,64 @@
+name: Merge Queue CI
+
+on:
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: merge-queue-ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Inventory only; kept outside required aggregate dependencies.
+  quarantine_backlog:
+    if: github.repository == 'perplexityai/SPACE'
+    uses: ./.github/workflows/quarantine-ci.yml
+    permissions:
+      contents: read
+
+  # Queue candidates rerun Rust format, Clippy, and correctness checks against
+  # the cumulative merge group. The Rust test build does not deny warnings, and
+  # pull requests that each pass Clippy can still fail it together: one
+  # deprecates an item that another starts to use.
+  #
+  # Artifact images build on main only. Any crate change recompiles every
+  # image's crates from scratch, which made them the queue's slowest job, and
+  # nothing consumes the images before main. A branch that changes packaging
+  # can run Artifact CI by hand.
+  rust_static:
+    if: github.repository == 'perplexityai/SPACE'
+    uses: ./.github/workflows/rust-static-ci.yml
+    # Reads the CI image from this repository's GHCR package.
+    permissions:
+      contents: read
+      packages: read
+
+  common:
+    if: github.repository == 'perplexityai/SPACE'
+    uses: ./.github/workflows/common-ci.yml
+    # Reads the CI image from this repository's GHCR package.
+    permissions:
+      contents: read
+      packages: read
+    with:
+      base_sha: ${{ github.event.merge_group.base_sha }}
+
+  space-pull-ci:
+    if: always() && github.repository == 'perplexityai/SPACE'
+    name: space-pull-ci
+    runs-on: ubuntu-24.04
+    needs:
+      - rust_static
+      - common
+    steps:
+      - name: Require every merge-group check
+        env:
+          RUST_STATIC_RESULT: ${{ needs.rust_static.result }}
+          COMMON_RESULT: ${{ needs.common.result }}
+        run: |
+          set -euo pipefail
+          test "${RUST_STATIC_RESULT}" = success
+          test "${COMMON_RESULT}" = success

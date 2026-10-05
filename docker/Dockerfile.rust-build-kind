@@ -1,0 +1,191 @@
+# syntax=docker/dockerfile:1.7
+#
+# Kind-only: every SPACE Rust binary from ONE cargo-chef cook and ONE build.
+#
+# docker/Dockerfile.rust-build-common — the CI/publish path — compiles each
+# artifact set (worker, api, data-plane, cluster-controller) in its own stage,
+# so a cold `tilt up` cooked the shared dependency graph four times and every
+# source change recompiled the workspace crates four times, once per image.
+# The dev cluster does not need per-set images: it needs the same binaries with
+# the same cargo features, once. This file produces a single artifact image
+# whose `/artifacts` layout is the union of the four production sets, so the
+# unchanged production runtime Dockerfiles (Dockerfile.api, .data-plane,
+# .cluster-controller, .worker) consume it through SPACE_RUST_BUILD_IMAGE.
+#
+# Same toolchain, same flags: the base is the production Dockerfile's own
+# `chef-base` stage (built by the caller as SPACE_RUST_CHEF_IMAGE), the bin and
+# feature lists below are the union of the production sets' lists, and the
+# planner/build-context COPY sets match the production stages. Only LTO is off,
+# as build-images.sh and the Tiltfile already chose for local images, and
+# every crate's `test-hooks` feature is on so the test-only environment
+# overrides the Kind charts set take effect (production images never enable it). Keep the
+# lists in step with Dockerfile.rust-build-common when a set changes.
+#
+# Build (repo root context):
+#   docker build -t space-rust-chef-base:local -f docker/Dockerfile.rust-build-common --target chef-base .
+#   docker build -t space-grpc-health-probe:local -f docker/Dockerfile.rust-build-common --target grpc-health-probe-downloader .
+#   docker build -t space-rust-build-kind:local -f docker/Dockerfile.rust-build-kind .
+
+ARG SPACE_RUST_CHEF_IMAGE=space-rust-chef-base:local
+ARG SPACE_GRPC_HEALTH_PROBE_IMAGE=space-grpc-health-probe:local
+
+FROM ${SPACE_RUST_CHEF_IMAGE} AS planner
+
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY .cargo/config.toml .cargo/config.toml
+COPY crates ./crates
+COPY proto ./proto
+COPY infra/space/identity/node-identities.sh infra/space/identity/node-identities.sh
+COPY templates/firecracker/seed/rootfs-builder.sh templates/firecracker/seed/rootfs-builder.sh
+COPY templates/firecracker/recipes/seed.toml templates/firecracker/recipes/code-runtime.toml templates/firecracker/recipes/
+
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM ${SPACE_RUST_CHEF_IMAGE} AS cook
+
+ENV CARGO_PROFILE_RELEASE_LTO=false
+
+COPY --from=planner /workspace/recipe.json recipe.json
+COPY infra/space/identity/node-identities.sh infra/space/identity/node-identities.sh
+
+# The union of the worker, api, data-plane and cluster-controller sets.
+# space-runtime-supervisor-svc is cooked here but built by
+# scripts/build-runtime-supervisor.sh below, as the production worker stage does.
+RUN cargo chef cook --locked --release --recipe-path recipe.json \
+      --features "pplx-space-node-api-svc/otel,pplx-space-node-api-svc/datadog,pplx-space-node-api-svc/k8s,pplx-space-internal-api-svc/otel,pplx-space-internal-api-svc/datadog,pplx-space-internal-api-svc/k8s,pplx-space-node-ctl-svc/otel,pplx-space-node-ctl-svc/datadog,pplx-space-node-ctl-svc/kubernetes,pplx-space-node-mgr-svc/otel,pplx-space-node-mgr-svc/datadog,pplx-space-build-mgr-svc/otel,pplx-space-build-mgr-svc/datadog,pplx-space-runtime-supervisor-svc/otel,pplx-space-runtime-supervisor-svc/datadog,pplx-space-runtime-manager-svc/otel,pplx-space-runtime-manager-svc/datadog,pplx-space-sbxmgr-svc/otel,pplx-space-sbxmgr-svc/datadog,pplx-space-spaced-host-svc/otel,pplx-space-spaced-host-svc/datadog,pplx-space-net-gateway-svc/otel,pplx-space-net-gateway-svc/datadog,pplx-space-tmplmgr-svc/otel,pplx-space-tmplmgr-svc/datadog,pplx-space-volmgr-svc/otel,pplx-space-volmgr-svc/datadog,pplx-space-api-svc/otel,pplx-space-api-svc/datadog,pplx-space-api-svc/kubernetes,pplx-space-api-svc/federated-identity,pplx-space-data-plane-svc/otel,pplx-space-data-plane-svc/datadog,pplx-space-data-plane-svc/kubernetes,pplx-space-cluster-controller/otel,pplx-space-cluster-controller/datadog,pplx-space-spaced-guest-svc/test-hooks,pplx-space-node-mgr-svc/test-hooks,pplx-space-sbxmgr-svc/test-hooks,pplx-space-tmplmgr-svc/test-hooks,pplx-space-template-mgr/test-hooks,pplx-space-internal-api-server/test-hooks,pplx-space-credmgr/test-hooks,pplx-space-common-svc/test-hooks,pplx-space-spaced-guest-server/test-hooks,pplx-space-observability/test-hooks,pplx-space-cluster-controller-server/test-hooks,pplx-space-common-core/test-hooks,pplx-space-sbx-mgr/test-hooks,pplx-space-api/test-hooks,pplx-space-build-mgr-server/test-hooks,pplx-space-node-api-server/test-hooks,pplx-space-node-mgr/test-hooks" \
+      --bin spaced \
+      --bin spaced-svc \
+      --bin space-buildmgr \
+      --bin space-buildmgr-svc \
+      --bin space-tmplmgr \
+      --bin space-runtime-supervisor-svc \
+      --bin space-rtmgr-svc \
+      --bin space-rtmgr \
+      --bin space-nodemgr-svc \
+      --bin space-sbxmgr \
+      --bin space-nodectl \
+      --bin space-sbxmgr-svc \
+      --bin space-spaced-host-svc \
+      --bin space-netgtw-svc \
+      --bin space-tmplmgr-svc \
+      --bin space-volmgr \
+      --bin space-credmgr-svc \
+      --bin space-volmgr-svc \
+      --bin space-node-api-svc \
+      --bin space-internal-api-svc \
+      --bin space-nodectl-svc \
+      --bin space-db-migrator \
+      --bin space-api-svc \
+      --bin space-template-publish \
+      --bin space-data-plane-svc \
+      --bin space-cluster-controller
+
+FROM cook AS build
+
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY .cargo/config.toml .cargo/config.toml
+COPY crates ./crates
+COPY proto ./proto
+COPY db ./db
+COPY infra/space/identity/node-identities.sh infra/space/identity/node-identities.sh
+COPY templates/firecracker/seed/rootfs-builder.sh templates/firecracker/seed/rootfs-builder.sh
+COPY templates/firecracker/recipes/seed.toml templates/firecracker/recipes/code-runtime.toml templates/firecracker/recipes/
+COPY scripts/build-runtime-supervisor.sh scripts/build-runtime-supervisor.sh
+
+RUN cargo build --locked --release \
+      -F pplx-space-node-api-svc/otel,pplx-space-node-api-svc/datadog \
+      -F pplx-space-node-api-svc/k8s \
+      -F pplx-space-internal-api-svc/otel,pplx-space-internal-api-svc/datadog \
+      -F pplx-space-internal-api-svc/k8s \
+      -F pplx-space-node-ctl-svc/otel,pplx-space-node-ctl-svc/datadog \
+      -F pplx-space-node-ctl-svc/kubernetes \
+      -F pplx-space-node-mgr-svc/otel,pplx-space-node-mgr-svc/datadog \
+      -F pplx-space-build-mgr-svc/otel,pplx-space-build-mgr-svc/datadog \
+      -F pplx-space-runtime-manager-svc/otel,pplx-space-runtime-manager-svc/datadog \
+      -F pplx-space-sbxmgr-svc/otel,pplx-space-sbxmgr-svc/datadog \
+      -F pplx-space-spaced-host-svc/otel,pplx-space-spaced-host-svc/datadog \
+      -F pplx-space-net-gateway-svc/otel,pplx-space-net-gateway-svc/datadog \
+      -F pplx-space-tmplmgr-svc/otel,pplx-space-tmplmgr-svc/datadog \
+      -F pplx-space-volmgr-svc/otel,pplx-space-volmgr-svc/datadog \
+      -F pplx-space-api-svc/otel,pplx-space-api-svc/datadog \
+      -F pplx-space-api-svc/kubernetes \
+      -F pplx-space-api-svc/federated-identity \
+      -F pplx-space-data-plane-svc/otel,pplx-space-data-plane-svc/datadog \
+      -F pplx-space-data-plane-svc/kubernetes \
+      -F pplx-space-cluster-controller/otel,pplx-space-cluster-controller/datadog \
+      -F pplx-space-spaced-guest-svc/test-hooks,pplx-space-node-mgr-svc/test-hooks,pplx-space-sbxmgr-svc/test-hooks,pplx-space-tmplmgr-svc/test-hooks \
+      -F pplx-space-template-mgr/test-hooks,pplx-space-internal-api-server/test-hooks,pplx-space-credmgr/test-hooks \
+      -F pplx-space-common-svc/test-hooks,pplx-space-spaced-guest-server/test-hooks,pplx-space-observability/test-hooks \
+      -F pplx-space-cluster-controller-server/test-hooks,pplx-space-common-core/test-hooks,pplx-space-sbx-mgr/test-hooks,pplx-space-api/test-hooks \
+      -F pplx-space-build-mgr-server/test-hooks,pplx-space-node-api-server/test-hooks,pplx-space-node-mgr/test-hooks \
+      --bin spaced \
+      --bin spaced-svc \
+      --bin space-buildmgr \
+      --bin space-buildmgr-svc \
+      --bin space-tmplmgr \
+      --bin space-rtmgr-svc \
+      --bin space-rtmgr \
+      --bin space-nodemgr-svc \
+      --bin space-sbxmgr \
+      --bin space-nodectl \
+      --bin space-sbxmgr-svc \
+      --bin space-spaced-host-svc \
+      --bin space-netgtw-svc \
+      --bin space-tmplmgr-svc \
+      --bin space-volmgr \
+      --bin space-credmgr-svc \
+      --bin space-volmgr-svc \
+      --bin space-node-api-svc \
+      --bin space-internal-api-svc \
+      --bin space-nodectl-svc \
+      --bin space-db-migrator \
+      --bin space-api-svc \
+      --bin space-template-publish \
+      --bin space-data-plane-svc \
+      --bin space-cluster-controller
+
+RUN bash scripts/build-runtime-supervisor.sh \
+      target/release/space-runtime-supervisor-svc \
+      target/release/space-runtime-supervisor-compatibility \
+      cargo build --locked --release \
+        -F pplx-space-runtime-supervisor-svc/otel,pplx-space-runtime-supervisor-svc/datadog \
+        --bin space-runtime-supervisor-svc
+
+FROM ${SPACE_GRPC_HEALTH_PROBE_IMAGE} AS grpc-health-probe
+
+FROM scratch AS build-artifacts-kind
+
+LABEL org.opencontainers.image.title="space-rust-build-kind"
+LABEL org.opencontainers.image.description="SPACE Rust build artifacts for the local kind stack: the union of every production artifact set from one build."
+
+# worker set
+COPY --from=build /workspace/target/release/spaced /artifacts/bin/spaced
+COPY --from=build /workspace/target/release/spaced-svc /artifacts/bin/spaced-svc
+COPY --from=build /workspace/target/release/space-runtime-supervisor-svc /artifacts/bin/space-runtime-supervisor-svc
+COPY --from=build /workspace/target/release/space-runtime-supervisor-compatibility /artifacts/etc/space-runtime-supervisor-compatibility
+COPY --from=build /workspace/target/release/space-rtmgr-svc /artifacts/bin/space-rtmgr-svc
+COPY --from=build /workspace/target/release/space-rtmgr /artifacts/bin/space-rtmgr
+COPY --from=build /workspace/target/release/space-nodemgr-svc /artifacts/bin/space-nodemgr-svc
+COPY --from=build /workspace/target/release/space-sbxmgr /artifacts/bin/space-sbxmgr
+COPY --from=build /workspace/target/release/space-nodectl /artifacts/bin/space-nodectl
+COPY --from=build /workspace/target/release/space-sbxmgr-svc /artifacts/bin/space-sbxmgr-svc
+COPY --from=build /workspace/target/release/space-spaced-host-svc /artifacts/bin/space-spaced-host-svc
+COPY --from=build /workspace/target/release/space-netgtw-svc /artifacts/bin/space-netgtw-svc
+COPY --from=build /workspace/target/release/space-tmplmgr-svc /artifacts/bin/space-tmplmgr-svc
+COPY --from=build /workspace/target/release/space-volmgr /artifacts/bin/space-volmgr
+COPY --from=build /workspace/target/release/space-credmgr-svc /artifacts/bin/space-credmgr-svc
+COPY --from=build /workspace/target/release/space-volmgr-svc /artifacts/bin/space-volmgr-svc
+COPY --from=build /workspace/target/release/space-node-api-svc /artifacts/bin/space-node-api-svc
+COPY --from=build /workspace/target/release/space-internal-api-svc /artifacts/bin/space-internal-api-svc
+COPY --from=build /workspace/target/release/space-nodectl-svc /artifacts/bin/space-nodectl-svc
+COPY --from=build /workspace/target/release/space-buildmgr /artifacts/bin/space-buildmgr
+COPY --from=build /workspace/target/release/space-buildmgr-svc /artifacts/bin/space-buildmgr-svc
+COPY --from=build /workspace/target/release/space-tmplmgr /artifacts/bin/space-tmplmgr
+COPY --from=build /workspace/target/release/space-db-migrator /artifacts/bin/space-db-migrator
+COPY --from=grpc-health-probe /grpc_health_probe /artifacts/bin/grpc_health_probe
+# api set
+COPY --from=build /workspace/target/release/space-api-svc /artifacts/bin/space-api-svc
+COPY --from=build /workspace/target/release/space-template-publish /artifacts/bin/space-template-publish
+# data-plane and cluster-controller sets
+COPY --from=build /workspace/target/release/space-data-plane-svc /artifacts/bin/space-data-plane-svc
+COPY --from=build /workspace/target/release/space-cluster-controller /artifacts/bin/space-cluster-controller

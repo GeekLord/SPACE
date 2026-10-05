@@ -1,0 +1,12 @@
+{{- /* This Kind harness exposes Agent host ports and owns its kube-system resources. */ -}}
+{{- if ne .Release.Namespace "kube-system" -}}
+{{- fail "datadog-agent-local requires --namespace kube-system; Fake Intake endpoints use that namespace" -}}
+{{- end -}}
+{{- $secret := required "Select values-fakeintake.yaml or set datadog.datadog.apiKeyExistingSecret to an existing SaaS Secret" .Values.datadog.datadog.apiKeyExistingSecret -}}
+{{- if .Values.fakeintake.enabled -}}
+{{- if or (ne $secret "datadog-fakeintake-key") (ne .Values.datadog.datadog.site "local.invalid") -}}
+{{- fail "Fake Intake requires its dummy Secret and site local.invalid" -}}
+{{- end -}}
+{{- else if eq $secret "datadog-fakeintake-key" -}}
+{{- fail "The dummy Secret requires Fake Intake; choose values-fakeintake.yaml" -}}
+{{- end -}}

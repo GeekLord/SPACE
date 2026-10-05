@@ -1,0 +1,64 @@
+name: Quarantined smoke backlog (non-blocking)
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    if: github.repository == 'perplexityai/SPACE'
+    name: Quarantined smoke backlog (non-blocking)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # This check fails visibly but required aggregate gates never depend on it.
+    # A failed inventory must say unknown, never zero. The job fails on its own
+    # without failing the Pull, merge-queue and Main CI runs that call this
+    # workflow: their callers cannot set continue-on-error, so it is set here.
+    continue-on-error: true
+    permissions:
+      contents: read
+    env:
+      SPACE_SMOKE_SCENARIO_PACKAGES: ""
+    steps:
+      - name: Check out SPACE without persisted credentials
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Inventory registry quarantine declarations
+        id: inventory
+        continue-on-error: true
+        run: |
+          python3 -m space_smoke.quarantine_backlog \
+            --summary "$GITHUB_STEP_SUMMARY" --annotations \
+            --json "$RUNNER_TEMP/quarantine-backlog.json"
+
+      - name: Report unavailable quarantine inventory
+        if: always() && (steps.checkout.outcome != 'success' || steps.inventory.outcome != 'success')
+        run: |
+          echo "::error title=Quarantined smoke backlog unavailable::Could not inventory declarations. The backlog count is unknown; inspect this job's diagnostics."
+          {
+            echo "# Quarantined smoke backlog (non-blocking)"
+            echo
+            echo "**Inventory unavailable: backlog count is unknown.**"
+            echo "No scenario execution or passing behavior is implied. Inspect the failed discovery step."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: Fail non-blocking check when quarantines remain
+        if: steps.inventory.outcome == 'success'
+        run: |
+          python3 - <<'PYTHON'
+          import json
+          import os
+          from pathlib import Path
+
+          count = json.loads((Path(os.environ["RUNNER_TEMP"]) / "quarantine-backlog.json").read_text())["quarantined_count"]
+          if count:
+              print(f"::error title=Quarantined smoke backlog (non-blocking)::{count} scenarios remain quarantined. This check is not required and does not block required CI gates. See the job summary.")
+              raise SystemExit(1)
+          PYTHON

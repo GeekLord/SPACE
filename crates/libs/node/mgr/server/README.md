@@ -1,0 +1,20 @@
+# Node-manager execution authority
+
+Lifecycle mutations require the sandbox owner's persisted execution identity.
+Node-manager, runtime-supervisor and sandbox-manager retain that authority across
+process restarts; lease absence alone does not authorize cleanup of a live VM.
+An explicit owner cleanup token can authorize an unbound, quiescent instance.
+Missing or stale authority is not repaired by retrying with a newly observed token.
+
+## Startup authority gate
+
+Node-manager and sandbox-manager refuse startup with persisted state that has
+no execution authority. Diagnostics report the missing authority count up to 64
+("at least 64" when saturated) and at most eight sandbox IDs. Do not erase
+stores, reset slots or manufacture identities to bypass the gate.
+
+Node-manager's authority preflight waits for startup recovery to release each
+sandbox, then rechecks its current lease/runtime evidence and persisted authority.
+Contention does not restart the daemon or bypass the gate. Shutdown cancels the
+ownership wait; a stuck recovery operation keeps admission unready. Qualify
+restarts with dirty/resetting slots as well as clean startup.

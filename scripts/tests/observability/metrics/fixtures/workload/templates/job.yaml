@@ -1,0 +1,52 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: workload-{{ .Values.run }}
+  labels:
+    space-local-owner: metrics
+    observability-test-run: {{ .Values.run | quote }}
+spec:
+  parallelism: 2
+  completions: 2
+  backoffLimit: 0
+  activeDeadlineSeconds: 780
+  template:
+    metadata:
+      labels:
+        app: oss-workload
+        space-local-owner: metrics
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: workload
+          image: {{ .Values.image | quote }}
+          imagePullPolicy: Never
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 50m, memory: 32Mi}
+            limits: {cpu: 250m, memory: 128Mi, ephemeral-storage: 64Mi}
+          env:
+            - {name: SPACE_METRICS_SINK, value: otlp}
+            - {name: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT, value: "http://collector:4317"}
+            - {name: OTEL_EXPORTER_OTLP_METRICS_PROTOCOL, value: grpc}
+            - {name: SPACE_CLUSTER_ID, value: kind-oss-synthetic}
+            - {name: OTEL_RESOURCE_ATTRIBUTES, value: "k8s.cluster.name=kind-oss-synthetic"}
+            - {name: DD_ENV, value: kind-oss-synthetic}
+            - {name: DD_SERVICE, value: space-oss-workload}
+            - {name: DD_VERSION, value: {{ .Values.version | quote }}}
+            - {name: RUST_LOG, value: info}
+            - name: HOSTNAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: SPACE_K8S_POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: SPACE_K8S_NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}

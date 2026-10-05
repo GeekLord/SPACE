@@ -1,0 +1,78 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.serviceAccount.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-api
+    app.kubernetes.io/instance: {{ .Release.Name }}
+---
+# Namespaced verbs the KubernetesSubstrate needs to create+observe the
+# per-sandbox pause pods and watch readiness events.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-api-pods
+  namespace: {{ .Values.k8s.sandboxNamespace }}
+  labels:
+    app.kubernetes.io/name: space-api
+    app.kubernetes.io/instance: {{ .Release.Name }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-api-pods
+  namespace: {{ .Values.k8s.sandboxNamespace }}
+  labels:
+    app.kubernetes.io/name: space-api
+    app.kubernetes.io/instance: {{ .Release.Name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.serviceAccount.name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-api-pods
+---
+# Cluster-scope: the substrate watches Nodes to map sandbox pod placement
+# back to a SPACE node row (and to address worker node-api pods by their
+# K8s node name).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-api-nodes
+  labels:
+    app.kubernetes.io/name: space-api
+    app.kubernetes.io/instance: {{ .Release.Name }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    # `patch` covers the admin `:drain`/`:terminate` cordon convergence
+    # path (api-server) AND the node-drain reconciler's idempotent
+    # cordon re-assert (cluster-controller, which reuses this Role via
+    # the kind-only space-cluster-controller-local chart).
+    verbs: ["get", "list", "watch", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-api-nodes
+  labels:
+    app.kubernetes.io/name: space-api
+    app.kubernetes.io/instance: {{ .Release.Name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.serviceAccount.name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Name }}-api-nodes

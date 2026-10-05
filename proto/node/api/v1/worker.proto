@@ -1,0 +1,131 @@
+syntax = "proto3";
+package space.node.api.v1;
+
+import "sandbox/manager/v1/manager.proto";
+import "net/gateway/v1/gateway.proto";
+import "spaced/operations/v1/operations.proto";
+import "template/manager/v1/manager.proto";
+import "node/v1/node.proto";
+import "node/api/v1/common.proto";
+
+// WorkerApi is the external API for a SPACE worker node.
+// Exposes full sandbox lifecycle, template management, and network operations.
+service WorkerApi {
+  // ── Sandbox lifecycle ──────────────────────────────────────────────────────
+
+  rpc CreateSandbox(space.sandbox.manager.v1.CreateRequest) returns (space.sandbox.manager.v1.CreateResponse);
+  rpc StartSandbox(space.sandbox.manager.v1.StartRequest) returns (space.sandbox.manager.v1.StartResponse);
+  rpc StopSandbox(space.sandbox.manager.v1.StopRequest) returns (space.sandbox.manager.v1.StopResponse);
+  rpc KillSandbox(space.sandbox.manager.v1.KillRequest) returns (space.sandbox.manager.v1.KillResponse);
+  rpc DeleteSandbox(space.sandbox.manager.v1.DeleteRequest) returns (space.sandbox.manager.v1.DeleteResponse);
+  rpc SandboxState(space.sandbox.manager.v1.StateRequest) returns (space.sandbox.manager.v1.StateResponse);
+  rpc GetSandboxHealth(space.sandbox.manager.v1.GetSandboxHealthRequest) returns (space.sandbox.manager.v1.GetSandboxHealthResponse);
+  rpc ListSandboxes(space.sandbox.manager.v1.ListRequest) returns (space.sandbox.manager.v1.ListResponse);
+
+  // ── Sandbox state management ───────────────────────────────────────────────
+
+  rpc PauseSandbox(space.sandbox.manager.v1.PauseRequest) returns (space.sandbox.manager.v1.PauseResponse);
+  rpc ResumeSandbox(space.sandbox.manager.v1.ResumeRequest) returns (space.sandbox.manager.v1.ResumeResponse);
+  rpc WakeSandbox(space.sandbox.manager.v1.WakeRequest) returns (space.sandbox.manager.v1.WakeResponse);
+  rpc CreateSandboxSnapshot(space.sandbox.manager.v1.CreateSnapshotRequest) returns (space.sandbox.manager.v1.CreateSnapshotResponse);
+  rpc SuspendSandbox(space.sandbox.manager.v1.SuspendRequest) returns (space.sandbox.manager.v1.SuspendResponse);
+  rpc PrepareTeardownSuspend(space.sandbox.manager.v1.PrepareTeardownSuspendRequest) returns (space.sandbox.manager.v1.PrepareTeardownSuspendResponse);
+  rpc EnqueueSandboxArtifactBackup(space.sandbox.manager.v1.EnqueueArtifactBackupRequest) returns (space.sandbox.manager.v1.EnqueueArtifactBackupResponse);
+
+  // ── Sandbox operations ─────────────────────────────────────────────────────
+
+  rpc SandboxStats(space.sandbox.manager.v1.StatsRequest) returns (space.sandbox.manager.v1.StatsResponse);
+  rpc UpdateSandbox(space.sandbox.manager.v1.UpdateRequest) returns (space.sandbox.manager.v1.UpdateResponse);
+  rpc SetSandboxAutoLifecyclePolicy(space.sandbox.manager.v1.SetAutoLifecyclePolicyRequest) returns (space.sandbox.manager.v1.SetAutoLifecyclePolicyResponse);
+  rpc TouchSandboxAutoLifecycle(space.sandbox.manager.v1.TouchAutoLifecycleRequest) returns (space.sandbox.manager.v1.TouchAutoLifecycleResponse);
+  rpc SetSandboxNetworkPolicy(space.sandbox.manager.v1.SetNetworkPolicyRequest) returns (space.sandbox.manager.v1.SetNetworkPolicyResponse);
+
+  // ── Spaced guest operations (via sandbox-manager) ─────────────────────────
+
+  rpc SpacedPingGuest(space.sandbox.manager.v1.SpacedPingGuestRequest) returns (space.sandbox.manager.v1.SpacedPingGuestResponse);
+  rpc SpacedGetStatus(space.sandbox.manager.v1.SpacedGetStatusRequest) returns (space.sandbox.manager.v1.SpacedGetStatusResponse);
+  rpc SpacedWaitReady(space.sandbox.manager.v1.SpacedWaitReadyRequest) returns (space.sandbox.manager.v1.SpacedWaitReadyResponse);
+  rpc SpacedStat(space.sandbox.manager.v1.SpacedStatRequest) returns (space.spaced.operations.v1.StatResponse);
+  rpc SpacedList(space.sandbox.manager.v1.SpacedListRequest) returns (stream space.spaced.operations.v1.FileInfo);
+  rpc SpacedRead(space.sandbox.manager.v1.SpacedReadRequest) returns (stream space.spaced.operations.v1.FileChunk);
+  rpc SpacedWrite(stream space.sandbox.manager.v1.SpacedWriteRequest) returns (space.spaced.operations.v1.WriteResponse);
+  rpc SpacedWriteBatch(space.sandbox.manager.v1.SpacedWriteBatchRequest) returns (space.spaced.operations.v1.WriteBatchResponse);
+  rpc SpacedMkdir(space.sandbox.manager.v1.SpacedMkdirRequest) returns (space.spaced.operations.v1.MkdirResponse);
+  rpc SpacedRemove(space.sandbox.manager.v1.SpacedRemoveRequest) returns (space.spaced.operations.v1.RemoveResponse);
+  rpc SpacedRename(space.sandbox.manager.v1.SpacedRenameRequest) returns (space.spaced.operations.v1.RenameResponse);
+  rpc SpacedNormalizeWatchRoot(space.sandbox.manager.v1.SpacedNormalizeWatchRootRequest) returns (space.spaced.operations.v1.NormalizeWatchRootResponse);
+  rpc SpacedWatch(space.sandbox.manager.v1.SpacedWatchRequest) returns (stream space.spaced.operations.v1.FileEvent);
+  rpc SpacedCreateWatcher(space.sandbox.manager.v1.SpacedCreateWatcherRequest) returns (space.spaced.operations.v1.CreateWatcherResponse);
+  rpc SpacedGetWatcherEvents(space.sandbox.manager.v1.SpacedGetWatcherEventsRequest) returns (space.spaced.operations.v1.GetWatcherEventsResponse);
+  rpc SpacedRemoveWatcher(space.sandbox.manager.v1.SpacedRemoveWatcherRequest) returns (space.spaced.operations.v1.RemoveWatcherResponse);
+  rpc SpacedEnableFileChanges(space.sandbox.manager.v1.SpacedEnableFileChangesRequest) returns (space.spaced.operations.v1.EnableFileChangesResponse);
+  rpc SpacedDisableFileChanges(space.sandbox.manager.v1.SpacedDisableFileChangesRequest) returns (space.spaced.operations.v1.DisableFileChangesResponse);
+  rpc SpacedGetModifiedFiles(space.sandbox.manager.v1.SpacedGetModifiedFilesRequest) returns (space.spaced.operations.v1.GetModifiedFilesResponse);
+  rpc SpacedStartProcess(space.sandbox.manager.v1.SpacedStartProcessRequest) returns (stream space.spaced.operations.v1.ProcessEvent);
+  rpc SpacedConnectProcess(space.sandbox.manager.v1.SpacedConnectProcessRequest) returns (stream space.spaced.operations.v1.ProcessEvent);
+  rpc SpacedListProcesses(space.sandbox.manager.v1.SpacedListProcessesRequest) returns (space.sandbox.manager.v1.SpacedListProcessesResponse);
+  rpc SpacedSendSignal(space.sandbox.manager.v1.SpacedSendSignalRequest) returns (space.spaced.operations.v1.SendSignalResponse);
+  rpc SpacedSendInput(space.sandbox.manager.v1.SpacedSendInputRequest) returns (space.spaced.operations.v1.SendInputResponse);
+  rpc SpacedCloseStdin(space.sandbox.manager.v1.SpacedCloseStdinRequest) returns (space.spaced.operations.v1.CloseStdinResponse);
+  rpc SpacedResizePty(space.sandbox.manager.v1.SpacedResizePtyRequest) returns (space.spaced.operations.v1.ResizePtyResponse);
+  rpc SpacedKillProcess(space.sandbox.manager.v1.SpacedKillProcessRequest) returns (space.spaced.operations.v1.KillResponse);
+
+  // Open / close the in-VM loopback bridge for an explicitly authorized port.
+  // The host-side firewall path (`ExposePort` + `AllowPort`) must be installed
+  // independently; these RPCs only manage the in-VM side.
+  rpc SpacedOpenLoopbackBridge(space.sandbox.manager.v1.SpacedOpenLoopbackBridgeRequest) returns (space.spaced.operations.v1.OpenLoopbackBridgeResponse);
+  rpc SpacedCloseLoopbackBridge(space.sandbox.manager.v1.SpacedCloseLoopbackBridgeRequest) returns (space.spaced.operations.v1.CloseLoopbackBridgeResponse);
+  rpc ServicePortIngress(stream space.net.gateway.v1.ServicePortIngressFrame) returns (stream space.net.gateway.v1.ServicePortIngressFrame);
+
+  // ── Sandbox snapshots ──────────────────────────────────────────────────────
+
+  rpc EnableSnapshots(space.sandbox.manager.v1.EnableSnapshotsRequest) returns (space.sandbox.manager.v1.EnableSnapshotsResponse);
+  rpc DisableSnapshots(space.sandbox.manager.v1.DisableSnapshotsRequest) returns (space.sandbox.manager.v1.DisableSnapshotsResponse);
+  rpc ListSnapshots(space.sandbox.manager.v1.ListSnapshotsRequest) returns (space.sandbox.manager.v1.ListSnapshotsResponse);
+  rpc DeleteSnapshots(space.sandbox.manager.v1.DeleteSnapshotsRequest) returns (space.sandbox.manager.v1.DeleteSnapshotsResponse);
+  rpc RollbackSandbox(space.sandbox.manager.v1.RollbackRequest) returns (space.sandbox.manager.v1.RollbackResponse);
+
+  // ── Template management (via template-manager) ─────────────────────────────
+
+  rpc DeleteTemplate(space.template.manager.v1.DeleteTemplateRequest) returns (space.template.manager.v1.DeleteTemplateResponse);
+  rpc DeleteTemplateBuild(space.template.manager.v1.DeleteTemplateBuildRequest) returns (space.template.manager.v1.DeleteTemplateBuildResponse);
+  rpc ListTemplates(space.template.manager.v1.ListTemplatesRequest) returns (space.template.manager.v1.ListTemplatesResponse);
+  rpc GetTemplate(space.template.manager.v1.GetTemplateRequest) returns (space.template.manager.v1.GetTemplateResponse);
+  rpc UpdateTemplateSettings(space.template.manager.v1.UpdateTemplateSettingsRequest) returns (space.template.manager.v1.UpdateTemplateSettingsResponse);
+  rpc UpdateTemplateSnapshotPolicy(space.template.manager.v1.UpdateTemplateSnapshotPolicyRequest) returns (space.template.manager.v1.UpdateTemplateSnapshotPolicyResponse);
+  rpc CreatePool(space.template.manager.v1.CreatePoolRequest) returns (space.template.manager.v1.CreatePoolResponse);
+  rpc DeletePool(space.template.manager.v1.DeletePoolRequest) returns (space.template.manager.v1.DeletePoolResponse);
+  rpc PoolStatus(space.template.manager.v1.PoolStatusRequest) returns (space.template.manager.v1.PoolStatusResponse);
+
+  // ── Network (via node-manager) ─────────────────────────────────────────────
+
+  rpc ExposePort(space.node.v1.ExposePortRequest) returns (space.node.v1.ExposePortResponse);
+  rpc UnexposePort(space.node.v1.UnexposePortRequest) returns (space.node.v1.UnexposePortResponse);
+  rpc AllowPort(space.node.v1.AllowPortRequest) returns (space.node.v1.AllowPortResponse);
+  rpc DenyPort(space.node.v1.DenyPortRequest) returns (space.node.v1.DenyPortResponse);
+
+  // ── Template transfer ───────────────────────────────────────────────────────
+
+  // Pull a template from a remote source onto this node.
+  // node-api-svc orchestrates: connects to source, streams to local template-manager.
+  rpc PullTemplate(PullTemplateRequest) returns (PullTemplateResponse);
+
+  // Export a template for transfer to another node.
+  // Server-streaming pass-through to local template-manager.
+  rpc NodeExportTemplate(space.template.manager.v1.ExportTemplateRequest) returns (stream space.template.manager.v1.ExportTemplateChunk);
+
+  // List templates on this node with content hashes.
+  rpc ListNodeTemplates(ListNodeTemplatesRequest) returns (ListNodeTemplatesResponse);
+
+  // ── Node-level orchestration ───────────────────────────────────────────────
+
+  rpc RefreshFacetState(RefreshFacetStateRequest) returns (RefreshFacetStateResponse);
+  rpc TriggerStateReconciliation(TriggerStateReconciliationRequest) returns (TriggerStateReconciliationResponse);
+}
+
+// WorkerApiInternal is the node-local worker surface for recovery/orchestration
+// RPCs that can carry privileged WakeRequest.start_context.
+service WorkerApiInternal {
+  rpc AdoptPoolSandbox(space.sandbox.manager.v1.AdoptPoolSandboxRequest) returns (space.sandbox.manager.v1.AdoptPoolSandboxResponse);
+  rpc WakeSandbox(space.sandbox.manager.v1.WakeRequest) returns (space.sandbox.manager.v1.WakeResponse);
+}

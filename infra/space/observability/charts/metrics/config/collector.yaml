@@ -1,0 +1,58 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        max_recv_msg_size_mib: 4
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 64
+  # Alpha; state is memory-only. One replica, no autoscaling or durable claim.
+  delta_to_cumulative:
+    max_stale: {{ .Values.collector.maxStale }}
+    max_streams: {{ .Values.collector.maxStreams }}
+  batch:
+    timeout: 1s
+    send_batch_size: 256
+    send_batch_max_size: 512
+exporters:
+  otlp_http:
+    metrics_endpoint: http://prometheus:9090/api/v1/otlp/v1/metrics
+    timeout: 3s
+    sending_queue:
+      enabled: true
+      num_consumers: 1
+      queue_size: 128
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 5s
+      max_elapsed_time: 30s
+  {{- if .Values.collector.debug }}
+  # Diagnostic samples prove that conversion retains ExponentialHistogram.
+  # Sampling bounds log volume; this is not a second metrics backend.
+  debug:
+    verbosity: detailed
+    sampling_initial: 2
+    sampling_thereafter: 100
+  {{- end }}
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+service:
+  extensions: [health_check]
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, delta_to_cumulative, batch]
+      exporters: [otlp_http{{ if .Values.collector.debug }}, debug{{ end }}]

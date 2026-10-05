@@ -1,0 +1,110 @@
+# Template for the `space-local` kind cluster config. Not consumable by
+# `kind create` as it stands: the `${...}` host paths are substituted by
+# `infra/space/kind/scripts/lib/kind-host-paths.sh`, which writes the result to
+# $SPACE_KIND_CONFIG (default ~/.space-devbox/kind/kind-cluster.yaml) and is
+# what both bring-up paths — `scripts/bootstrap.sh` and the smoke suites'
+# `scripts/tests/lib/bootstrap-kind-stack.sh` — pass to `kind create`.
+#
+# The host paths are rendered rather than written here because `kind create`
+# expands nothing, so a literal path would name one machine's layout: these
+# trees live under the invoking user's home, and hardcoding `/home/dev` gave
+# every other username an empty `/space/vendor` and a first sandbox that died
+# looking like a Firecracker fault. Nothing refused the missing path —
+# `kind create` accepts an extraMount hostPath that does not exist, and Docker
+# creates it.
+#
+# The knobs, named without braces on purpose: a braced placeholder in a
+# comment gets substituted like any other, and this block would render as
+# "/home/you/.kind-data default ~/.kind-data".
+#   SPACE_KIND_DATA_ROOT  default ~/.kind-data
+#   SPACE_VENDOR_ROOT     default ~/.space-devbox/space/vendor
+#
+# Both defaults reproduce the paths this file used to hardcode when $HOME is
+# /home/dev, so a devbox renders byte-identical mounts.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: space-local
+nodes:
+  - role: control-plane
+    # /var/lib/containerd is where the kind worker's containerd stores image
+    # blobs + snapshotter state. The image set can exhaust the per-container
+    # overlay during `kind load`. Mount it from a per-node host directory so
+    # each kind worker can use the host filesystem capacity.
+    # `kind_prepare_host_mounts` pre-creates
+    # every dir under SPACE_KIND_DATA_ROOT before `kind create`, reading
+    # this file rather than a second list of node roles.
+    extraMounts:
+      - hostPath: ${SPACE_KIND_DATA_ROOT}/control-plane/containerd
+        containerPath: /var/lib/containerd
+  # Sandbox worker nodes — receive SPACE sandbox pods. Labeled
+  # node.kubernetes.io/space-enabled=true by the bootstrap step.
+  # Do NOT run control-plane components here; these nodes get drained
+  # and terminated during node-drain e2e tests.
+  #
+  # extraMounts on sandbox workers:
+  #   - SPACE_VENDOR_ROOT : where install-fc-vendor.sh stages
+  #     Firecracker v1.15.1 (binary, jailer,
+  #     vmlinux). The node-stack pod hostPath-mounts /space/vendor through,
+  #     matching production where /space/vendor is populated by Packer on
+  #     the AMI. Without this the node-stack image would have to bake the
+  #     FC tree itself.
+  #   - /dev/kvm : Firecracker needs the host KVM character device. kind
+  #     nodes run as privileged docker containers; bind-mounting the device
+  #     file lets the container's /dev/kvm work.
+  - role: worker
+    labels:
+      space.pplx.net/node-pool: sandbox
+    extraMounts:
+      - hostPath: ${SPACE_KIND_DATA_ROOT}/worker1/containerd
+        containerPath: /var/lib/containerd
+      - hostPath: ${SPACE_VENDOR_ROOT}
+        containerPath: /space/vendor
+        readOnly: true
+      - hostPath: /dev/kvm
+        containerPath: /dev/kvm
+  - role: worker
+    labels:
+      space.pplx.net/node-pool: sandbox
+    extraMounts:
+      - hostPath: ${SPACE_KIND_DATA_ROOT}/worker2/containerd
+        containerPath: /var/lib/containerd
+      - hostPath: ${SPACE_VENDOR_ROOT}
+        containerPath: /space/vendor
+        readOnly: true
+      - hostPath: /dev/kvm
+        containerPath: /dev/kvm
+  # Infra node — runs Postgres, space-api, and space-cluster-controller.
+  # Never labeled space-enabled so sandbox pods never land here, and
+  # never targeted by the drain reconciler.
+  - role: worker
+    labels:
+      space.pplx.net/node-pool: infra
+    extraMounts:
+      - hostPath: ${SPACE_KIND_DATA_ROOT}/worker3/containerd
+        containerPath: /var/lib/containerd
+  # Builder nodes — run the production-shaped builder node stack. They are kept
+  # out of the sandbox placement pool: build VMs are created directly by the
+  # builders' node-api/build-manager pairs, while user sandbox pods continue to
+  # land only on the sandbox workers above.
+  - role: worker
+    labels:
+      space.pplx.net/node-pool: builder
+    extraMounts:
+      - hostPath: ${SPACE_KIND_DATA_ROOT}/builder/containerd
+        containerPath: /var/lib/containerd
+      - hostPath: ${SPACE_VENDOR_ROOT}
+        containerPath: /space/vendor
+        readOnly: true
+      - hostPath: /dev/kvm
+        containerPath: /dev/kvm
+  - role: worker
+    labels:
+      space.pplx.net/node-pool: builder
+    extraMounts:
+      - hostPath: ${SPACE_KIND_DATA_ROOT}/builder2/containerd
+        containerPath: /var/lib/containerd
+      - hostPath: ${SPACE_VENDOR_ROOT}
+        containerPath: /space/vendor
+        readOnly: true
+      - hostPath: /dev/kvm
+        containerPath: /dev/kvm

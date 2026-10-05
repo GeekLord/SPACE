@@ -1,0 +1,59 @@
+# Lefthook — local git hooks for the SPACE repo.
+#
+# Install once:
+#   brew install lefthook   # or: go install github.com/evilmartians/lefthook@latest
+#   lefthook install
+#
+# Hooks run automatically on `git push`. To run manually:
+#   lefthook run pre-push
+#   lefthook run pre-commit
+
+pre-commit:
+  parallel: false
+  commands:
+    rust-fmt:
+      glob: "*.rs"
+      run: cargo fmt --all -- --check
+      fail_text: |
+        Rust formatting check failed.
+        Run `cargo fmt --all` to fix formatting issues.
+
+pre-push:
+  parallel: false
+  commands:
+    rust-fmt:
+      glob: "*.rs"
+      run: cargo fmt --all -- --check
+      fail_text: |
+        Rust formatting check failed.
+        Run `cargo fmt --all` to fix formatting issues.
+
+    rust-check:
+      glob: "*.rs"
+      run: cargo check --workspace --locked
+      fail_text: |
+        Rust compilation check failed.
+        Fix the compilation errors above before pushing.
+
+    rust-clippy:
+      glob: "*.rs"
+      run: cargo clippy --workspace --locked --all-features -- -D warnings
+      fail_text: |
+        Clippy found warnings (treated as errors).
+        Fix the clippy warnings above before pushing.
+
+    shim-fmt:
+      root: "shim/"
+      glob: "*.go"
+      run: test -z "$(gofmt -l .)"
+      fail_text: |
+        Go formatting check failed.
+        Run `gofmt -w .` in the shim/ directory to fix formatting.
+
+    shim-vet:
+      root: "shim/"
+      glob: "*.go"
+      run: go vet ./...
+      fail_text: |
+        Go vet found issues in the shim.
+        Fix the vet warnings above before pushing.

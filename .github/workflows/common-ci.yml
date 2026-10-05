@@ -1,0 +1,586 @@
+name: Common CI
+
+on:
+  workflow_call:
+    inputs:
+      base_sha:
+        description: Commit used as the migration-check comparison base
+        required: true
+        type: string
+      per_commit_migration_isolation:
+        description: Check migration isolation separately for each first-parent commit after base_sha
+        required: false
+        default: false
+        type: boolean
+      main_only_tests:
+        description: >-
+          Also run the tests whose cost only the post-merge pipeline pays for.
+          Their contracts are covered at small scale on every run; the
+          full-scale versions re-prove them against production-sized
+          statistics.
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  guidebook:
+    if: github.repository == 'perplexityai/SPACE'
+    name: SPACE Guide
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # A GitHub release download has answered 500 to four attempts over 8 s,
+      # while jobs half a minute either side fetched the same file. Six retries
+      # back off over about a minute; --retry-all-errors also retries a reset
+      # connection.
+      - &install-mdbook
+        name: Install pinned mdBook
+        run: |
+          version="$(cat docs/book/mdbook.version)"
+          archive="mdbook-v${version}-x86_64-unknown-linux-musl.tar.gz"
+          curl --fail --location --retry 6 --retry-all-errors --output "$RUNNER_TEMP/$archive" \
+            "https://github.com/rust-lang/mdBook/releases/download/v${version}/$archive"
+          echo "c96bdabf3754d9e016fb803c1565a41050434479b2dc1e02a87c8d0da7524c6c  $RUNNER_TEMP/$archive" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" mdbook
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Set up guide diagram tooling
+        # Mermaid's offline browser bundle comes from the shared docs lockfile.
+        # Keep the standalone guide on the same Node version as the API build.
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        with:
+          node-version: '22.23.3'
+
+      - name: Build and check the guide
+        run: |
+          bash scripts/build-guide-docs.sh
+          python3 docs/book/test.py
+
+  api_reference:
+    if: github.repository == 'perplexityai/SPACE'
+    name: Documentation site
+    runs-on: ubuntu-24.04-16core
+    timeout-minutes: 15
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up documentation tooling
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        with:
+          node-version: '22.23.3'
+          cache: npm
+          cache-dependency-path: docs/api/package-lock.json
+
+      - *install-mdbook
+
+      - name: Get the CI image
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: bash ci/scripts/ci-image.sh ensure "space-ci:${GITHUB_SHA}"
+
+      - name: Install documentation dependencies
+        run: npm ci --prefix docs/api --ignore-scripts --no-fund
+
+      - name: Build guide and API while installing the test browser
+        env:
+          SPACE_API_DOCS_RUST_IMAGE: space-ci:${{ github.sha }}
+          SPACE_DOCS_NPM_CI_DONE: '1'
+        run: |
+          bash scripts/build-docs.sh &
+          build_pid=$!
+          npm --prefix docs/api exec -- playwright install --with-deps --only-shell chromium &
+          browser_pid=$!
+          status=0
+          wait "$build_pid" || status=1
+          wait "$browser_pid" || status=1
+          exit "$status"
+
+      - name: Check standalone outputs and the combined site
+        run: |
+          python3 docs/book/test.py
+          python3 docs/site/test_build.py
+          node docs/api/test.mjs &
+          api_pid=$!
+          node docs/site/test.mjs &
+          site_pid=$!
+          status=0
+          wait "$api_pid" || status=1
+          wait "$site_pid" || status=1
+          exit "$status"
+
+      - name: Retain private preview assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: space-docs-${{ github.event.pull_request.head.sha || github.sha }}
+          path: target/docs/site/
+          include-hidden-files: true
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Retain visual check screenshots
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: space-docs-checks-${{ github.event.pull_request.head.sha || github.sha }}
+          path: target/docs/site-checks/
+          retention-days: 1
+          if-no-files-found: error
+
+  # The existing Rust test lane below also runs the canonical OpenAPI contract
+  # tests. Both this job and that lane feed the unchanged space-pull-ci gate for
+  # pull requests and merge groups. No docs deployment or write token is used.
+  dependency_vetting:
+    if: github.repository == 'perplexityai/SPACE'
+    name: Rust dependency checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # cargo-vet and cargo-deny are pinned in ci/Dockerfile.ci and ship in the
+      # CI image, so this job no longer compiles them on every run.
+      - name: Get the CI image
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: bash ci/scripts/ci-image.sh ensure "space-ci:${GITHUB_SHA}"
+
+      - name: Verify third-party Rust dependencies
+        run: >-
+          docker run --rm --volume "${GITHUB_WORKSPACE}:/workspace" --workdir /workspace
+          "space-ci:${GITHUB_SHA}" cargo vet --locked
+
+      - name: Check Rust advisories, licenses, and sources
+        run: >-
+          docker run --rm --volume "${GITHUB_WORKSPACE}:/workspace" --workdir /workspace
+          "space-ci:${GITHUB_SHA}"
+          cargo deny --locked --all-features check advisories licenses sources
+
+  validation:
+    if: github.repository == 'perplexityai/SPACE'
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Rust tests
+            command: bash ci/scripts/run-rust-checks.sh tests
+            # The full all-targets/all-features graph exhausts the standard
+            # runner's 14 GB disk before linking the workspace test binaries.
+            runner: ubuntu-24.04-16core
+            docker_access: true
+            host_network: true
+            privileged: true
+            rust_cache: true
+            rust_cache_key: tests
+            rust_cache_size: 4G
+            rust_cache_refresh_misses: 20
+            rust_target_cache: true
+            # Only this runner gains from it: on the standard runners the
+            # prefetch slows the concurrent CI image pull by more than it saves.
+            prefetch_crates: true
+            timeout: 120
+          - name: Go shim
+            command: bash ci/scripts/run-shim-checks.sh
+            runner: ubuntu-24.04
+            docker_access: false
+            host_network: false
+            privileged: false
+            timeout: 30
+          - name: Python tests
+            command: bash ci/scripts/run-python-tests.sh
+            runner: ubuntu-24.04
+            docker_access: true
+            host_network: true
+            privileged: false
+            timeout: 30
+          - name: Shell tests
+            command: bash ci/scripts/run-shell-tests.sh
+            runner: ubuntu-24.04
+            docker_access: false
+            host_network: false
+            privileged: false
+            timeout: 30
+          - name: Migration guards
+            command: >-
+              migration_base="$(bash ci/scripts/resolve-migration-base.sh "$SPACE_CI_BASE_SHA" "$SPACE_CI_PULL_REQUEST_HEAD_SHA")" &&
+              export BUILDKITE_BUILD_ID=github-actions &&
+              export MIGRATION_VERSION_GUARD_BASE_REF="$migration_base" &&
+              export MIGRATION_ISOLATION_BASE_REF="$migration_base" &&
+              export MIGRATION_SQUAWK_BASE_REF="$migration_base" &&
+              bash scripts/check-migration-versions.sh &&
+              if [[ "$SPACE_CI_PER_COMMIT_MIGRATION_ISOLATION" == true ]]; then
+              bash ci/scripts/check-migration-isolation-per-commit.sh "$migration_base";
+              else bash scripts/check-postgres-migrations-isolated.sh; fi &&
+              bash scripts/check-postgres-migrations-squawk.sh
+            runner: ubuntu-24.04
+            docker_access: false
+            host_network: false
+            privileged: false
+            timeout: 15
+          - name: Gateway traffic
+            command: >-
+              bash scripts/netgtw/traffic/run.sh &&
+              NETGTW_TRAFFIC_SKIP_BUILD=1 python3 scripts/netgtw/traffic/tls-authority/run.py
+            runner: ubuntu-24.04
+            docker_access: false
+            host_network: true
+            privileged: true
+            # Its own snapshot: the tests job's --workspace --all-features
+            # build compiles different feature sets, so its keys never match.
+            # One cold build writes about 330 MiB.
+            rust_cache: true
+            rust_cache_key: gateway
+            rust_cache_size: 1G
+            rust_cache_refresh_misses: 20
+            timeout: 45
+
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The repository-owned image pins the same toolchain used by the source
+      # scripts. Main pushes publish it to this repository's GHCR package; a
+      # job builds it locally when its tag is new or cannot be pulled. SPACE CI
+      # neither reads nor writes SPACE's private CI image registry. The pull
+      # runs in the background while the next steps fetch the test containers'
+      # images and the compiler cache; "Wait for the CI image" reports it.
+      - name: Start getting the CI image
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: >-
+          bash ci/scripts/background-step.sh start ci-image
+          bash ci/scripts/ci-image.sh ensure "space-ci:${GITHUB_SHA}"
+
+      # Download the crates meanwhile with the runner's own Cargo, into the
+      # registry the job container mounts; its `cargo fetch --locked` then only
+      # checks them. Cargo shares one registry across versions, as on any
+      # machine with several toolchains. This only saves time: if it fails, the
+      # container's fetch downloads everything, as before.
+      - name: Start fetching the Rust dependencies
+        if: matrix.prefetch_crates == true
+        run: >-
+          bash ci/scripts/background-step.sh start cargo-fetch
+          env RUSTUP_TOOLCHAIN=stable RUSTUP_AUTO_INSTALL=0 CARGO_HOME="${RUNNER_TEMP}/cargo-home"
+          cargo fetch --locked
+
+      # Anonymous public.ecr.aws pulls from these runners fail once their
+      # shared egress exhausts its data limit, and retries do not help. Take the
+      # test containers' images from this repository's GHCR mirror instead; see
+      # ci/mirrored-images.txt. The job container shares this Docker daemon, so
+      # its own pulls find the images already present. A missing mirror falls
+      # back to the source and never fails the job. Like the CI image, the pull
+      # overlaps the cache restores below and is waited for before the run.
+      - name: Start pulling the test containers' images
+        if: matrix.docker_access == true
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          source ci/scripts/lib/test-deps.sh
+          bash ci/scripts/background-step.sh start test-images \
+            bash ci/scripts/mirror-images.sh pull \
+            "$(space_test_dependency_postgres_image)" "$(space_test_dependency_redis_image)"
+
+      # The Rust tests' M1 SDK check runs the OpenAPI generator from Docker Hub,
+      # whose anonymous pull limit these runners also share. Pull its
+      # linux/amd64 image from the mirror as well. The check runs that copy when
+      # this daemon has it (SPACE_M1_GENERATOR_MIRROR below) and otherwise pulls
+      # from Docker Hub as before; see scripts/check-m1-sdk-generation.sh.
+      - name: Start pulling the M1 SDK generator's image
+        if: matrix.name == 'Rust tests'
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: >-
+          bash ci/scripts/background-step.sh start m1-generator
+          bash ci/scripts/mirror-images.sh pull
+          openapitools/openapi-generator-cli:v7.25.0@sha256:2ab0a9680222de65dc9d3baf861aa02b99e1b80c211d8221ebf3ae8f8a102524
+
+      # sccache cannot cache what links: test harnesses, binaries, build scripts
+      # and proc-macros. A Cargo target directory from an earlier commit can
+      # skip those too. Main builds cold and saves one per push; pull requests
+      # and the merge queue restore the newest and rebuild what changed since.
+      # The key never crosses the toolchain, Cargo config, CI image, test
+      # script or this mechanism; it does cross Cargo.lock, whose changes
+      # Cargo's own fingerprints track. The test script's side checks, in
+      # ci/scripts/lib/rust-side-checks.sh, are not among its inputs: they build
+      # in this directory only through the test script's own functions. Main CI
+      # keeps the newest directory for each of the last few inputs, so a pull
+      # request stacked on a branch with older ones still finds its own. See
+      # ci/scripts/rust-target-cache.sh.
+      # Setting the repository variable SPACE_RUST_TARGET_CACHE to off
+      # disables it.
+      - name: Name the Cargo target directory
+        id: target-key
+        if: matrix.rust_target_cache == true && vars.SPACE_RUST_TARGET_CACHE != 'off'
+        env:
+          FAMILY: space-target-v2-${{ runner.os }}-${{ runner.arch }}-${{ matrix.rust_cache_key }}
+          HARD: >-
+            ${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', 'ci/Dockerfile.ci',
+            'ci/scripts/run-rust-checks.sh', 'ci/scripts/rust-target-cache.sh') }}
+          LOCK: ${{ hashFiles('Cargo.lock') }}
+        run: |
+          {
+            echo "hard=${FAMILY}-${HARD:0:16}-"
+            echo "lock=${FAMILY}-${HARD:0:16}-${LOCK:0:16}-"
+            echo "key=${FAMILY}-${HARD:0:16}-${LOCK:0:16}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          } >>"${GITHUB_OUTPUT}"
+
+      # Main never restores one: its cold build is what catches an input Cargo
+      # was never told about.
+      - name: Restore the Cargo target directory
+        if: steps.target-key.outcome == 'success' && github.event_name != 'push'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/space-target-parts
+          key: ${{ steps.target-key.outputs.key }}
+          restore-keys: |
+            ${{ steps.target-key.outputs.lock }}
+            ${{ steps.target-key.outputs.hard }}
+
+      # Unpacking takes the CPU and disk while the compiler cache's restore
+      # below mostly downloads, so the two overlap.
+      - name: Start hydrating the Cargo target directory
+        if: steps.target-key.outcome == 'success'
+        run: >-
+          bash ci/scripts/background-step.sh start target-hydrate
+          bash ci/scripts/rust-target-cache.sh hydrate target/buildkite-tests "${RUNNER_TEMP}/space-target-parts"
+
+      # GitHub's cache service rate-limits sccache's per-object backend under
+      # this workspace's compile fanout. Restore one bounded local archive
+      # instead. Only trusted main pushes save one, each under a new key, so a
+      # restore takes the newest snapshot for the current dependency inputs,
+      # else the newest for any inputs.
+      - name: Name the Rust compiler cache
+        id: rust-cache-key
+        if: matrix.rust_cache == true
+        env:
+          FAMILY: space-sccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.rust_cache_key }}
+          INPUTS: >-
+            ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', 'ci/Dockerfile.ci',
+            'ci/scripts/run-rust-checks.sh') }}
+        run: |
+          {
+            echo "family=${FAMILY}-"
+            echo "inputs=${FAMILY}-${INPUTS}-"
+            echo "key=${FAMILY}-${INPUTS}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          } >>"${GITHUB_OUTPUT}"
+
+      - name: Restore the Rust compiler cache
+        id: restore-rust-cache
+        if: matrix.rust_cache == true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/space-sccache
+          key: ${{ steps.rust-cache-key.outputs.key }}
+          restore-keys: |
+            ${{ steps.rust-cache-key.outputs.inputs }}
+            ${{ steps.rust-cache-key.outputs.family }}
+
+      - name: Wait for the Cargo target directory
+        if: steps.target-key.outcome == 'success'
+        run: bash ci/scripts/background-step.sh wait target-hydrate
+
+      - name: Wait for the CI image
+        run: bash ci/scripts/background-step.sh wait ci-image
+
+      # Also when it failed: the two Cargos do not share a lock, so the
+      # container's must not start while this one still writes.
+      - name: Wait for the Rust dependencies
+        if: matrix.prefetch_crates == true
+        run: >-
+          bash ci/scripts/background-step.sh wait cargo-fetch ||
+          echo "::warning::The runner could not fetch the Rust dependencies; the job container fetches them itself"
+
+      - name: Wait for the test containers' images
+        if: matrix.docker_access == true
+        run: bash ci/scripts/background-step.sh wait test-images
+
+      - name: Wait for the M1 SDK generator's image
+        if: matrix.name == 'Rust tests'
+        run: bash ci/scripts/background-step.sh wait m1-generator
+
+      - name: Run ${{ matrix.name }}
+        env:
+          SPACE_CI_COMMAND: ${{ matrix.command }}
+          SPACE_CI_BASE_SHA: ${{ inputs.base_sha }}
+          SPACE_CI_PER_COMMIT_MIGRATION_ISOLATION: ${{ inputs.per_commit_migration_isolation }}
+          SPACE_CI_MAIN_ONLY_TESTS: ${{ inputs.main_only_tests }}
+          SPACE_CI_PULL_REQUEST_HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || '' }}
+          SPACE_CI_DOCKER_ACCESS: ${{ matrix.docker_access }}
+          SPACE_CI_HOST_NETWORK: ${{ matrix.host_network }}
+          SPACE_CI_PRIVILEGED: ${{ matrix.privileged }}
+          SPACE_CI_RUST_CACHE: ${{ matrix.rust_cache == true }}
+          SPACE_CI_SCCACHE_DIR: ${{ runner.temp }}/space-sccache
+          SPACE_CI_SCCACHE_RUN_DIR: ${{ runner.temp }}/space-sccache-run
+          SPACE_CI_SCCACHE_SIZE: ${{ matrix.rust_cache_size }}
+          SPACE_CI_CARGO_REGISTRY: ${{ runner.temp }}/cargo-home/registry
+        run: |
+          set -euo pipefail
+
+          # Mount Cargo's registry, under the CI image's CARGO_HOME, from the
+          # runner. It holds any crates prefetched above, and it keeps their
+          # tens of thousands of unpacked source files out of the container,
+          # which --rm would otherwise delete one by one before the step ends.
+          mkdir -p "${SPACE_CI_CARGO_REGISTRY}"
+          docker_args=(
+            --rm
+            --volume "${GITHUB_WORKSPACE}:/workspace"
+            --volume "${SPACE_CI_CARGO_REGISTRY}:/usr/local/cargo/registry"
+            --workdir /workspace
+            --env CI=true
+            --env CARGO_INCREMENTAL=0
+            --env GITHUB_ACTIONS=true
+            --env NEXTEST_TEST_THREADS=30
+            --env SPACE_CI_BASE_SHA
+            --env SPACE_CI_PULL_REQUEST_HEAD_SHA
+            --env SPACE_CI_COMMAND
+            --env SPACE_CI_PER_COMMIT_MIGRATION_ISOLATION
+            --env SPACE_CI_REQUIRE_TEST_DEPS=1
+            --env SPACE_M1_GENERATOR_MIRROR=ghcr.io/perplexityai/space-ci-mirror
+          )
+
+          # Only the Rust suite reads this, but passing it to every matrix
+          # entry keeps the rendering one branch instead of a per-entry flag.
+          if [[ "${SPACE_CI_MAIN_ONLY_TESTS}" == true ]]; then
+            docker_args+=(--env SPACE_CI_MAIN_ONLY_TESTS=1)
+          fi
+          if [[ "${SPACE_CI_HOST_NETWORK}" == true ]]; then
+            docker_args+=(--network host)
+          fi
+          if [[ "${SPACE_CI_DOCKER_ACCESS}" == true ]]; then
+            docker_args+=(--volume /var/run/docker.sock:/var/run/docker.sock)
+          fi
+          if [[ "${SPACE_CI_PRIVILEGED}" == true ]]; then
+            docker_args+=(--privileged)
+          fi
+          if [[ "${SPACE_CI_RUST_CACHE}" == true ]]; then
+            # The command writes its sccache statistics to SPACE_CI_SCCACHE_STATS.
+            # The marker dates the run for trimming the cache before a save.
+            mkdir -p "${SPACE_CI_SCCACHE_DIR}" "${SPACE_CI_SCCACHE_RUN_DIR}"
+            touch "${SPACE_CI_SCCACHE_RUN_DIR}/started"
+            docker_args+=(
+              --volume "${SPACE_CI_SCCACHE_DIR}:/sccache"
+              --volume "${SPACE_CI_SCCACHE_RUN_DIR}:/sccache-run"
+              --env RUSTC_WRAPPER=sccache
+              --env SCCACHE_CACHE_SIZE="${SPACE_CI_SCCACHE_SIZE}"
+              --env SCCACHE_DIR=/sccache
+              --env SPACE_CI_SCCACHE_STATS=/sccache-run/stats.json
+            )
+          fi
+
+          docker run "${docker_args[@]}" "space-ci:${GITHUB_SHA}" \
+            bash -c 'git config --global --add safe.directory /workspace && exec bash -c "$SPACE_CI_COMMAND"'
+
+      # Keep the full test-build report: later nextest and doctest invocations
+      # reuse its artifacts and would otherwise hide the expensive compilation.
+      - name: Upload Rust test build timings
+        if: ${{ !cancelled() && matrix.name == 'Rust tests' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rust-test-timings-${{ github.run_attempt }}
+          path: target/buildkite-tests/cargo-timings/*.html
+          if-no-files-found: warn
+          retention-days: 14
+
+      # A failed traffic run's process logs, results, and events otherwise
+      # vanish with the runner. The container writes them as root in 0700
+      # directories, so hand them to the runner user first.
+      - name: Prepare the Gateway traffic logs for upload
+        if: failure() && matrix.name == 'Gateway traffic'
+        run: |
+          [[ -d target/gateway-traffic ]] || exit 0
+          sudo chown -R "$(id -u):$(id -g)" target/gateway-traffic
+
+      # runtime/ holds the fixtures' keys and the test credential; the harness
+      # deletes it on a normal exit, and it is never uploaded.
+      - name: Upload the Gateway traffic logs
+        if: failure() && matrix.name == 'Gateway traffic'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gateway-traffic-${{ github.run_attempt }}
+          path: |
+            target/gateway-traffic/run.*/
+            !target/gateway-traffic/run.*/runtime/**
+          retention-days: 7
+
+      # Main refreshes the snapshot when it was built for other dependency
+      # inputs or when this job missed rust_cache_refresh_misses Rust
+      # compilations against it. Missing statistics also refresh it. Every
+      # event logs the decision; only pushes to main save, and Main CI then
+      # deletes superseded snapshots.
+      - name: Decide whether to refresh the Rust compiler cache
+        id: refresh-rust-cache
+        if: success() && matrix.rust_cache == true
+        env:
+          KEY: ${{ steps.rust-cache-key.outputs.key }}
+          INPUTS_PREFIX: ${{ steps.rust-cache-key.outputs.inputs }}
+          RESTORED_KEY: ${{ steps.restore-rust-cache.outputs.cache-matched-key }}
+          REFRESH_MISSES: ${{ matrix.rust_cache_refresh_misses }}
+          STATS: ${{ runner.temp }}/space-sccache-run/stats.json
+        run: >-
+          python3 ci/scripts/sccache-snapshot.py decide --key "${KEY}" --inputs-prefix "${INPUTS_PREFIX}"
+          --restored-key "${RESTORED_KEY}" --refresh-misses "${REFRESH_MISSES}" --stats "${STATS}"
+
+      # sccache stamps each entry it reads or writes, so entries older than the
+      # run are ones this commit no longer uses.
+      - name: Prepare the Rust compiler cache for upload
+        if: >-
+          github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+          steps.refresh-rust-cache.outputs.save == 'true'
+        env:
+          SPACE_CI_SCCACHE_DIR: ${{ runner.temp }}/space-sccache
+          SPACE_CI_SCCACHE_RUN_DIR: ${{ runner.temp }}/space-sccache-run
+          TRIM: ${{ steps.refresh-rust-cache.outputs.trim }}
+        run: |
+          set -euo pipefail
+          sudo chown -R "$(id -u):$(id -g)" "${SPACE_CI_SCCACHE_DIR}"
+          if [[ "${TRIM}" == true ]]; then
+            unused="$(find "${SPACE_CI_SCCACHE_DIR}" -type f ! -newer "${SPACE_CI_SCCACHE_RUN_DIR}/started" -print -delete | wc -l)"
+            echo "Deleted ${unused} entries this run did not use."
+          fi
+          du -sh "${SPACE_CI_SCCACHE_DIR}"
+
+      - name: Save the Rust compiler cache
+        if: >-
+          github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+          steps.refresh-rust-cache.outputs.save == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/space-sccache
+          key: ${{ steps.rust-cache-key.outputs.key }}
+
+      # Every successful main push saves its cold target directory under a
+      # new key, and Main CI then deletes the superseded ones.
+      - name: Pack the Cargo target directory for upload
+        id: pack-target
+        if: >-
+          success() && steps.target-key.outcome == 'success' &&
+          github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: bash ci/scripts/rust-target-cache.sh prepare target/buildkite-tests "${RUNNER_TEMP}/space-target-parts"
+
+      - name: Save the Cargo target directory
+        if: steps.pack-target.outputs.save == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/space-target-parts
+          key: ${{ steps.target-key.outputs.key }}

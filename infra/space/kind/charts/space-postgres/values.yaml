@@ -1,0 +1,34 @@
+image:
+  repository: postgres
+  tag: "16-alpine"
+  pullPolicy: IfNotPresent
+
+datadogTeam: team-space
+
+service:
+  name: postgres
+  port: 5432
+
+# Dev-only credentials. Override in CI or anything beyond local laptops.
+# NOTE: do NOT use "space" anywhere here. Tilt redacts secret VALUES from
+# command lines (including docker build-args), so a `space` substring inside
+# this secret poisons every `docker build … space-rust-build-… …` invocation
+# and the build fails with "pull access denied" on the redacted image name.
+credentials:
+  user: spaceuser
+  password: spacepassword
+  database: spacedb
+
+nodeSelector:
+  space.pplx.net/infra: "true"
+
+storage:
+  size: 1Gi
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

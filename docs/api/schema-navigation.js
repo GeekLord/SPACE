@@ -1,0 +1,48 @@
+// Progressive enhancement of native Redoc schema output, never a schema renderer.
+function enhanceSchemaNavigation(catalog) {
+  const initialHash = location.hash;
+  for (const { name, purpose, related, primitive } of catalog) {
+    const section = document.querySelector(`[data-section-id="schema/${name}"]`);
+    const heading = section?.querySelector('h2');
+    if (!heading || section.querySelector('.schema-context')) continue;
+    const context = document.createElement('div');
+    context.className = 'schema-context';
+    const identifier = document.createElement('code');
+    identifier.textContent = name;
+    const description = document.createElement('p');
+    description.textContent = purpose;
+    const links = document.createElement('p');
+    links.append('Related: ');
+    related.forEach(({ label, href }, index) => {
+      if (index) links.append(' · ');
+      const link = document.createElement('a');
+      link.href = href;
+      link.textContent = label;
+      links.append(link);
+    });
+    context.append(identifier, description, links);
+    heading.after(context);
+    if (!primitive) continue;
+    // Redoc 2.5.4: the schema definition's row contains the field view and
+    // sample panel. Guard the structure; unexpected output stays fully visible.
+    const row = section.children[1]?.firstElementChild;
+    const panel = row?.children[1];
+    if (row?.children.length !== 2 || !panel
+      || row.children[0].querySelector('.redoc-json')
+      || panel.querySelectorAll('.redoc-json').length !== 1) continue;
+    const details = document.createElement('details');
+    details.className = 'schema-example';
+    const summary = document.createElement('summary');
+    summary.textContent = 'Example value';
+    details.append(summary, ...panel.childNodes);
+    panel.append(details);
+  }
+  // Collapsing earlier samples changes layout. Re-anchor an initial legacy
+  // schema/index link after enhancement without rewriting its hash or history.
+  if (initialHash.startsWith('#schema/') || initialHash === '#tag/Schemas') {
+    requestAnimationFrame(() => {
+      if (location.hash !== initialHash) return;
+      document.getElementById(decodeURIComponent(initialHash.slice(1)))?.scrollIntoView();
+    });
+  }
+}

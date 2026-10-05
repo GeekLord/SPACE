@@ -1,0 +1,690 @@
+use pplx_space_common_core::types::{OrgId, SandboxId};
+
+use axum::{
+    Extension, Json,
+    body::{Body, Bytes},
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
+};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use futures_util::{StreamExt, stream};
+use pplx_space_common_core::spaced::MAX_WRITE_BATCH_ENTRIES;
+use pplx_space_common_core::types::{
+    GuestUserName, IdempotencyKey, validate_linux_guest_path_input,
+};
+use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
+use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
+use pplx_space_public_api::{
+    FileChangeTrackingRequest, FileChangeTrackingResponse, FileEventKind, FileInfo,
+    FileListRequest, FileListResponse, FileMkdirRequest, FileModifiedEntry, FileModifiedRequest,
+    FileModifiedResponse, FileMutationResponse, FileReadRequest, FileRemoveRequest,
+    FileRenameRequest, FileStatRequest, FileStatResponse, FileType, FileWriteBatchRequest,
+    FileWriteBatchResponse, FileWriteRequest, FileWriteResponse, PublicSandboxId,
+};
+use pplx_space_sbx_mgr_client::operations as spaced_ops;
+use pplx_space_sbx_mgr_client::proto::{
+    SpacedDisableFileChangesRequest, SpacedEnableFileChangesRequest, SpacedFileEventKind,
+    SpacedFileInfo, SpacedFileType, SpacedGetModifiedFilesRequest, SpacedMkdirRequest,
+    SpacedReadRequest, SpacedRemoveRequest, SpacedRenameRequest, SpacedWriteBatchEntry,
+    SpacedWriteBatchRequest, SpacedWriteOpen, SpacedWriteRequest, spaced_write_request,
+};
+use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
+
+use crate::{
+    controllers::{ControllerError, sandbox::fetch_sandbox},
+    middleware::auth::AuthOrg,
+    models::Sandbox,
+    routes::AppState,
+};
+
+use super::error::{PublicApiError, with_retry_after_hint};
+
+const MAX_FILE_LIST_ENTRIES: usize = 10_000;
+const MAX_FILE_WRITE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_FILE_READ_BYTES: u64 = 16 * 1024 * 1024;
+const FILE_WRITE_CHUNK_BYTES: usize = 1024 * 1024;
+const DEFAULT_FILE_LIST_DEPTH: u32 = 1;
+const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
+
+pub async fn stat_file(
+    State(state): State<AppState>,
+    Extension(AuthOrg(org)): Extension<AuthOrg>,
+    Path(sandbox_id): Path<String>,
+    Json(request): Json<FileStatRequest>,
+) -> Result<Json<FileStatResponse>, PublicApiError> {
+    let sandbox = ensure_sandbox_owner(&state.pool, org.id, &sandbox_id).await?;
+    let user = parse_guest_user(request.user)?;
+    let path = parse_guest_path(request.path)?;
+    let response = state
+        .sandbox_controller
+        .spaced_stat(
+            &state.pool,
+            &sandbox,
+            SandboxApiMetricIdentity::native("files_stat"),
+            sandbox.id,
+            path,
+            user,
+        )
+        .await
+        .map_err(controller_error)?;
+    let entry = response
+        .info
+        .map(public_file_info)
+        .ok_or_else(PublicApiError::internal)?;
+    Ok(Json(FileStatResponse { entry }))
+}
+
+pub async fn list_files(
+    State(state): State<AppState>,
+    Extension(AuthOrg(org)): Extension<AuthOrg>,
+    Path(sandbox_id): Path<String>,
+    Json(request): Json<FileListRequest>,
+) -> Result<Json<FileListResponse>, PublicApiError> {
+    let depth = request.depth.unwrap_or(DEFAULT_FILE_LIST_DEPTH);
+    if depth == 0 {
+        return Err(PublicApiError::bad_request("depth must be at least 1"));
+    }
+    let sandbox = ensure_sandbox_owner(&state.pool, org.id, &sandbox_id).await?;
+    let user = parse_guest_user(request.user)?;
+    let path = parse_guest_path(request.path)?;
+    let mut stream = state
+        .sandbox_controller
+        .spaced_list(
+            &state.pool,
+            &sandbox,
+            SandboxApiMetricIdentity::native("files_list"),
+            sandbox.id,
+            crate::controllers::sandbox::SpacedListOptions {
+                path,
+                depth: Some(depth),
+                user,
+            },
+        )
+        .await
+        .map_err(controller_error)?;
+
+    let mut entries = Vec::new();
+    while let Some(entry) = stream.next().await {
+        if entries.len() >= MAX_FILE_LIST_ENTRIES {
+            return Err(PublicApiError::bad_request(
+                "file list returned too many entries; use a smaller depth",
+            ));
+        }
+        let entry = entry
+            .map_err(ControllerError::from)
+            .map_err(controller_error)?;
+        entries.push(public_file_info(entry));
+    }
+    Ok(Json(FileListResponse { entries }))
+}
+
+pub async fn read_file(
+    State(state): State<AppState>,
+    Extension(AuthOrg(org)): Extension<AuthOrg>,
+    Path(sandbox_id): Path<String>,
+    Json(request): Json<FileReadRequest>,
+) -> Result<Response, PublicApiError> {
+    let sandbox = ensure_sandbox_owner(&state.pool, org.id, &sandbox_id).await?;
+    validate_read_length(request.length)?;
+    let user = parse_guest_user(request.user)?;
+    let path = parse_guest_path(request.path)?;
+    let stream = state
+        .sandbox_controller
+        .spaced_read(
+            &state.pool,
+            &sandbox,
+            SandboxApiMetricIdentity::native("files_read"),
+            SpacedReadRequest {
+                sandbox_id: sandbox.id.to_string(),
+                operation: Some(spaced_ops::ReadRequest {
+                    path,
+                    offset: request.offset,
+                    length: Some(request.length),
+                    user: user.map(|user| user.as_str().to_string()),
+                }),
+            },
+        )
+        .await
+        .map_err(controller_error)?;
+    let stream = stream.map(|chunk| {
+        chunk
+            .map(|chunk| Bytes::from(chunk.data))
+            .map_err(|status| std::io::Error::other(status.to_string()))
+    });
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/octet-stream")],
+        Body::from_stream(stream),
+    )
+        .into_response())
+}
+
+pub async fn write_file(
+    State(state): State<AppState>,
+    Extension(AuthOrg(org)): Extension<AuthOrg>,
+    headers: HeaderMap,
+    Path(sandbox_id): Path<String>,
+    Json(request): Json<FileWriteRequest>,
+) -> Result<Json<FileWriteResponse>, PublicApiError> {
+    let idempotency_key = idempotency_key(&headers)?;
+    let sandbox = ensure_sandbox_owner(&state.pool, org.id, &sandbox_id).await?;
+    let user = parse_guest_user(request.user)?;
+    let path = parse_guest_path(request.path)?;
+    let data = decode_write_payload(&request.data_base64)?;
+    let response = state
+        .sandbox_controller
+        .spaced_write(
+            &state.pool,
+            &sandbox,
+            SandboxApiMetricIdentity::native("files_write"),
+            stream::iter(spaced_write_requests(
+                sandbox.id,
+                path,
+                request.append,
+                idempotency_key,
+                data,
+                user,
+            )),
+        )
+        .await
+        .map_err(controller_error)?;
+    Ok(Json(FileWriteResponse {
+        bytes_written: response.bytes_written,
+    }))
+}
+
+pub async fn write_file_batch(
+    State(state): State<AppState>,
+    Extension(AuthOrg(org)): Extension<AuthOrg>,
+    headers: HeaderMap,
+    Path(sandbox_id): Path<String>,
+    Json(request): Json<FileWriteBatchRequest>,
+) -> Result<Json<FileWriteBatchResponse>, PublicApiError> {
+    let idempotency_key = idempotency_key(&headers)?;
+    if request.entries.len() > MAX_WRITE_BATCH_ENTRIES {
+        return Err(PublicApiError::bad_request(format!(
+            "entries has {} items, max is {MAX_WRITE_BATCH_ENTRIES}",
+            request.entries.len()
+        )));
+    }
+    let sandbox = ensure_sandbox_owner(&state.pool, org.id, &sandbox_id).await?;
+    let user = parse_guest_user(request.user)?;
+    let mut entries = Vec::with_capacity(request.entries.len());
+    for entry in request.entries {
+        let path = parse_guest_path(entry.path)?;
+        let data = decode_write_payload(&entry.data_base64)?;
+        entries.push(SpacedWriteBatchEntry {
+            path,
+            data,
+            append: entry.append,
+        });
+    }
+    let response = state
+        .sandbox_controller
+        .spaced_write_batch(
+            &state.pool,
+            &sandbox,
+            SandboxApiMetricIdentity::native("files_write_batch"),
+            SpacedWriteBatchRequest {
+                sandbox_id: sandbox.id.to_string(),
+                operation: Some(spaced_ops::WriteBatchRequest {
+                    entries,
+                    idempotency_key: Some(idempotency_key.as_str().to_string()),
+                    user: user.map(|user| user.as_str().to_string()),
+                }),
+            },
+        )
+        .await
+        .map_err(controller_error)?;
+    Ok(Json(FileWriteBatchResponse {
+        files_written: response.files_written,
+    }))
+}
+
+pub async fn mkdir_file(
+    State(state): State<AppState>,
+    Extension(AuthOrg(org)): Extension<AuthOrg>,
+    headers: HeaderMap,
+    Path(sandbox_id): Path<String>,
+    Json(request): Json<FileMkdirRequest>,
+) -> Result<Json<FileMutationResponse>, PublicApiError> {
+    let _idempotency_key = idempotency_key(&headers)?;
+    let sandbox = ensure_sandbox_owner(&state.pool, org.id, &sandbox_id).await?;
+    let user = parse_guest_user(request.user)?;
+    let path = parse_guest_path(request.path)?;
+    state
+        .sandbox_controller
+        .spaced_mkdir(
+            &state.pool,
+            &sandbox,
+            SandboxApiMetricIdentity::native("files_mkdir"),
+            SpacedMkdirRequest {
+                sandbox_id: sandbox.id.to_string(),
+                operation: Some(spaced_ops::MkdirRequest {
+                    path,
+                    parents: request.parents,
+                    exist_ok: true,
+                    user: user.map(|user| user.as_str().to_string()),
+                }),
+            },
+        )
+        .await
+        .map_err(controller_error)?;
+    Ok(Json(FileMutationResponse { ok: true }))
+}
+
+pub async fn remove_file(
+    State(state): State<AppState>,
+    Extension(AuthOrg(org)): Extension<AuthOrg>,
+    headers: HeaderMap,
+    Path(sandbox_id): Path<String>,
+    Json(request): Json<FileRemoveRequest>,
+) -> Result<Json<FileMutationResponse>, PublicApiError> {
+    let _idempotency_key = idempotency_key(&headers)?;
+    let sandbox = ensure_sandbox_owner(&state.pool, org.id, &sandbox_id).await?;
+    let user = parse_guest_user(request.user)?;
+    let path = parse_guest_path(request.path)?;
+    state
+        .sandbox_controller
+        .spaced_remove(
+            &state.pool,
+            &sandbox,
+            SandboxApiMetricIdentity::native("files_remove"),
+            SpacedRemoveRequest {
+                sandbox_id: sandbox.id.to_string(),
+                operation: Some(spaced_ops::RemoveRequest {
+                    path,
+                    recursive: request.recursive,
+                    missing_ok: true,
+                    user: user.map(|user| user.as_str().to_string()),
+                }),
+            },
+        )
+        .await
+        .map_err(controller_error)?;
+    Ok(Json(FileMutationResponse { ok: true }))
+}
+
+pub async fn rename_file(
+    State(state): State<AppState>,
+    Extension(AuthOrg(org)): Extension<AuthOrg>,
+    headers: HeaderMap,
+    Path(sandbox_id): Path<String>,
+    Json(request): Json<FileRenameRequest>,
+) -> Result<Json<FileMutationResponse>, PublicApiError> {
+    let idempotency_key = idempotency_key(&headers)?;
+    let sandbox = ensure_sandbox_owner(&state.pool, org.id, &sandbox_id).await?;
+    let user = parse_guest_user(request.user)?;
+    let old_path = parse_guest_path(request.old_path)?;
+    let new_path = parse_guest_path(request.new_path)?;
+    state
+        .sandbox_controller
+        .spaced_rename(
+            &state.pool,
+            &sandbox,
+            SandboxApiMetricIdentity::native("files_rename"),
+            SpacedRenameRequest {
+                sandbox_id: sandbox.id.to_string(),
+                operation: Some(spaced_ops::RenameRequest {
+                    old_path,
+                    new_path,
+                    idempotency_key: Some(idempotency_key.as_str().to_string()),
+                    user: user.map(|user| user.as_str().to_string()),
+                }),
+            },
+        )
+        .await
+        .map_err(controller_error)?;
+    Ok(Json(FileMutationResponse { ok: true }))
+}
+
+pub async fn enable_file_change_tracking(
+    State(state): State<AppState>,
+    Extension(AuthOrg(org)): Extension<AuthOrg>,
+    headers: HeaderMap,
+    Path(sandbox_id): Path<String>,
+    body: Option<Json<FileChangeTrackingRequest>>,
+) -> Result<Json<FileChangeTrackingResponse>, PublicApiError> {
+    let _idempotency_key = idempotency_key(&headers)?;
+    let request = body.map(|Json(request)| request).unwrap_or_default();
+    if !request.enabled {
+        return Err(PublicApiError::bad_request(
+            "file change tracking enable request must set enabled=true",
+        ));
+    }
+    let sandbox = ensure_sandbox_owner(&state.pool, org.id, &sandbox_id).await?;
+    let user = parse_guest_user(request.user)?;
+    let roots = request
+        .roots
+        .into_iter()
+        .map(parse_guest_path)
+        .collect::<Result<Vec<_>, _>>()?;
+    let response = state
+        .sandbox_controller
+        .spaced_enable_file_changes(
+            &state.pool,
+            &sandbox,
+            SandboxApiMetricIdentity::native("files_changes_enable"),
+            SpacedEnableFileChangesRequest {
+                sandbox_id: sandbox.id.to_string(),
+                operation: Some(spaced_ops::EnableFileChangesRequest {
+                    roots,
+                    include_globs: request.include_globs,
+                    exclude_globs: request.exclude_globs,
+                    use_default_excludes: request.use_default_excludes,
+                    user: user.map(|user| user.as_str().to_string()),
+                }),
+            },
+        )
+        .await
+        .map_err(controller_error)?;
+    Ok(Json(FileChangeTrackingResponse {
+        monitoring_enabled: true,
+        observed_since: response.observed_since.and_then(timestamp_to_rfc3339),
+    }))
+}
+
+pub async fn disable_file_change_tracking(
+    State(state): State<AppState>,
+    Extension(AuthOrg(org)): Extension<AuthOrg>,
+    headers: HeaderMap,
+    Path(sandbox_id): Path<String>,
+    body: Option<Json<FileChangeTrackingRequest>>,
+) -> Result<Json<FileMutationResponse>, PublicApiError> {
+    let _idempotency_key = idempotency_key(&headers)?;
+    let request = body.map(|Json(request)| request).unwrap_or_default();
+    let sandbox = ensure_sandbox_owner(&state.pool, org.id, &sandbox_id).await?;
+    let user = parse_guest_user(request.user)?;
+    state
+        .sandbox_controller
+        .spaced_disable_file_changes(
+            &state.pool,
+            &sandbox,
+            SandboxApiMetricIdentity::native("files_changes_disable"),
+            SpacedDisableFileChangesRequest {
+                sandbox_id: sandbox.id.to_string(),
+                operation: Some(spaced_ops::DisableFileChangesRequest {
+                    user: user.map(|user| user.as_str().to_string()),
+                }),
+            },
+        )
+        .await
+        .map_err(controller_error)?;
+    Ok(Json(FileMutationResponse { ok: true }))
+}
+
+pub async fn modified_files(
+    State(state): State<AppState>,
+    Extension(AuthOrg(org)): Extension<AuthOrg>,
+    Path(sandbox_id): Path<String>,
+    Json(request): Json<FileModifiedRequest>,
+) -> Result<Json<FileModifiedResponse>, PublicApiError> {
+    validate_modified_filters(&request)?;
+    let sandbox = ensure_sandbox_owner(&state.pool, org.id, &sandbox_id).await?;
+    let user = parse_guest_user(request.user)?;
+    let response = state
+        .sandbox_controller
+        .spaced_get_modified_files(
+            &state.pool,
+            &sandbox,
+            SandboxApiMetricIdentity::native("files_modified"),
+            SpacedGetModifiedFilesRequest {
+                sandbox_id: sandbox.id.to_string(),
+                operation: Some(spaced_ops::GetModifiedFilesRequest {
+                    window: request
+                        .window_seconds
+                        .map(duration_from_seconds)
+                        .transpose()?,
+                    since: request
+                        .since
+                        .as_deref()
+                        .map(timestamp_from_rfc3339)
+                        .transpose()?,
+                    cursor: request.cursor,
+                    user: user.map(|user| user.as_str().to_string()),
+                }),
+            },
+        )
+        .await
+        .map_err(controller_error)?;
+    let files = response
+        .files
+        .into_iter()
+        .map(|file| FileModifiedEntry {
+            path: file.path,
+            root: (!file.root.is_empty()).then_some(file.root),
+            last_modified_at: file.last_modified_at.and_then(timestamp_to_rfc3339),
+            kinds: file.kinds.into_iter().map(public_file_event_kind).collect(),
+        })
+        .collect();
+    Ok(Json(FileModifiedResponse {
+        files,
+        observed_since: response.observed_since.and_then(timestamp_to_rfc3339),
+        retained_since: response.retained_since.and_then(timestamp_to_rfc3339),
+        cursor: response.cursor,
+        monitoring_enabled: response.monitoring_enabled,
+        overflowed: response.overflowed,
+    }))
+}
+
+async fn ensure_sandbox_owner(
+    pool: &sqlx::PgPool,
+    org_id: OrgId,
+    sandbox_id: &str,
+) -> Result<Sandbox, PublicApiError> {
+    let sandbox_id = sandbox_id
+        .parse::<PublicSandboxId>()
+        .map_err(|_| PublicApiError::bad_request("invalid sandbox id"))?;
+    let Some(sandbox) = fetch_sandbox(pool, sandbox_id.into()).await? else {
+        return Err(PublicApiError::not_found("sandbox not found"));
+    };
+    if sandbox.org_id != org_id {
+        return Err(PublicApiError::not_found("sandbox not found"));
+    }
+    Ok(sandbox)
+}
+
+fn parse_guest_path(path: String) -> Result<String, PublicApiError> {
+    validate_linux_guest_path_input(&path)
+        .map_err(|error| PublicApiError::bad_request(error.to_string()))?;
+    Ok(path)
+}
+
+fn parse_guest_user(user: Option<String>) -> Result<Option<GuestUserName>, PublicApiError> {
+    user.map(GuestUserName::parse)
+        .transpose()
+        .map_err(|error| PublicApiError::bad_request(error.to_string()))
+}
+
+fn idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, PublicApiError> {
+    let Some(value) = headers
+        .get(IDEMPOTENCY_KEY_HEADER)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Err(PublicApiError::bad_request(
+            "Idempotency-Key header is required",
+        ));
+    };
+    IdempotencyKey::parse(value)
+        .map_err(|error| PublicApiError::bad_request(format!("invalid Idempotency-Key: {error}")))
+}
+
+fn decode_write_payload(data_base64: &str) -> Result<Vec<u8>, PublicApiError> {
+    let data = BASE64_STANDARD
+        .decode(data_base64)
+        .map_err(|_| PublicApiError::bad_request("data_base64 must be valid base64"))?;
+    if data.len() > MAX_FILE_WRITE_BYTES {
+        return Err(PublicApiError::bad_request(
+            "file write payload is too large",
+        ));
+    }
+    Ok(data)
+}
+
+fn validate_read_length(length: u64) -> Result<(), PublicApiError> {
+    if length == 0 {
+        return Err(PublicApiError::bad_request(
+            "file read length must be at least 1 byte",
+        ));
+    }
+    if length > MAX_FILE_READ_BYTES {
+        return Err(PublicApiError::bad_request(
+            "file read length exceeds the control-plane API limit",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_modified_filters(request: &FileModifiedRequest) -> Result<(), PublicApiError> {
+    let filters = [
+        request.window_seconds.is_some(),
+        request.since.is_some(),
+        request.cursor.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    if filters > 1 {
+        return Err(PublicApiError::bad_request(
+            "window_seconds, since, and cursor are mutually exclusive",
+        ));
+    }
+    Ok(())
+}
+
+fn spaced_write_requests(
+    sandbox_id: SandboxId,
+    path: String,
+    append: bool,
+    idempotency_key: IdempotencyKey,
+    data: Vec<u8>,
+    user: Option<GuestUserName>,
+) -> Vec<SpacedWriteRequest> {
+    let mut requests = Vec::with_capacity(1 + data.len().div_ceil(FILE_WRITE_CHUNK_BYTES));
+    requests.push(SpacedWriteRequest {
+        sandbox_id: sandbox_id.to_string(),
+        operation: Some(spaced_ops::WriteRequest {
+            message: Some(spaced_write_request::Message::Open(SpacedWriteOpen {
+                path,
+                append,
+                idempotency_key: Some(idempotency_key.as_str().to_string()),
+                user: user.map(|user| user.as_str().to_string()),
+            })),
+        }),
+    });
+    requests.extend(
+        data.chunks(FILE_WRITE_CHUNK_BYTES)
+            .map(|chunk| SpacedWriteRequest {
+                sandbox_id: sandbox_id.to_string(),
+                operation: Some(spaced_ops::WriteRequest {
+                    message: Some(spaced_write_request::Message::Data(chunk.to_vec())),
+                }),
+            }),
+    );
+    requests
+}
+
+pub(in crate::routes::public) fn controller_error(error: ControllerError) -> PublicApiError {
+    // A lock race is this service's own database, not the sandbox fleet. The
+    // status match below cannot tell it from an out-of-capacity 503, so it
+    // would attribute it to the cluster or the node.
+    if error.is_lock_contention() {
+        return PublicApiError::lock_contention();
+    }
+    let retry_after = error.retry_after_header();
+    match error.status() {
+        StatusCode::BAD_REQUEST => PublicApiError::bad_request(error.to_string()),
+        StatusCode::FORBIDDEN => PublicApiError::forbidden(error.to_string()),
+        StatusCode::NOT_FOUND => PublicApiError::not_found(error.to_string()),
+        StatusCode::CONFLICT => PublicApiError::conflict(error.to_string()),
+        StatusCode::PRECONDITION_FAILED => PublicApiError::failed_precondition(error.to_string()),
+        StatusCode::TOO_MANY_REQUESTS => with_retry_after_hint(
+            PublicApiError::rate_limited(error.to_string())
+                .with_classification(ResponseOrigin::Node, ResponseKind::Admission),
+            retry_after,
+        ),
+        StatusCode::SERVICE_UNAVAILABLE => with_retry_after_hint(
+            PublicApiError::service_unavailable(error.to_string())
+                .with_classification(ResponseOrigin::Node, ResponseKind::BackendStatus),
+            retry_after,
+        ),
+        status if status.is_server_error() => {
+            tracing::warn!(%error, "native file operation failed");
+            PublicApiError::internal()
+                .with_classification(ResponseOrigin::Node, ResponseKind::BackendStatus)
+        }
+        _ => PublicApiError::internal(),
+    }
+}
+
+fn public_file_info(info: SpacedFileInfo) -> FileInfo {
+    FileInfo {
+        path: info.path.clone(),
+        name: info
+            .name
+            .unwrap_or_else(|| path_basename(&info.path).to_string()),
+        file_type: public_file_type(info.file_type),
+        size_bytes: info.size_bytes,
+        mode: info.mode,
+        modified_at: info.modified_at.and_then(timestamp_to_rfc3339),
+        owner_uid: info.owner_uid,
+        owner_gid: info.owner_gid,
+        symlink_target: info.symlink_target,
+        link_count: info.link_count,
+    }
+}
+
+fn public_file_type(file_type: i32) -> FileType {
+    match SpacedFileType::try_from(file_type) {
+        Ok(SpacedFileType::File) => FileType::File,
+        Ok(SpacedFileType::Directory) => FileType::Directory,
+        Ok(SpacedFileType::Symlink) => FileType::Symlink,
+        Ok(SpacedFileType::Other) | Ok(SpacedFileType::Unspecified) | Err(_) => FileType::Other,
+    }
+}
+
+fn timestamp_to_rfc3339(value: prost_types::Timestamp) -> Option<String> {
+    let timestamp = OffsetDateTime::from_unix_timestamp(value.seconds)
+        .ok()?
+        .checked_add(TimeDuration::nanoseconds(value.nanos.into()))?;
+    timestamp
+        .format(&Rfc3339)
+        .ok()
+        .or_else(|| Some(timestamp.unix_timestamp().to_string()))
+}
+
+fn timestamp_from_rfc3339(value: &str) -> Result<prost_types::Timestamp, PublicApiError> {
+    let timestamp = OffsetDateTime::parse(value, &Rfc3339)
+        .map_err(|_| PublicApiError::bad_request("since must be an RFC3339 timestamp"))?;
+    Ok(prost_types::Timestamp {
+        seconds: timestamp.unix_timestamp(),
+        nanos: timestamp.nanosecond() as i32,
+    })
+}
+
+fn duration_from_seconds(seconds: u64) -> Result<prost_types::Duration, PublicApiError> {
+    let seconds = i64::try_from(seconds)
+        .map_err(|_| PublicApiError::bad_request("window_seconds is too large"))?;
+    Ok(prost_types::Duration { seconds, nanos: 0 })
+}
+
+fn public_file_event_kind(kind: i32) -> FileEventKind {
+    match SpacedFileEventKind::try_from(kind) {
+        Ok(SpacedFileEventKind::Created) => FileEventKind::Created,
+        Ok(SpacedFileEventKind::Modified) => FileEventKind::Modified,
+        Ok(SpacedFileEventKind::Removed) => FileEventKind::Removed,
+        Ok(SpacedFileEventKind::Renamed) => FileEventKind::Renamed,
+        Ok(SpacedFileEventKind::Chmod) => FileEventKind::Chmod,
+        Ok(SpacedFileEventKind::Unspecified) | Err(_) => FileEventKind::Unknown,
+    }
+}
+
+fn path_basename(path: &str) -> &str {
+    path.rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(path)
+}
+
+#[cfg(test)]
+mod tests;

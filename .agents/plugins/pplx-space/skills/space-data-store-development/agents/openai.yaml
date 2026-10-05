@@ -1,0 +1,3 @@
+interface:
+  display_name: "SPACE Data Store Development"
+  short_description: "Data stores, SQL, migrations, and fixtures"

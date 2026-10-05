@@ -1,0 +1,32 @@
+.chapter li.has-page-toc { display: block; }
+.chapter li.has-page-toc > .page-toc { display: block; margin: 0.4em 0 0.8em; padding-left: 16px; list-style: none; }
+.chapter .page-toc a { font-size: 0.9em; }
+.docs-build { margin-top: 4rem; font-size: 0.8em; }
+#sidebar a:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+.section-nav { display: flex; flex-direction: column; gap: .7rem; margin: 0 10px 1.8rem; padding-bottom: 1.4rem; border-bottom: 1px solid var(--table-border-color); }
+.section-nav a { display: block; color: var(--sidebar-fg); font-size: 1.5rem; text-decoration: none; padding-block: .3rem; }
+.section-nav [aria-current] { font-weight: 700; color: var(--sidebar-active); }
+.section-nav a:hover { text-decoration: underline; }
+.mermaid-diagram { margin: 2rem 0; overflow: auto; padding: 1rem; }
+.mermaid-diagram:focus-visible { outline: 2px solid var(--fg); outline-offset: 2px; }
+.mermaid-diagram svg { display: block; margin: auto; min-width: 480px; max-width: 100%; height: auto; }
+.diagram-scroll-hint { display: none; font-size: .9em; }
+@media screen and (max-width: 600px) {
+  .diagram-scroll-hint { display: block; }
+}
+.diagram-description { margin-block: 1rem; }
+.diagram-description summary { cursor: pointer; }
+.diagram-description summary:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+@media print {
+  .mermaid-diagram { overflow: visible; break-inside: avoid; padding: 0; }
+  .mermaid-diagram svg { min-width: 0; max-height: 230mm; }
+  .mermaid-diagram svg text { fill: #000 !important; }
+  .mermaid-diagram svg .node rect, .mermaid-diagram svg .node path,
+  .mermaid-diagram svg .node polygon, .mermaid-diagram svg .node circle {
+    fill: #fff !important; stroke: #000 !important;
+  }
+  .mermaid-diagram svg .flowchart-link { stroke: #000 !important; }
+  .mermaid-diagram svg marker path { fill: #000 !important; stroke: #000 !important; }
+  .mermaid-diagram svg .edgeLabel rect { fill: #fff !important; }
+  .diagram-description { display: block; }
+}

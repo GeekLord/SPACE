@@ -1,0 +1,55 @@
+flowchart LR
+  classDef person fill:#fde2e4,stroke:#c0392b,color:#000
+  classDef ci fill:#dbeafe,stroke:#1d4ed8,color:#000
+  classDef aws fill:#fef3c7,stroke:#b45309,color:#000
+  classDef alert fill:#e5e7eb,stroke:#374151,color:#000
+
+  admin["Administrator<br/>(by hand, never CI)"]:::person
+
+  subgraph bootstrap["bootstrap/ root"]
+    bucket["State bucket<br/>versioned, TLS-only,<br/>prevent_destroy, use_lockfile"]:::aws
+    oidc["GitHub OIDC provider<br/>prevent_destroy"]:::aws
+    role["Apply role<br/>trust: immutable sub<br/>…:environment:reference-deployment<br/>perms: network + cluster EC2 in one region,<br/>EKS / IAM / logs named from the cluster,<br/>cluster/ and addons/ state & lock only"]:::aws
+    boundary["Role boundary<br/>every role the apply role creates<br/>must carry it; it can't edit it"]:::aws
+    admins["Cluster admin list<br/>SSM parameter"]:::aws
+  end
+
+  admin -->|terraform apply| bootstrap
+  admin -->|packer bake| amis["SPACE node AMIs<br/>Firecracker, guest kernel,<br/>btrfs cache, host setup<br/>tagged Role + KubernetesVersion"]:::aws
+  amis -.newest at the cluster's minor.-> eks
+
+  pr["Pull request"]:::ci --> validate["validate job<br/>fmt -check + validate<br/>all three roots, chart lint,<br/>no AWS creds"]:::ci
+  sched["Daily schedule /<br/>workflow_dispatch"]:::ci --> validate
+  validate --> gate{"repo vars set?<br/>not a PR?"}:::ci
+  gate -->|no| skip["apply skipped"]:::ci
+  gate -->|yes| apply["apply job<br/>environment: reference-deployment<br/>(branch policy: main)"]:::ci
+  apply -->|"OIDC token → STS<br/>4 h session"| role
+  apply -->|"init / plan / apply<br/>(apply on schedule or apply=true)"| net
+  apply -->|"kubectl wait<br/>nodes Ready"| eks
+
+  subgraph cluster["cluster/ root"]
+    net["VPC /16 · private /20 + public /24 per AZ<br/>CIDR keyed by AZ letter · 1 NAT gateway"]:::aws
+    eks["EKS cluster (eks-cluster module)<br/>public endpoint · vpc-cni, kube-proxy, coredns<br/>general: m6i.large, EKS AL2023, one AZ<br/>workers + builders: m5d.metal, SPACE node AMIs"]:::aws
+    net --> eks
+  end
+
+  apply -->|"every pool Ready"| addonsjob["addons job<br/>own session, own failure;<br/>never gates the cluster"]:::ci
+  addonsjob -->|"init / plan / apply"| addons
+  addonsjob -->|"verify.sh, one step each"| addons
+
+  subgraph addons["addons/ root"]
+    ms["metrics-server<br/>EKS addon"]:::aws
+    ebs["EBS CSI driver<br/>EKS addon + IRSA role"]:::aws
+    pg["PostgreSQL 17<br/>StatefulSet on general,<br/>encrypted gp3 volume"]:::aws
+    vk["Valkey 9.0<br/>in memory, on general"]:::aws
+    ebs --> pg
+  end
+  addons -.runs on.-> eks
+
+  boundary -.bounds IAM roles.-> eks
+  boundary -.bounds IAM roles.-> ebs
+  admins -.access entries.-> eks
+
+  net -.state.-> bucket
+  apply -->|"validate or apply failed<br/>or cancelled (schedule only)"| slack
+  addonsjob -->|"failed or cancelled<br/>(schedule only)"| slack["Slack via internal-slack<br/>(repo issues are off)"]:::alert

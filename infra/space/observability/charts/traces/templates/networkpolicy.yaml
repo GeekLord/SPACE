@@ -1,0 +1,45 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- range $name := list "collector" "tempo" }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: traces-{{ $name }}
+spec:
+  podSelector:
+    matchLabels: {app: {{ $name }}}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    {{- if eq $name "collector" }}
+    {{- with $.Values.networkPolicy.monitoringPeers }}
+    - ports: [{protocol: TCP, port: 8888}]
+      from:
+{{ toYaml . | indent 8 }}
+    {{- end }}
+    {{- with $.Values.networkPolicy.receiverPeers }}
+    - ports: [{protocol: TCP, port: 4317}]
+      from:
+{{ toYaml . | indent 8 }}
+    {{- end }}
+    {{- else }}
+    - ports: [{protocol: TCP, port: 4317}]
+      from:
+        - podSelector: {matchLabels: {app: collector}}
+    {{- with $.Values.networkPolicy.queryPeers }}
+    - ports: [{protocol: TCP, port: 3200}]
+      from:
+{{ toYaml . | indent 8 }}
+    {{- end }}
+    {{- end }}
+  egress:
+    {{- if eq $name "collector" }}
+    - to:
+        - podSelector: {matchLabels: {app: tempo}}
+      ports: [{protocol: TCP, port: 4317}]
+    {{- end }}
+{{- include "common.dnsEgress" . | nindent 4 }}
+{{- with $.Values.networkPolicy.additionalEgress }}
+{{ toYaml . | indent 4 }}
+{{- end }}
+---
+{{- end }}
+{{- end }}

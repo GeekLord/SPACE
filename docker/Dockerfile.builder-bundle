@@ -1,0 +1,22 @@
+# syntax=docker/dockerfile:1.7
+
+ARG SPACE_RUST_BUILD_IMAGE=space-rust-build-builder:local
+FROM ${SPACE_RUST_BUILD_IMAGE} AS rust-build
+
+FROM public.ecr.aws/docker/library/debian:bookworm-slim AS build-identity
+ARG SPACE_GIT_SHA=unknown
+RUN mkdir -p /identity && printf '%s\n' "${SPACE_GIT_SHA}" > /identity/build-git-sha
+
+FROM scratch
+
+LABEL org.opencontainers.image.title="space-buildmgr-bundle"
+LABEL org.opencontainers.image.description="Deployable SPACE build manager artifact bundle for packer and CI validation."
+
+COPY --from=rust-build /artifacts/bin/space-buildmgr /bundle/space/bin/space-buildmgr
+COPY --from=rust-build /artifacts/bin/space-tmplmgr /bundle/space/bin/space-tmplmgr
+COPY --from=rust-build /artifacts/bin/space-db-migrator /bundle/space/bin/space-db-migrator
+COPY templates/firecracker/recipes /bundle/space/templates/firecracker/recipes
+
+ARG SPACE_GIT_SHA=unknown
+LABEL org.opencontainers.image.revision="${SPACE_GIT_SHA}"
+COPY --from=build-identity /identity/build-git-sha /bundle/space/etc/build-git-sha

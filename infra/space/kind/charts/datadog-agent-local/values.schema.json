@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "datadog": {
+      "type": "object",
+      "properties": {
+        "clusterAgent": {
+          "type": "object",
+          "properties": {
+            "token": {
+              "type": "string",
+              "minLength": 32,
+              "description": "A stable local-only token; the Agent requires at least 32 characters."
+            }
+          }
+        }
+      }
+    }
+  }
+}

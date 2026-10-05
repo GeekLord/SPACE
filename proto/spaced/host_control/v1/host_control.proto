@@ -1,0 +1,49 @@
+syntax = "proto3";
+package space.spaced.host.control.v1;
+
+import "net/policy/v1/policy.proto";
+import "credential/manager/v1/network_credential.proto";
+import "spaced/activity/v1/activity.proto";
+
+// Host-control API exposed by sbx-manager for sandbox-scoped host-side requests
+// originating from sandbox sidecars.
+service HostControl {
+  rpc SetActivityState(space.spaced.activity.v1.SetActivityStateRequest) returns (space.spaced.activity.v1.SetActivityStateResponse);
+  rpc RequestActiveFor(space.spaced.activity.v1.RequestActiveForRequest) returns (space.spaced.activity.v1.RequestActiveForResponse);
+  rpc RequestShutdown(space.spaced.activity.v1.RequestShutdownRequest) returns (space.spaced.activity.v1.RequestShutdownResponse);
+  rpc GetNetworkPolicy(GetNetworkPolicyRequest) returns (GetNetworkPolicyResponse);
+  // Startup/renewal only, not per-host leaf signing. Authenticates the
+  // registered gateway and rechecks its assigned execution after issuance.
+  rpc IssueGatewayIntermediateCertificate(IssueGatewayIntermediateCertificateRequest) returns (IssueGatewayIntermediateCertificateResponse);
+}
+
+message IssueGatewayIntermediateCertificateRequest {
+  // DER PKCS#10 P-256 CSR using credential-manager's intermediate CSR profile.
+  // The private key stays in gateway. Retries reuse this CSR; a new execution
+  // or renewal uses a fresh key.
+  bytes csr = 1;
+  bytes launch_capability = 2;
+  int64 execution_generation = 3;
+}
+
+message IssueGatewayIntermediateCertificateResponse {
+  // Node-signed gateway CA. Gateway validates the key, CA profiles, validity,
+  // and signature against the returned node issuer before installation.
+  bytes certificate_der = 2;
+  // Exact node CA that signed certificate_der. Root trust lives in the guest.
+  bytes issuer_certificate_der = 3;
+}
+
+message GetNetworkPolicyRequest {}
+
+message GetNetworkPolicyResponse {
+  space.net.policy.v1.NetworkPolicyV1 effective_policy = 1;
+  bool inherited = 2;
+  uint64 network_tx_bytes = 3; // guest -> network, persisted lifetime counter
+  uint64 network_rx_bytes = 4; // network -> guest, persisted lifetime counter
+  string effective_policy_ref = 5;
+  // UUID-keyed material from Credential Authority. Request matching remains
+  // owned by effective_policy; this list is empty for unbound, missing, foreign,
+  // or retired references.
+  repeated space.credential.manager.v1.ResolvedNetworkCredential network_credentials = 10;
+}

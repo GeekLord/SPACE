@@ -1,0 +1,55 @@
+{{- if not .Values.storage.existingClaim }}
+{{ include "common.pvc" (dict "name" "loki-data" "storage" .Values.storage) }}
+---
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki
+spec:
+  type: ClusterIP
+  selector: {app: loki}
+  ports:
+    - {name: http, port: 3100}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loki
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: loki}
+  template:
+    metadata:
+      labels:
+{{ include "common.podLabels" (dict "app" "loki" "profile" .Values.profile "owner" "logs") | indent 8 }}
+      annotations:
+        checksum/config: {{ tpl (.Files.Get "config/loki.yaml") . | sha256sum }}
+    spec:
+{{- include "common.scheduling" .Values.scheduling | nindent 6 }}
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: loki
+          image: {{ .Values.images.loki | quote }}
+          securityContext:
+{{ include "common.containerSecurityContext" . | indent 12 }}
+          args: [-config.file=/etc/space/loki.yaml, -target=all]
+          resources:
+{{ toYaml .Values.loki.resources | indent 12 }}
+          readinessProbe:
+            httpGet: {path: /ready, port: 3100}
+            periodSeconds: 3
+          volumeMounts:
+            - {name: config, mountPath: /etc/space, readOnly: true}
+            - {name: data, mountPath: /loki}
+      volumes:
+        - {name: config, configMap: {name: logs-config}}
+        - name: data
+          persistentVolumeClaim: {claimName: {{ include "common.claimName" (dict "name" "loki-data" "storage" .Values.storage) | quote }}}

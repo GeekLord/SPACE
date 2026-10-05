@@ -1,0 +1,35 @@
+{
+  "metadata": {
+    "annotations": {
+      "space.pplx.net/process-env-v1": "RU1QVFk9AEVRVUFMUz1hPWI9YwBGUk9aRU49b3JpZ2luYWwgY2Fmw6kg6ZuqIC8gbGluZQpicmVhawBNVUxUSUxJTkU9Zmlyc3QKc2Vjb25kAFVOSUNPREU96ZuqIGNhZsOpIPCfmoAA"
+    }
+  },
+  "spec": {
+    "containers": [
+      {
+        "env": [
+          {
+            "name": "EMPTY",
+            "value": ""
+          },
+          {
+            "name": "EQUALS",
+            "value": "a=b=c"
+          },
+          {
+            "name": "FROZEN",
+            "value": "original café 雪 / line\nbreak"
+          },
+          {
+            "name": "MULTILINE",
+            "value": "first\nsecond"
+          },
+          {
+            "name": "UNICODE",
+            "value": "雪 café 🚀"
+          }
+        ]
+      }
+    ]
+  }
+}

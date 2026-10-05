@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Prefer a system-installed udevadm (e.g., from install-tools.py udev).
+for candidate in /bin/udevadm /sbin/udevadm /usr/bin/udevadm /usr/sbin/udevadm; do
+    if [ -x "${candidate}" ]; then
+        exec "${candidate}" "$@"
+    fi
+done
+
+echo "Buildkite shim: skipping udevadm $* because the agent image does not provide udev tools." >&2

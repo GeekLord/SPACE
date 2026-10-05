@@ -1,0 +1,334 @@
+name: Kind CI
+
+on:
+  workflow_call:
+
+# The caller owns permissions: kind-pull-ci.yml grants contents:read and
+# packages:read; main-ci.yml grants packages:write to this call. Never elevate
+# a PR token here.
+
+# Cancel superseded PR validation, but keep every main commit's evidence.
+concurrency:
+  group: kind-ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  rust_artifacts:
+    if: github.repository == 'perplexityai/SPACE'
+    name: Build shared Kind Rust artifacts
+    runs-on: ubuntu-24.04-16core
+    timeout-minutes: 60
+    outputs:
+      image_id: ${{ steps.export.outputs.image_id }}
+      source_sha: ${{ steps.export.outputs.source_sha }}
+      artifact_name: ${{ steps.export.outputs.artifact_name }}
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - &enable-containerd-store
+        name: Enable the containerd image store for artifact handoff and cache
+        run: |
+          set -euo pipefail
+          sudo install -d -m 0755 /etc/docker
+          if [[ -s /etc/docker/daemon.json ]]; then
+            sudo jq '.features["containerd-snapshotter"] = true' /etc/docker/daemon.json \
+              | sudo tee /etc/docker/daemon.json.new >/dev/null
+            sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+          else
+            echo '{"features":{"containerd-snapshotter":true}}' | sudo tee /etc/docker/daemon.json >/dev/null
+          fi
+          sudo systemctl restart docker
+          if ! docker info --format '{{json .DriverStatus}}' | grep -q 'io.containerd.snapshotter'; then
+            echo "::error::The containerd image store did not activate; artifact identity and BuildKit cache export require it"
+            exit 1
+          fi
+
+      # Keep existing cache hits while main seeds the public registry package.
+      # This is an import-only bridge: neither PRs nor main export to Actions.
+      - name: Expose the existing Actions cache for read-only imports
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
+
+      # Reads the third-party image mirror (ci/mirrored-images.txt) and the
+      # layer cache; only main's token can also write the cache.
+      - &ghcr-login
+        name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build the Rust artifact image once
+        env:
+          SPACE_CI_IMAGE_MIRROR: ghcr
+          SPACE_KIND_RUST_ARTIFACTS: docker
+          SPACE_KIND_BUILD_CACHE_REPOSITORY: ghcr.io/perplexityai/space-kind-build-cache
+          SPACE_KIND_BUILD_CACHE_WRITE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && '1' || '0' }}
+        run: bash infra/space/kind/scripts/build-rust-artifacts.sh
+
+      - name: Export the exact-commit artifact image
+        id: export
+        run: |
+          set -euo pipefail
+          echo "source_sha=$(git rev-parse HEAD)" >>"${GITHUB_OUTPUT}"
+          echo "artifact_name=kind-rust-${GITHUB_SHA}-${GITHUB_RUN_ATTEMPT}" >>"${GITHUB_OUTPUT}"
+          echo "image_id=$(docker image inspect -f '{{.Id}}' space-rust-build-kind:local)" >>"${GITHUB_OUTPUT}"
+          docker image save space-rust-build-kind:local | gzip -1 >"${RUNNER_TEMP}/kind-rust.tar.gz"
+
+      - name: Upload the image for this run's isolated shards
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.export.outputs.artifact_name }}
+          path: ${{ runner.temp }}/kind-rust.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+      # Only this dedicated cache package is pruned, never release images.
+      # Fixed tagged heads stay intact; retain ten untagged versions for readers
+      # already pulling an older manifest. This never runs on a PR.
+      - name: Retain ten superseded cache versions
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        uses: actions/delete-package-versions@e5bc658cc4c965c472efe991f8beea3981499c55 # v5
+        with:
+          owner: perplexityai
+          package-name: space-kind-build-cache
+          package-type: container
+          delete-only-untagged-versions: 'true'
+          min-versions-to-keep: 10
+
+  smoke:
+    if: github.repository == 'perplexityai/SPACE'
+    name: Kind / Firecracker smoke (${{ matrix.shard }}/4)
+    needs: rust_artifacts
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      # Image builds and the charts' images come from the GHCR mirror; see
+      # ci/mirrored-images.txt.
+      SPACE_CI_IMAGE_MIRROR: ghcr
+      SPACE_KIND_RUST_ARTIFACTS: prebuilt
+      SPACE_KIND_PREBUILT_RUST_IMAGE_ID: ${{ needs.rust_artifacts.outputs.image_id }}
+      SPACE_KIND_PREBUILT_RUST_SHA: ${{ needs.rust_artifacts.outputs.source_sha }}
+    runs-on: ubuntu-24.04-16core
+    timeout-minutes: 180
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Match the producer before loading the archive: the classic image store
+      # exposes a config digest instead of the producer's OCI image-index ID.
+      # Restart Docker before any Kind/Tilt containers exist.
+      - *enable-containerd-store
+
+      - name: Enable KVM access
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          if ! sudo udevadm control --reload-rules; then
+            echo "::error::Failed to reload udev rules"
+            exit 1
+          fi
+          if ! sudo udevadm trigger --name-match=kvm; then
+            echo "::error::Failed to trigger the kvm udev device"
+            exit 1
+          fi
+          if ! sudo udevadm settle; then
+            echo "::error::Failed to wait for kvm udev processing"
+            exit 1
+          fi
+
+          if [[ ! -e /dev/kvm ]]; then
+            echo "::error::The runner does not expose /dev/kvm"
+            exit 1
+          fi
+          if [[ ! -c /dev/kvm ]]; then
+            echo "::error::/dev/kvm exists but is not a character device"
+            exit 1
+          fi
+          if [[ ! -r /dev/kvm ]]; then
+            echo "::error::The runner user cannot read /dev/kvm"
+            exit 1
+          fi
+          if [[ ! -w /dev/kvm ]]; then
+            echo "::error::The runner user cannot write /dev/kvm"
+            exit 1
+          fi
+
+      - *ghcr-login
+
+      - name: Install Kind smoke prerequisites
+        run: |
+          set -euo pipefail
+          sudo install -d -m 0755 -o "${USER}" -g "$(id -gn)" /home/dev
+          install -d -m 0755 "${HOME}/.local/bin"
+          INSTALL_DIR="${HOME}/.local/bin" \
+            bash infra/space/kind/scripts/install-prereqs.sh
+          echo "${HOME}/.local/bin" >>"${GITHUB_PATH}"
+
+      # The BYOK scenario seals snapshots with the host kernel's device-mapper
+      # crypt and snapshot targets. Kind nodes share the runner's kernel and
+      # cannot load modules themselves, so load them here, where a runner that
+      # cannot fails the job instead of losing BYOK coverage. The general
+      # bring-up never touches host modules; elsewhere the scenario's own
+      # preflight reports missing targets. The runner image provides modprobe
+      # and dmsetup, so they are not general smoke prerequisites: on a Devbox,
+      # dmsetup's /usr/sbin is not on the user's PATH and install-prereqs.sh
+      # rejected it as absent.
+      - name: Load the host device-mapper targets for BYOK smoke
+        run: |
+          set -euo pipefail
+          source scripts/lib/space-smoke-prereqs.sh
+          space_smoke_prepare_encrypted_targets
+
+      - name: Download this run's Rust artifact image
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.rust_artifacts.outputs.artifact_name }}
+          path: ${{ runner.temp }}/kind-rust
+
+      - name: Load and verify the shared Rust artifact image
+        run: |
+          set -euo pipefail
+          gzip -dc "${RUNNER_TEMP}/kind-rust/kind-rust.tar.gz" | docker image load
+          bash infra/space/kind/scripts/build-rust-artifacts.sh
+
+      # DATA_PLANE_URL makes the bring-up wait for the public data plane as well as the API.
+      # The data plane's ReplicaSet reaches ready a few minutes after the API on a cold
+      # stack; without this wait the baseline passes on the API alone and the typed suite's
+      # first scenarios fail with connection refused on 127.0.0.1:8090.
+      # Every Tilt invocation verifies and reuses the loaded Rust image. Runtime images,
+      # seed, credentials, and Kind cluster state are still built separately on each runner.
+      - name: Run the baseline Kind smoke
+        env:
+          BOOTSTRAP_TIMEOUT: 1800
+          DATA_PLANE_URL: http://127.0.0.1:8090
+        run: bash scripts/tests/smoke-kind-e2e.sh
+
+      # Together the shards cover every ecw, network_policy, native, and local scenario.
+      # Each shard stays serial against the isolated stack its baseline proved. The suite
+      # exits 1 on any failed scenario and 2 on an inconclusive one or a missing tool, so a
+      # partial run cannot report green. A scenario declared `quarantined=` is withheld and
+      # printed as QUARANTINED with its reason, so the log shows what this run did not prove.
+      # ecw.cold_create_environment needs an admin bearer token file and a receipts
+      # directory; both are created here from the local root account the baseline already
+      # logged in as. Two local scenarios need the aws CLI. `all` runs the inventory on the
+      # ECW API surface and then the native-capable scenarios on the native /v1 surface, and
+      # exits nonzero if either pass did; that second pass is the only typed coverage of the
+      # native API.
+      - name: Run this shard of the typed Kind smoke
+        env:
+          SKIP_BOOTSTRAP: "1"
+          SMOKE_SHARD: ${{ matrix.shard }}/4
+          SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE: ${{ runner.temp }}/space-smoke-admin-token
+          SPACE_SMOKE_KIND_COLD_RECEIPTS: ${{ runner.temp }}/space-smoke-cold-receipts
+        run: |
+          set -euo pipefail
+          for tool in aws curl jq; do
+            if ! command -v "${tool}" >/dev/null 2>&1; then
+              echo "::error::The typed Kind smoke needs ${tool} on the runner"
+              exit 1
+            fi
+          done
+          uv_bin="$(bash ci/scripts/ensure-uv.sh)"
+          uv_dir="$(dirname "${uv_bin}")"
+          export PATH="${uv_dir}:${PATH}"
+          install -d -m 0700 "${SPACE_SMOKE_KIND_COLD_RECEIPTS}"
+          curl -fsS -X POST http://localhost:8080/auth/v1/sessions \
+            -H 'content-type: application/json' \
+            -d '{"email":"root@local","password":"password"}' \
+            | jq -r '.token // empty' >"${SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE}"
+          chmod 0600 "${SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE}"
+          if [[ ! -s "${SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE}" ]]; then
+            echo "::error::Could not obtain an admin session token from the Kind API"
+            exit 1
+          fi
+          # Belt and braces for the baseline's wait: the typed scenarios talk to the data
+          # plane from their first command, so prove it answers before starting any of them.
+          for _ in $(seq 1 150); do
+            if curl -sf -m 2 http://127.0.0.1:8090/healthz >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          if ! curl -sf -m 2 http://127.0.0.1:8090/healthz >/dev/null 2>&1; then
+            echo "::error::The Kind data plane at 127.0.0.1:8090 never became healthy"
+            exit 1
+          fi
+          bash scripts/tests/smoke-kind-typed.sh all "${SMOKE_SHARD}"
+
+      # Every command below is bounded, and each step has a deadline: a wedged
+      # apiserver, Tilt, or node must not hold the job until its own deadline and
+      # lose the evidence upload. Each command writes its own output, so what
+      # finished before a timeout is still uploaded.
+      - name: Collect Kind diagnostics
+        if: failure()
+        timeout-minutes: 5
+        run: |
+          k() { timeout "$1" kubectl --context kind-space-local "${@:2}"; }
+          k 30s get nodes -o wide || true
+          k 30s get pods -A -o wide || true
+          timeout 30s tilt get uiresources -o yaml || true
+          timeout 30s tilt logs --tail=200 || true
+          # Startup can fail before the supervisor forwards service logs.
+          # Keep the earlier attempt visible when a replacement pod retried.
+          for pod in $(k 30s -n space get pods -l space.pplx.net/chart=space-node-stack -o name); do
+            k 30s -n space logs "$pod" -c node-stack --previous --tail=100 || true
+            k 30s -n space exec "$pod" -c node-stack -- \
+              bash -c 'for log in /space/logs/previous-*/*.log; do
+                if [[ -f "$log" ]]; then tail -n 100 -v "$log"; fi
+              done' || true
+          done
+
+      # A sandbox pod stuck Terminating is held on its node: the kubelet's
+      # StopPodSandbox runs through containerd into the SPACE shim, which waits
+      # for node-local sbx-manager. Only the node journals (the shim logs to
+      # containerd's stderr) and the node-stack logs name the refused call, and
+      # they vanish with the runner. The Kind nodes are fresh per job, so each
+      # journal covers exactly this run.
+      - name: Collect Kind node teardown evidence
+        if: failure()
+        timeout-minutes: 8
+        run: |
+          dir="${RUNNER_TEMP}/kind-node-diagnostics"
+          mkdir -p "${dir}"
+          k() { timeout "$1" kubectl --context kind-space-local "${@:2}"; }
+          for node in $(timeout 30s kind get nodes --name space-local 2>/dev/null); do
+            timeout 45s docker exec "${node}" journalctl -u kubelet -u containerd --no-pager -o short-iso \
+              >"${dir}/${node}.journal.log" 2>&1 || true
+            timeout 15s docker exec "${node}" crictl pods >"${dir}/${node}.crictl-pods.txt" 2>&1 || true
+          done
+          for pod in $(k 30s -n space get pods -l space.pplx.net/chart=space-node-stack -o name); do
+            k 45s -n space exec "${pod}" -c node-stack -- \
+              tar -C /space/logs -cf - . >"${dir}/${pod#pod/}.space-logs.tar" 2>/dev/null || true
+          done
+          k 30s -n space get pods -l app.kubernetes.io/name=space-sandbox -o json \
+            | jq -r '.items[] | select(.metadata.deletionTimestamp) | .metadata.name' \
+            | while IFS= read -r pod; do
+                echo "::group::Terminating sandbox pod ${pod}"
+                k 15s -n space describe pod "${pod}" || true
+                echo "::endgroup::"
+              done || true
+          echo "Teardown refusals recorded by the node journals (last 100):"
+          grep -hE 'StopPodSandbox.*failed|KillPodSandbox|\[space-shim\] (kill|delete): task .* keeps running' \
+            "${dir}"/*.journal.log 2>/dev/null | tail -n 100 || true
+
+      - name: Upload Kind node teardown evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kind-node-diagnostics-${{ matrix.shard }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kind-node-diagnostics/
+          retention-days: 7

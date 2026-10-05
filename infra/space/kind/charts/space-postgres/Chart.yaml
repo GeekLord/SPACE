@@ -1,0 +1,6 @@
+apiVersion: v2
+name: space-postgres
+description: Single-pod Postgres for the local KinD SPACE stack
+type: application
+version: 0.1.0
+appVersion: "16"

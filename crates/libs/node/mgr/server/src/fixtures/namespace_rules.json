@@ -1,0 +1,812 @@
+{
+  "nftables": [
+    {
+      "add": {
+        "table": {
+          "family": "ip",
+          "name": "sandbox"
+        }
+      }
+    },
+    {
+      "add": {
+        "chain": {
+          "family": "ip",
+          "table": "sandbox",
+          "name": "pre_tproxy_guardrails",
+          "type": "filter",
+          "hook": "prerouting",
+          "prio": -175
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "ip",
+          "table": "sandbox",
+          "chain": "pre_tproxy_guardrails",
+          "comment": "drop-spoofed-guest-source",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "tap0",
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "saddr"
+                  }
+                },
+                "right": "169.254.0.21",
+                "op": "!="
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "ip",
+          "table": "sandbox",
+          "chain": "pre_tproxy_guardrails",
+          "comment": "pre-tproxy-allow-established-related",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "tap0",
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "ct": {
+                    "key": "state"
+                  }
+                },
+                "right": {
+                  "set": [
+                    "established",
+                    "related"
+                  ]
+                },
+                "op": "in"
+              }
+            },
+            {
+              "return": null
+            }
+          ]
+        }
+      }
+    },
+  { "add": { "rule": { "family": "ip", "table": "sandbox", "chain": "pre_tproxy_guardrails",
+    "comment": "platform-egress-pre-tproxy-guardrail-quic-udp443",
+    "expr": [
+      { "match": { "left": { "meta": { "key": "iifname" } },
+                     "right": "tap0", "op": "==" } },
+      { "match": { "left": { "ct": { "key": "state" } },
+                     "right": { "set": ["new"] }, "op": "in" } },
+      { "match": { "left": { "payload": { "protocol": "udp", "field": "dport" } },
+                     "right": 443, "op": "==" } },
+      { "counter": null }
+    ] } } },
+    {
+      "add": {
+        "rule": {
+          "family": "ip",
+          "table": "sandbox",
+          "chain": "pre_tproxy_guardrails",
+          "comment": "platform-egress-pre-tproxy-guardrail-cloud-imds",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "tap0",
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "ct": {
+                    "key": "state"
+                  }
+                },
+                "right": {
+                  "set": [
+                    "new"
+                  ]
+                },
+                "op": "in"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": "169.254.169.254",
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "protocol": "tcp",
+                    "field": "dport"
+                  }
+                },
+                "right": 80,
+                "op": "=="
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "ip",
+          "table": "sandbox",
+          "chain": "pre_tproxy_guardrails",
+          "comment": "platform-egress-pre-tproxy-guardrail-aws-ecs-credentials",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "tap0",
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "ct": {
+                    "key": "state"
+                  }
+                },
+                "right": {
+                  "set": [
+                    "new"
+                  ]
+                },
+                "op": "in"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": "169.254.170.2",
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "protocol": "tcp",
+                    "field": "dport"
+                  }
+                },
+                "right": 80,
+                "op": "=="
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "ip",
+          "table": "sandbox",
+          "chain": "pre_tproxy_guardrails",
+          "comment": "platform-egress-pre-tproxy-guardrail-aws-time-sync",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "tap0",
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "ct": {
+                    "key": "state"
+                  }
+                },
+                "right": {
+                  "set": [
+                    "new"
+                  ]
+                },
+                "op": "in"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": "169.254.169.123",
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "protocol": "udp",
+                    "field": "dport"
+                  }
+                },
+                "right": 123,
+                "op": "=="
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "ip",
+          "table": "sandbox",
+          "chain": "pre_tproxy_guardrails",
+          "comment": "platform-egress-pre-tproxy-guardrail-rfc1918-10",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "tap0",
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "ct": {
+                    "key": "state"
+                  }
+                },
+                "right": {
+                  "set": [
+                    "new"
+                  ]
+                },
+                "op": "in"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "10.0.0.0",
+                    "len": 8
+                  }
+                },
+                "op": "=="
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "ip",
+          "table": "sandbox",
+          "chain": "pre_tproxy_guardrails",
+          "comment": "platform-egress-pre-tproxy-guardrail-rfc1918-172",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "tap0",
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "ct": {
+                    "key": "state"
+                  }
+                },
+                "right": {
+                  "set": [
+                    "new"
+                  ]
+                },
+                "op": "in"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "172.16.0.0",
+                    "len": 12
+                  }
+                },
+                "op": "=="
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "ip",
+          "table": "sandbox",
+          "chain": "pre_tproxy_guardrails",
+          "comment": "platform-egress-pre-tproxy-guardrail-rfc1918-192",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "tap0",
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "ct": {
+                    "key": "state"
+                  }
+                },
+                "right": {
+                  "set": [
+                    "new"
+                  ]
+                },
+                "op": "in"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "192.168.0.0",
+                    "len": 16
+                  }
+                },
+                "op": "=="
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "add": {
+        "chain": {
+          "family": "ip",
+          "table": "sandbox",
+          "name": "guardrails",
+          "type": "filter",
+          "hook": "forward",
+          "prio": -200
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "ip",
+          "table": "sandbox",
+          "chain": "guardrails",
+          "comment": "platform-egress-guardrail-ec2-imds",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "tap0",
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "169.254.169.254",
+                    "len": 32
+                  }
+                },
+                "op": "=="
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "ip",
+          "table": "sandbox",
+          "chain": "guardrails",
+          "comment": "platform-egress-guardrail-link-local",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "tap0",
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "169.254.0.0",
+                    "len": 16
+                  }
+                },
+                "op": "=="
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "ip",
+          "table": "sandbox",
+          "chain": "guardrails",
+          "comment": "platform-egress-guardrail-space-slots-a",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "tap0",
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "10.11.0.0",
+                    "len": 16
+                  }
+                },
+                "op": "=="
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "ip",
+          "table": "sandbox",
+          "chain": "guardrails",
+          "comment": "platform-egress-guardrail-space-slots-b",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "tap0",
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "10.12.0.0",
+                    "len": 16
+                  }
+                },
+                "op": "=="
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "ip",
+          "table": "sandbox",
+          "chain": "guardrails",
+          "comment": "platform-egress-guardrail-loopback",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "tap0",
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "127.0.0.0",
+                    "len": 8
+                  }
+                },
+                "op": "=="
+              }
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "add": {
+        "chain": {
+          "family": "ip",
+          "table": "sandbox",
+          "name": "postrouting",
+          "type": "nat",
+          "hook": "postrouting",
+          "prio": 100
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "ip",
+          "table": "sandbox",
+          "chain": "postrouting",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "mark"
+                  }
+                },
+                "right": 2,
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "right": "vpeer-000000",
+                "op": "=="
+              }
+            },
+            {
+              "snat": {
+                "addr": "10.12.128.2"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "add": {
+        "chain": {
+          "family": "ip",
+          "table": "sandbox",
+          "name": "prerouting",
+          "type": "nat",
+          "hook": "prerouting",
+          "prio": -100
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "ip",
+          "table": "sandbox",
+          "chain": "prerouting",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "vpeer-000000",
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": "10.12.128.2",
+                "op": "=="
+              }
+            },
+            {
+              "dnat": {
+                "addr": "169.254.0.21"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

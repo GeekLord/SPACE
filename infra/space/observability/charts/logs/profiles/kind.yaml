@@ -1,0 +1,14 @@
+profile: kind
+clusterLabel: kind-local
+storage:
+  retain: false
+networkPolicy:
+  enabled: false
+alloy:
+  tolerations:
+    - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+collection:
+  podTargets:
+    - {path: "/var/log/pods/space_*/*/*.log", namespace: space}
+  journal:
+    path: /run/log/journal

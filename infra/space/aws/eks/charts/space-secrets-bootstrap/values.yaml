@@ -1,0 +1,47 @@
+# External-secrets plumbing for the space namespace: the SecretStore, the
+# ExternalSecrets, and the ServiceAccount the SecretStore authenticates as.
+#
+# This set has to exist before the Postgres migration Job runs, which is earlier
+# than the space release deploys, so it is installed from Terraform rather than
+# rendered by the space chart. Terraform supplies every value below from
+# module.app_deploy's external_secrets input, which is also where the
+# ExternalSecrets' Secrets Manager read policy is derived from — one source for
+# both halves.
+
+# The space namespace. An empty value falls back to the release namespace.
+namespaceOverride: space
+
+serviceAccount:
+  name: space-secrets-store
+  # IRSA role the SecretStore assumes to read Secrets Manager.
+  roleArn: ""
+
+secretStore:
+  name: space-aws-secrets
+  region: us-east-1
+
+# ExternalSecret name -> spec. Every entry targets a Secret it owns
+# (creationPolicy: Owner), and carries helm.sh/resource-policy: keep. An entry
+# that stops rendering therefore leaves the live object behind rather than
+# taking its Secret with it — the ExternalSecret keeps syncing, now reconciled
+# by no release. Retire it only after its consumers have stopped using the
+# target Secret; deleting the ExternalSecret also deletes that Secret.
+#
+# `enabled: false` keeps a declaration in place without rendering it — used for
+# secrets whose Secrets Manager value is populated out-of-band and not there
+# yet, where rendering anyway produces a permanently-failing ExternalSecret.
+# Omitting the key means enabled.
+#
+# externalSecrets:
+#   space-postgres:
+#     targetSecretName: space-postgres
+#     refreshInterval: 5m
+#     data:
+#       POSTGRES_CONNECTION_STRING:
+#         remoteRef:
+#           key: space-postgres-connection-string
+#       PGHOST:
+#         remoteRef:
+#           key: space-rds-credentials
+#           property: host
+externalSecrets: {}

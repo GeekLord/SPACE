@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+perl -pe 's/\$(\{)?([A-Za-z_][A-Za-z0-9_]*)(?(1)\})/defined $ENV{$2} ? $ENV{$2} : ""/ge'

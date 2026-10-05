@@ -1,0 +1,5 @@
+{{- include "common.profileGuard" . }}
+{{- include "common.sharedGuards" . }}
+{{- if eq .Values.profile "shared" }}
+{{- include "common.sharedStorageGuard" (dict "storage" .Values.storage "key" "storage") }}
+{{- end }}

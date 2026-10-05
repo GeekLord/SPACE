@@ -1,0 +1,426 @@
+name: Reference deployment
+
+# Applies infra/space/aws/reference/cluster, and then the add-ons in
+# infra/space/aws/reference/addons, on a schedule, in an AWS account with no
+# Perplexity workloads, so drift and module regressions surface without anyone
+# remembering to look. Pull requests only check formatting and validate (the
+# roots, the add-on charts, verify.sh and the node AMI recipes): they get no
+# AWS credentials, because a plan executes provider code and a
+# pull request can come from a fork.
+#
+# The apply job stays off until the REFERENCE_DEPLOYMENT_ROLE_ARN and
+# REFERENCE_TF_STATE_BUCKET repository variables are set from the bootstrap
+# root's outputs. infra/space/aws/reference/README.md has the setup.
+
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: Apply the plan (otherwise plan only)
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - infra/space/aws/reference/**
+      # The cluster root calls this module by path, and renders its node
+      # bootstrap from modules/space's templates.
+      - infra/space/aws/eks/modules/eks-cluster/**
+      - infra/space/aws/eks/modules/space/templates/**
+      # The node AMI recipes the cluster root's AMI lookup depends on, and the
+      # identity file they bake in.
+      - infra/space/packer/**
+      - infra/space/identity/**
+      # The tool installers both jobs run.
+      - ci/scripts/tfswitch-lite.sh
+      - ci/scripts/ensure-uv.sh
+      - .github/workflows/reference-deployment.yml
+      - .github/actions/assume-reference-role/**
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never cancel a run in flight: an interrupted apply leaves a held state
+  # lock and a half-created resource behind.
+  group: reference-deployment-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'apply' }}
+  cancel-in-progress: false
+
+env:
+  REFERENCE_DIR: infra/space/aws/reference
+
+jobs:
+  validate:
+    name: Validate reference roots
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Terraform
+        # tfswitch-lite reads the version from the nearest .terraform-version.
+        working-directory: ${{ env.REFERENCE_DIR }}
+        run: |
+          set -euo pipefail
+          UV_BIN="$(bash "${GITHUB_WORKSPACE}/ci/scripts/ensure-uv.sh")" TFSWITCH_INSTALL_DIR="${RUNNER_TEMP}/bin" \
+            bash "${GITHUB_WORKSPACE}/ci/scripts/tfswitch-lite.sh"
+          echo "${RUNNER_TEMP}/bin" >>"${GITHUB_PATH}"
+
+      - name: Check formatting
+        working-directory: ${{ env.REFERENCE_DIR }}
+        run: terraform fmt -check -recursive -diff
+
+      - name: Validate each root
+        working-directory: ${{ env.REFERENCE_DIR }}
+        run: |
+          set -euo pipefail
+          # The roots pin the same AWS provider; download it once.
+          export TF_PLUGIN_CACHE_DIR="${RUNNER_TEMP}/terraform-plugin-cache"
+          mkdir -p "${TF_PLUGIN_CACHE_DIR}"
+          for root in bootstrap cluster addons; do
+            echo "::group::${root}"
+            terraform -chdir="${root}" init -backend=false -input=false -lockfile=readonly
+            terraform -chdir="${root}" validate
+            echo "::endgroup::"
+          done
+
+      # The add-on charts render only at apply time otherwise. The password and
+      # image are stand-ins: both charts refuse to render without them.
+      - name: Lint the add-on charts
+        working-directory: ${{ env.REFERENCE_DIR }}/addons
+        run: |
+          set -euo pipefail
+          helm version --short
+          helm lint --strict charts/postgresql --set credentials.password=lint --set image=lint
+          helm lint --strict charts/valkey --set password=lint --set image=lint
+          shellcheck verify.sh
+
+      - name: Install Packer
+        env:
+          PACKER_VERSION: 1.15.3
+          # From https://releases.hashicorp.com/packer/1.15.3/packer_1.15.3_SHA256SUMS.
+          PACKER_SHA256: 9ed712c9a8f223c7985d7d21c6b65744bf1c66b8aca333232b96f5ae3fd9c90d
+        run: |
+          set -euo pipefail
+          zip="${RUNNER_TEMP}/packer.zip"
+          curl -fsSL -o "${zip}" "https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_linux_amd64.zip"
+          echo "${PACKER_SHA256}  ${zip}" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/bin"
+          unzip -o -q "${zip}" -d "${RUNNER_TEMP}/bin"
+          "${RUNNER_TEMP}/bin/packer" version
+
+      # Nothing bakes in CI, so this is where a broken recipe shows up before
+      # the next bake does. Validation needs no AWS credentials.
+      - name: Validate the node AMI recipes
+        working-directory: infra/space/packer/aws
+        env:
+          # packer init fetches the amazon plugin from GitHub's API, which rate
+          # limits anonymous calls.
+          PACKER_GITHUB_API_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          packer fmt -check -diff .
+          for recipe in space-worker.pkr.hcl space-builder.pkr.hcl; do
+            echo "::group::${recipe}"
+            packer init "${recipe}"
+            packer validate -var kubernetes_version=1.36 "${recipe}"
+            echo "::endgroup::"
+          done
+
+  apply:
+    name: Plan and apply the reference cluster
+    needs: validate
+    if: >-
+      github.repository == 'perplexityai/SPACE'
+      && github.event_name != 'pull_request'
+      && vars.REFERENCE_DEPLOYMENT_ROLE_ARN != ''
+      && vars.REFERENCE_TF_STATE_BUCKET != ''
+    runs-on: ubuntu-24.04
+    # A Kubernetes minor bump runs the control-plane upgrade (60 minutes at
+    # most), the node-level addons (20), the node-group rolls (40, or 80 if the
+    # same apply also resizes a pool) and coredns (20) in sequence: 180 at most.
+    # This adds setup and the 20-minute readiness check. A bump combined with a
+    # node-group replacement or other cluster changes can exceed it; the
+    # reference README says to apply those by hand. The role session below
+    # has to outlast it.
+    timeout-minutes: 210
+    # The apply role trusts only tokens issued to this environment. Restrict
+    # the environment to the default branch in the repository settings.
+    environment: reference-deployment
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      # Whether the cluster matched its configuration with every pool Ready,
+      # the precondition for installing anything on it.
+      cluster_ready: ${{ steps.nodes.outcome == 'success' }}
+      # From the cluster root, which recorded it, so the add-ons job can
+      # reach the cluster even when its own apply fails before recording
+      # anything.
+      cluster_name: ${{ steps.nodes.outputs.cluster_name }}
+    env:
+      AWS_REGION: ${{ vars.REFERENCE_AWS_REGION || 'us-east-1' }}
+      TF_IN_AUTOMATION: "1"
+      TF_INPUT: "0"
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Terraform
+        # tfswitch-lite reads the version from the nearest .terraform-version.
+        working-directory: ${{ env.REFERENCE_DIR }}
+        run: |
+          set -euo pipefail
+          UV_BIN="$(bash "${GITHUB_WORKSPACE}/ci/scripts/ensure-uv.sh")" TFSWITCH_INSTALL_DIR="${RUNNER_TEMP}/bin" \
+            bash "${GITHUB_WORKSPACE}/ci/scripts/tfswitch-lite.sh"
+          echo "${RUNNER_TEMP}/bin" >>"${GITHUB_PATH}"
+
+      - name: Assume the apply role
+        uses: ./.github/actions/assume-reference-role
+        with:
+          role-arn: ${{ vars.REFERENCE_DEPLOYMENT_ROLE_ARN }}
+          session-name: reference-deployment-${{ github.run_id }}
+          # Four hours, past the job's 210-minute limit.
+          duration-seconds: "14400"
+
+      - name: Initialize
+        working-directory: ${{ env.REFERENCE_DIR }}/cluster
+        env:
+          STATE_BUCKET: ${{ vars.REFERENCE_TF_STATE_BUCKET }}
+        run: |
+          terraform init -lockfile=readonly \
+            -backend-config="bucket=${STATE_BUCKET}" \
+            -backend-config="region=${AWS_REGION}"
+
+      - name: Plan
+        id: plan
+        working-directory: ${{ env.REFERENCE_DIR }}/cluster
+        env:
+          # The root's default AZs are us-east-1's; another region needs its
+          # own list, e.g. ["eu-west-1a","eu-west-1b","eu-west-1c"].
+          AVAILABILITY_ZONES: ${{ vars.REFERENCE_AVAILABILITY_ZONES }}
+        run: |
+          var_args=(-var="region=${AWS_REGION}")
+          if [[ -n "${AVAILABILITY_ZONES}" ]]; then
+            var_args+=(-var="availability_zones=${AVAILABILITY_ZONES}")
+          fi
+          status=0
+          terraform plan -detailed-exitcode -out=tfplan "${var_args[@]}" || status=$?
+          # 0 = no changes, 2 = changes present; anything else is a failure.
+          case "${status}" in
+            0) echo "changes=false" >>"${GITHUB_OUTPUT}" ;;
+            2) echo "changes=true" >>"${GITHUB_OUTPUT}" ;;
+            *) exit "${status}" ;;
+          esac
+
+      - name: Apply
+        id: apply
+        if: >-
+          steps.plan.outputs.changes == 'true'
+          && (github.event_name == 'schedule' || inputs.apply)
+        working-directory: ${{ env.REFERENCE_DIR }}/cluster
+        run: terraform apply tfplan
+
+      # A cluster that exists isn't the goal; one whose nodes register is. Runs
+      # whenever the cluster should match the configuration: after an apply, or
+      # when the plan found nothing to change. Each pool must have exactly the
+      # number of Ready nodes it's sized for, so a pool with no nodes at all
+      # fails the check rather than being skipped by a wait over nodes that do
+      # exist.
+      - name: Check that nodes are Ready
+        id: nodes
+        if: steps.apply.outcome == 'success' || steps.plan.outputs.changes == 'false'
+        working-directory: ${{ env.REFERENCE_DIR }}/cluster
+        run: |
+          set -euo pipefail
+          cluster="$(terraform output -raw cluster_name)"
+          echo "cluster_name=${cluster}" >>"${GITHUB_OUTPUT}"
+          aws eks update-kubeconfig --region "${AWS_REGION}" --name "${cluster}"
+          # Pool names from Terraform, sizes from EKS: a plan with nothing to
+          # change doesn't refresh state, so a resize done through the EKS API
+          # would otherwise be read stale. Each call is its own assignment, so
+          # a failure stops the step instead of dropping a pool from the check.
+          pools="$(terraform output -json node_pool_sizes | jq -r 'keys[]')"
+          if [[ -z "${pools}" ]]; then
+            echo "::error::The cluster root reports no node pools"
+            exit 1
+          fi
+          sizes='{}'
+          for pool in ${pools}; do
+            size="$(aws eks describe-nodegroup --region "${AWS_REGION}" --cluster-name "${cluster}" --nodegroup-name "${pool}" \
+              --query nodegroup.scalingConfig.desiredSize --output text)"
+            sizes="$(jq -c --arg pool "${pool}" --argjson size "${size}" '. + {($pool): $size}' <<<"${sizes}")"
+          done
+          # Twenty minutes: a metal node scaled up by a size change can still be
+          # booting when the apply returns.
+          deadline=$((SECONDS + 1200))
+          while :; do
+            pending=()
+            for pool in $(jq -r 'keys[]' <<<"${sizes}"); do
+              want="$(jq -r --arg pool "${pool}" '.[$pool]' <<<"${sizes}")"
+              # A failed query is a pool not known to be Ready yet, not a
+              # reason to stop waiting.
+              if ! ready="$(kubectl get nodes -l "space.pplx.net/node-pool=${pool}" -o json |
+                jq '[.items[] | select(any(.status.conditions // [] | .[]; .type == "Ready" and .status == "True"))] | length')"; then
+                pending+=("${pool}: query failed")
+                continue
+              fi
+              if [[ "${ready}" != "${want}" ]]; then
+                pending+=("${pool}: ${ready} of ${want} Ready")
+              fi
+            done
+            if [[ "${#pending[@]}" -eq 0 ]]; then
+              break
+            fi
+            if (( SECONDS >= deadline )); then
+              printf '::error::Node pools not Ready after 20 minutes: %s\n' "${pending[*]}"
+              kubectl get nodes -L space.pplx.net/node-pool -o wide
+              exit 1
+            fi
+            sleep 15
+          done
+          kubectl get nodes -L space.pplx.net/node-pool -o wide
+
+  # The add-ons are their own root and their own job, so none of them gates the
+  # cluster: this runs only once the cluster job has left every pool Ready,
+  # and a failure here leaves the cluster as it was. Each add-on is verified in
+  # its own step, and every one runs even when an earlier one fails.
+  addons:
+    name: Plan, apply and verify the reference add-ons
+    needs: apply
+    if: needs.apply.outputs.cluster_ready == 'true'
+    runs-on: ubuntu-24.04
+    # The EBS CSI and metrics-server addons apply in parallel, 10 minutes per
+    # create, update or delete (20 to replace a tainted one); then
+    # PostgreSQL's release waits up to 10 per install or uninstall (20 to
+    # replace a tainted one). Each verify step retries for 5 and can overrun
+    # that by under 2 on its last attempt (verify.sh). With setup, about 65 at
+    # worst, so a stall fails the apply and releases the state lock before the
+    # job is killed. The role session below outlasts it.
+    timeout-minutes: 75
+    environment: reference-deployment
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.REFERENCE_AWS_REGION || 'us-east-1' }}
+      TF_IN_AUTOMATION: "1"
+      TF_INPUT: "0"
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Terraform
+        # tfswitch-lite reads the version from the nearest .terraform-version.
+        working-directory: ${{ env.REFERENCE_DIR }}
+        run: |
+          set -euo pipefail
+          UV_BIN="$(bash "${GITHUB_WORKSPACE}/ci/scripts/ensure-uv.sh")" TFSWITCH_INSTALL_DIR="${RUNNER_TEMP}/bin" \
+            bash "${GITHUB_WORKSPACE}/ci/scripts/tfswitch-lite.sh"
+          echo "${RUNNER_TEMP}/bin" >>"${GITHUB_PATH}"
+
+      - name: Assume the apply role
+        uses: ./.github/actions/assume-reference-role
+        with:
+          role-arn: ${{ vars.REFERENCE_DEPLOYMENT_ROLE_ARN }}
+          session-name: reference-addons-${{ github.run_id }}
+          # 90 minutes, past this job's 75-minute limit.
+          duration-seconds: "5400"
+
+      - name: Initialize
+        working-directory: ${{ env.REFERENCE_DIR }}/addons
+        env:
+          STATE_BUCKET: ${{ vars.REFERENCE_TF_STATE_BUCKET }}
+        run: |
+          terraform init -lockfile=readonly \
+            -backend-config="bucket=${STATE_BUCKET}" \
+            -backend-config="region=${AWS_REGION}"
+
+      - name: Plan
+        id: plan
+        working-directory: ${{ env.REFERENCE_DIR }}/addons
+        env:
+          # The cluster the cluster job just checked, so the plan and kubectl
+          # can't target different ones.
+          CLUSTER_NAME: ${{ needs.apply.outputs.cluster_name }}
+        run: |
+          status=0
+          terraform plan -detailed-exitcode -out=tfplan -var="region=${AWS_REGION}" -var="cluster_name=${CLUSTER_NAME}" || status=$?
+          # 0 = no changes, 2 = changes present; anything else is a failure.
+          case "${status}" in
+            0) echo "changes=false" >>"${GITHUB_OUTPUT}" ;;
+            2) echo "changes=true" >>"${GITHUB_OUTPUT}" ;;
+            *) exit "${status}" ;;
+          esac
+
+      - name: Apply
+        id: apply
+        if: >-
+          steps.plan.outputs.changes == 'true'
+          && (github.event_name == 'schedule' || inputs.apply)
+        working-directory: ${{ env.REFERENCE_DIR }}/addons
+        run: terraform apply tfplan
+
+      # After a failed apply too: Terraform keeps whatever it did create, so
+      # the checks still say which add-ons work.
+      - name: Configure kubectl
+        id: kubeconfig
+        if: >-
+          !cancelled()
+          && (steps.apply.outcome == 'success' || steps.apply.outcome == 'failure'
+            || steps.plan.outputs.changes == 'false')
+        env:
+          CLUSTER_NAME: ${{ needs.apply.outputs.cluster_name }}
+        run: aws eks update-kubeconfig --region "${AWS_REGION}" --name "${CLUSTER_NAME}"
+
+      - name: Verify metrics-server
+        if: ${{ !cancelled() && steps.kubeconfig.outcome == 'success' }}
+        working-directory: ${{ env.REFERENCE_DIR }}/addons
+        run: ./verify.sh metrics-server
+
+      - name: Verify PostgreSQL
+        if: ${{ !cancelled() && steps.kubeconfig.outcome == 'success' }}
+        working-directory: ${{ env.REFERENCE_DIR }}/addons
+        run: ./verify.sh postgresql
+
+      - name: Verify Valkey
+        if: ${{ !cancelled() && steps.kubeconfig.outcome == 'success' }}
+        working-directory: ${{ env.REFERENCE_DIR }}/addons
+        run: ./verify.sh valkey
+
+  report-failure:
+    name: Report a failed scheduled run
+    needs: [validate, apply, addons]
+    # A job stopped by timeout-minutes or a runner loss can conclude as either
+    # failed or cancelled; report both.
+    if: (failure() || cancelled()) && github.event_name == 'schedule' && github.repository == 'perplexityai/SPACE'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    # The repository has issues turned off, so failures go where main CI's do.
+    environment:
+      name: internal-slack
+      deployment: false
+    steps:
+      - name: Post failure to Slack
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_CI_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${SLACK_WEBHOOK_URL}" ]]; then
+            echo "::error::The internal-slack environment is missing SLACK_CI_WEBHOOK_URL"
+            exit 1
+          fi
+          jq -n --arg url "${RUN_URL}" \
+            '{text: (":x: *OSS SPACE reference deployment failed*\nThe scheduled plan-and-apply of `infra/space/aws/reference` (the cluster or its add-ons) failed.\n<" + $url + "|Open failed run>")}' |
+            curl --fail-with-body --silent --show-error --max-time 15 \
+              -H "Content-Type: application/json" --data-binary @- "${SLACK_WEBHOOK_URL}"

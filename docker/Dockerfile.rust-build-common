@@ -1,0 +1,350 @@
+FROM public.ecr.aws/docker/library/rust:1-bookworm AS rust-base
+
+WORKDIR /workspace
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      pkg-config \
+      protobuf-compiler \
+      libprotobuf-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pin the compiler once, for every stage. `planner` and `build-context` copied
+# rust-toolchain.toml but `fetch-deps` did not, so `cargo chef cook` there ran
+# on the base image's default rustc: on a cold build it compiled 493 dependency
+# crates under 1.98.1 and `cargo build` then recompiled the identical 493 under
+# the pinned 1.97.1 (the `syncing channel updates for 1.97.1` line appeared in
+# the build step, not the cook). The chef layer bought nothing (~60 s per set) and
+# wrote compiler-mismatched objects into the shared sccache. Installing the
+# pin here means planner, fetch-deps and build-context inherit it, cargo-chef
+# itself is built with the pinned compiler, and the cook layer stays keyed on
+# recipe.json plus this file. `rustup toolchain install` with no argument
+# reads the toolchain file, including its components and targets.
+COPY rust-toolchain.toml ./
+RUN rustup toolchain install && rustc --version && cargo --version
+
+ARG SCCACHE_VERSION=0.16.0
+ARG SCCACHE_X86_64_SHA256=aec995a83ad3dff3d14b6314e08858b7b73d35ca85a5bcf3d3a9ec07dee35588
+ARG WILD_VERSION=0.9.0
+ARG WILD_X86_64_SHA256=deb6ee0e5caec798053ec4aafaba042e20a8edf91f08cb4d36268571cc628d3b
+
+RUN set -eux; \
+    package="sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl"; \
+    curl -fsSL \
+      "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/${package}.tar.gz" \
+      -o /tmp/sccache.tar.gz; \
+    printf '%s  %s\n' "${SCCACHE_X86_64_SHA256}" /tmp/sccache.tar.gz | sha256sum -c -; \
+    tar -xzf /tmp/sccache.tar.gz -C /tmp; \
+    install -m 0755 "/tmp/${package}/sccache" /usr/local/bin/sccache; \
+    rm -rf /tmp/sccache.tar.gz "/tmp/${package}"
+
+RUN set -eux; \
+    package="wild-linker-${WILD_VERSION}-x86_64-unknown-linux-gnu"; \
+    curl -fsSL \
+      "https://github.com/wild-linker/wild/releases/download/${WILD_VERSION}/${package}.tar.gz" \
+      -o /tmp/wild.tar.gz; \
+    printf '%s  %s\n' "${WILD_X86_64_SHA256}" /tmp/wild.tar.gz | sha256sum -c -; \
+    tar -xzf /tmp/wild.tar.gz -C /tmp; \
+    install -m 0755 "/tmp/${package}/wild" /usr/local/bin/wild; \
+    mkdir -p /usr/local/lib/wild-linker; \
+    ln -s /usr/local/bin/wild /usr/local/lib/wild-linker/ld; \
+    rm -rf /tmp/wild.tar.gz "/tmp/${package}"; \
+    wild --version
+
+COPY --chmod=0755 docker/run-cargo-with-sccache.sh /usr/local/bin/run-cargo-with-sccache
+
+ARG SPACE_SCCACHE_ENABLED=false
+ARG SPACE_SCCACHE_BUCKET=""
+ARG SPACE_SCCACHE_REGION=us-east-1
+ARG SPACE_SCCACHE_S3_KEY_PREFIX=sccache/space/v1/release
+ARG SPACE_SCCACHE_S3_RW_MODE=READ_WRITE
+ARG SPACE_SCCACHE_S3_SERVER_SIDE_ENCRYPTION=true
+ARG SPACE_SCCACHE_ROLE_ARN=""
+
+ENV SPACE_SCCACHE_ENABLED=${SPACE_SCCACHE_ENABLED} \
+    SPACE_SCCACHE_BUCKET=${SPACE_SCCACHE_BUCKET} \
+    SPACE_SCCACHE_REGION=${SPACE_SCCACHE_REGION} \
+    SPACE_SCCACHE_S3_KEY_PREFIX=${SPACE_SCCACHE_S3_KEY_PREFIX} \
+    SPACE_SCCACHE_S3_RW_MODE=${SPACE_SCCACHE_S3_RW_MODE} \
+    SPACE_SCCACHE_S3_SERVER_SIDE_ENCRYPTION=${SPACE_SCCACHE_S3_SERVER_SIDE_ENCRYPTION} \
+    SPACE_SCCACHE_ROLE_ARN=${SPACE_SCCACHE_ROLE_ARN}
+
+# Link every native glibc Cargo target with Wild. Debian bookworm's GCC predates
+# direct `-fuse-ld=wild` support, so its supported -B lookup resolves `ld` to
+# Wild. Scope this to the CI build image and inherit it through cargo-chef and
+# final release builds so their cache keys remain consistent.
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="gcc" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-Clink-arg=-B/usr/local/lib/wild-linker"
+
+FROM rust-base AS chef-base
+
+RUN cargo install --locked cargo-chef
+
+FROM chef-base AS planner
+
+# Let cargo-chef derive the workspace dependency recipe so new crates and path
+# deps do not require hand-maintained manifest or placeholder lists here.
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY .cargo/config.toml .cargo/config.toml
+COPY crates ./crates
+COPY proto ./proto
+COPY infra/space/identity/node-identities.sh infra/space/identity/node-identities.sh
+COPY templates/firecracker/seed/rootfs-builder.sh templates/firecracker/seed/rootfs-builder.sh
+COPY templates/firecracker/recipes/seed.toml templates/firecracker/recipes/code-runtime.toml templates/firecracker/recipes/
+
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef-base AS fetch-deps
+
+ARG SPACE_RUST_ARTIFACT_SET=workspace
+ARG SPACE_CARGO_RELEASE_LTO=thin
+ENV CARGO_PROFILE_RELEASE_LTO=${SPACE_CARGO_RELEASE_LTO}
+
+COPY --from=planner /workspace/recipe.json recipe.json
+COPY infra/space/identity/node-identities.sh infra/space/identity/node-identities.sh
+
+RUN --mount=type=secret,id=aws_web_identity_token \
+    set -eux; \
+      case "${SPACE_RUST_ARTIFACT_SET}" in \
+        worker) \
+          run-cargo-with-sccache cargo chef cook --locked --release --recipe-path recipe.json \
+            --features "pplx-space-node-api-svc/otel,pplx-space-node-api-svc/datadog,pplx-space-node-api-svc/k8s,pplx-space-internal-api-svc/otel,pplx-space-internal-api-svc/datadog,pplx-space-internal-api-svc/k8s,pplx-space-node-ctl-svc/otel,pplx-space-node-ctl-svc/datadog,pplx-space-node-ctl-svc/kubernetes,pplx-space-node-mgr-svc/otel,pplx-space-node-mgr-svc/datadog,pplx-space-build-mgr-svc/otel,pplx-space-build-mgr-svc/datadog,pplx-space-build-mgr-svc/k8s,pplx-space-runtime-supervisor-svc/otel,pplx-space-runtime-supervisor-svc/datadog,pplx-space-runtime-manager-svc/otel,pplx-space-runtime-manager-svc/datadog,pplx-space-sbxmgr-svc/otel,pplx-space-sbxmgr-svc/datadog,pplx-space-spaced-host-svc/otel,pplx-space-spaced-host-svc/datadog,pplx-space-net-gateway-svc/otel,pplx-space-net-gateway-svc/datadog,pplx-space-tmplmgr-svc/otel,pplx-space-tmplmgr-svc/datadog,pplx-space-volmgr-svc/otel,pplx-space-volmgr-svc/datadog" \
+            --bin spaced \
+            --bin spaced-svc \
+            --bin space-buildmgr \
+            --bin space-buildmgr-svc \
+            --bin space-tmplmgr \
+            --bin space-runtime-supervisor-svc \
+            --bin space-rtmgr-svc \
+            --bin space-rtmgr \
+            --bin space-nodemgr-svc \
+            --bin space-sbxmgr \
+            --bin space-nodectl \
+            --bin space-sbxmgr-svc \
+            --bin space-spaced-host-svc \
+            --bin space-netgtw-svc \
+            --bin space-tmplmgr-svc \
+            --bin space-volmgr \
+            --bin space-credmgr-svc \
+            --bin space-volmgr-svc \
+            --bin space-node-api-svc \
+            --bin space-internal-api-svc \
+            --bin space-nodectl-svc \
+            --bin space-db-migrator \
+          ;; \
+        builder) \
+          run-cargo-with-sccache cargo chef cook --locked --release --recipe-path recipe.json \
+            --bin space-buildmgr \
+            --bin space-tmplmgr \
+            --bin space-db-migrator \
+          ;; \
+        api) \
+          run-cargo-with-sccache cargo chef cook --locked --release --recipe-path recipe.json \
+            --features "pplx-space-api-svc/otel,pplx-space-api-svc/datadog,pplx-space-api-svc/kubernetes,pplx-space-api-svc/federated-identity" \
+            --bin space-api-svc \
+            --bin space-db-migrator \
+            --bin space-template-publish \
+          ;; \
+        data-plane) \
+          run-cargo-with-sccache cargo chef cook --locked --release --recipe-path recipe.json \
+            --features "pplx-space-data-plane-svc/otel,pplx-space-data-plane-svc/datadog,pplx-space-data-plane-svc/kubernetes" \
+            --bin space-data-plane-svc \
+          ;; \
+        cluster-controller) \
+          run-cargo-with-sccache cargo chef cook --locked --release --recipe-path recipe.json \
+            --features "pplx-space-cluster-controller/otel,pplx-space-cluster-controller/datadog" \
+            --bin space-cluster-controller \
+          ;; \
+        workspace) \
+          run-cargo-with-sccache cargo chef cook --locked --release --recipe-path recipe.json \
+          ;; \
+        *) \
+          echo "Unsupported SPACE_RUST_ARTIFACT_SET=${SPACE_RUST_ARTIFACT_SET}" >&2; \
+          exit 1 \
+          ;; \
+      esac
+
+FROM fetch-deps AS build-context
+
+ARG SPACE_CARGO_RELEASE_LTO=thin
+ENV CARGO_PROFILE_RELEASE_LTO=${SPACE_CARGO_RELEASE_LTO}
+
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY .cargo/config.toml .cargo/config.toml
+COPY crates ./crates
+COPY proto ./proto
+COPY db ./db
+COPY infra/space/identity/node-identities.sh infra/space/identity/node-identities.sh
+COPY templates/firecracker/seed/rootfs-builder.sh templates/firecracker/seed/rootfs-builder.sh
+COPY templates/firecracker/recipes/seed.toml templates/firecracker/recipes/code-runtime.toml templates/firecracker/recipes/
+COPY scripts/build-runtime-supervisor.sh scripts/build-runtime-supervisor.sh
+
+FROM build-context AS build-worker
+
+RUN --mount=type=secret,id=aws_web_identity_token \
+    run-cargo-with-sccache cargo build --locked --release \
+      -F pplx-space-node-api-svc/otel,pplx-space-node-api-svc/datadog \
+      -F pplx-space-node-api-svc/k8s \
+      -F pplx-space-internal-api-svc/otel,pplx-space-internal-api-svc/datadog \
+      -F pplx-space-internal-api-svc/k8s \
+      -F pplx-space-node-ctl-svc/otel,pplx-space-node-ctl-svc/datadog \
+      -F pplx-space-node-ctl-svc/kubernetes \
+      -F pplx-space-node-mgr-svc/otel,pplx-space-node-mgr-svc/datadog \
+      -F pplx-space-build-mgr-svc/otel,pplx-space-build-mgr-svc/datadog \
+      -F pplx-space-build-mgr-svc/k8s \
+      -F pplx-space-runtime-manager-svc/otel,pplx-space-runtime-manager-svc/datadog \
+      -F pplx-space-sbxmgr-svc/otel,pplx-space-sbxmgr-svc/datadog \
+      -F pplx-space-spaced-host-svc/otel,pplx-space-spaced-host-svc/datadog \
+      -F pplx-space-net-gateway-svc/otel,pplx-space-net-gateway-svc/datadog \
+      -F pplx-space-tmplmgr-svc/otel,pplx-space-tmplmgr-svc/datadog \
+      -F pplx-space-volmgr-svc/otel,pplx-space-volmgr-svc/datadog \
+      --bin spaced \
+      --bin spaced-svc \
+      --bin space-buildmgr \
+      --bin space-buildmgr-svc \
+      --bin space-tmplmgr \
+      --bin space-rtmgr-svc \
+      --bin space-rtmgr \
+      --bin space-nodemgr-svc \
+      --bin space-sbxmgr \
+      --bin space-nodectl \
+      --bin space-sbxmgr-svc \
+      --bin space-spaced-host-svc \
+      --bin space-netgtw-svc \
+      --bin space-tmplmgr-svc \
+      --bin space-volmgr \
+      --bin space-credmgr-svc \
+      --bin space-volmgr-svc \
+      --bin space-node-api-svc \
+      --bin space-internal-api-svc \
+      --bin space-nodectl-svc \
+      --bin space-db-migrator
+
+RUN --mount=type=secret,id=aws_web_identity_token \
+    bash scripts/build-runtime-supervisor.sh \
+      target/release/space-runtime-supervisor-svc \
+      target/release/space-runtime-supervisor-compatibility \
+      run-cargo-with-sccache cargo build --locked --release \
+        -F pplx-space-runtime-supervisor-svc/otel,pplx-space-runtime-supervisor-svc/datadog \
+        --bin space-runtime-supervisor-svc
+
+FROM build-context AS build-builder
+
+RUN --mount=type=secret,id=aws_web_identity_token \
+    run-cargo-with-sccache cargo build --locked --release \
+      --bin space-buildmgr \
+      --bin space-tmplmgr \
+      --bin space-db-migrator
+
+FROM build-context AS build-api
+
+RUN --mount=type=secret,id=aws_web_identity_token \
+    run-cargo-with-sccache cargo build --locked --release \
+      -F pplx-space-api-svc/otel,pplx-space-api-svc/datadog \
+      -F pplx-space-api-svc/kubernetes \
+      -F pplx-space-api-svc/federated-identity \
+      --bin space-api-svc \
+      --bin space-db-migrator \
+      --bin space-template-publish
+
+FROM build-context AS build-data-plane
+
+RUN --mount=type=secret,id=aws_web_identity_token \
+    run-cargo-with-sccache cargo build --locked --release \
+      -F pplx-space-data-plane-svc/otel,pplx-space-data-plane-svc/datadog \
+      -F pplx-space-data-plane-svc/kubernetes \
+      --bin space-data-plane-svc
+
+FROM build-context AS build-cluster-controller
+
+RUN --mount=type=secret,id=aws_web_identity_token \
+    run-cargo-with-sccache cargo build --locked --release \
+      -F pplx-space-cluster-controller/otel,pplx-space-cluster-controller/datadog \
+      --bin space-cluster-controller
+
+FROM public.ecr.aws/docker/library/debian:bookworm-slim AS binary-downloader-base
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM binary-downloader-base AS grpc-health-probe-downloader
+
+ARG TARGETARCH
+ARG GRPC_HEALTH_PROBE_VERSION=v0.4.48
+
+RUN set -eux; \
+      case "${TARGETARCH:-amd64}" in \
+        amd64) asset=grpc_health_probe-linux-amd64; sha256=ceeacfc858929b223f90a823e7da46ab34605ec7c2a9ee1dd272fa9e4fedf5e6 ;; \
+        arm64) asset=grpc_health_probe-linux-arm64; sha256=98792fd8c3356991735df46c8d1fe415d7825ff7a988ac2ba18159ed801097a4 ;; \
+        *) echo "unsupported TARGETARCH=${TARGETARCH}"; exit 1 ;; \
+      esac; \
+      curl -fsSL \
+        "https://github.com/grpc-ecosystem/grpc-health-probe/releases/download/${GRPC_HEALTH_PROBE_VERSION}/${asset}" \
+        -o /grpc_health_probe; \
+      printf '%s  %s\n' "${sha256}" /grpc_health_probe | sha256sum -c -; \
+      chmod 0755 /grpc_health_probe
+
+FROM scratch AS build-artifacts-worker
+
+LABEL org.opencontainers.image.title="space-rust-build-worker"
+LABEL org.opencontainers.image.description="SPACE worker Rust build artifacts for bundle image packaging."
+
+COPY --from=build-worker /workspace/target/release/spaced /artifacts/bin/spaced
+COPY --from=build-worker /workspace/target/release/spaced-svc /artifacts/bin/spaced-svc
+COPY --from=build-worker /workspace/target/release/space-runtime-supervisor-svc /artifacts/bin/space-runtime-supervisor-svc
+COPY --from=build-worker /workspace/target/release/space-runtime-supervisor-compatibility /artifacts/etc/space-runtime-supervisor-compatibility
+COPY --from=build-worker /workspace/target/release/space-rtmgr-svc /artifacts/bin/space-rtmgr-svc
+COPY --from=build-worker /workspace/target/release/space-rtmgr /artifacts/bin/space-rtmgr
+COPY --from=build-worker /workspace/target/release/space-nodemgr-svc /artifacts/bin/space-nodemgr-svc
+COPY --from=build-worker /workspace/target/release/space-sbxmgr /artifacts/bin/space-sbxmgr
+COPY --from=build-worker /workspace/target/release/space-nodectl /artifacts/bin/space-nodectl
+COPY --from=build-worker /workspace/target/release/space-sbxmgr-svc /artifacts/bin/space-sbxmgr-svc
+COPY --from=build-worker /workspace/target/release/space-spaced-host-svc /artifacts/bin/space-spaced-host-svc
+COPY --from=build-worker /workspace/target/release/space-netgtw-svc /artifacts/bin/space-netgtw-svc
+COPY --from=build-worker /workspace/target/release/space-tmplmgr-svc /artifacts/bin/space-tmplmgr-svc
+COPY --from=build-worker /workspace/target/release/space-volmgr /artifacts/bin/space-volmgr
+COPY --from=build-worker /workspace/target/release/space-credmgr-svc /artifacts/bin/space-credmgr-svc
+COPY --from=build-worker /workspace/target/release/space-volmgr-svc /artifacts/bin/space-volmgr-svc
+COPY --from=build-worker /workspace/target/release/space-node-api-svc /artifacts/bin/space-node-api-svc
+COPY --from=build-worker /workspace/target/release/space-internal-api-svc /artifacts/bin/space-internal-api-svc
+COPY --from=build-worker /workspace/target/release/space-nodectl-svc /artifacts/bin/space-nodectl-svc
+COPY --from=build-worker /workspace/target/release/space-buildmgr /artifacts/bin/space-buildmgr
+COPY --from=build-worker /workspace/target/release/space-buildmgr-svc /artifacts/bin/space-buildmgr-svc
+COPY --from=build-worker /workspace/target/release/space-tmplmgr /artifacts/bin/space-tmplmgr
+COPY --from=build-worker /workspace/target/release/space-db-migrator /artifacts/bin/space-db-migrator
+COPY --from=grpc-health-probe-downloader /grpc_health_probe /artifacts/bin/grpc_health_probe
+
+FROM scratch AS build-artifacts-builder
+
+LABEL org.opencontainers.image.title="space-rust-build-builder"
+LABEL org.opencontainers.image.description="SPACE builder Rust build artifacts for bundle image packaging."
+
+COPY --from=build-builder /workspace/target/release/space-buildmgr /artifacts/bin/space-buildmgr
+COPY --from=build-builder /workspace/target/release/space-tmplmgr /artifacts/bin/space-tmplmgr
+COPY --from=build-builder /workspace/target/release/space-db-migrator /artifacts/bin/space-db-migrator
+
+FROM scratch AS build-artifacts-api
+
+LABEL org.opencontainers.image.title="space-rust-build-api"
+LABEL org.opencontainers.image.description="SPACE API Rust build artifacts for bundle image packaging."
+
+COPY --from=build-api /workspace/target/release/space-api-svc /artifacts/bin/space-api-svc
+COPY --from=build-api /workspace/target/release/space-db-migrator /artifacts/bin/space-db-migrator
+COPY --from=build-api /workspace/target/release/space-template-publish /artifacts/bin/space-template-publish
+
+FROM scratch AS build-artifacts-data-plane
+
+LABEL org.opencontainers.image.title="space-rust-build-data-plane"
+LABEL org.opencontainers.image.description="SPACE data-plane Rust build artifacts for bundle image packaging."
+
+COPY --from=build-data-plane /workspace/target/release/space-data-plane-svc /artifacts/bin/space-data-plane-svc
+
+FROM scratch AS build-artifacts-cluster-controller
+
+LABEL org.opencontainers.image.title="space-rust-build-cluster-controller"
+LABEL org.opencontainers.image.description="SPACE cluster-controller Rust build artifacts for bundle image packaging."
+
+COPY --from=build-cluster-controller /workspace/target/release/space-cluster-controller /artifacts/bin/space-cluster-controller

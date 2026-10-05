@@ -1,0 +1,5 @@
+profile: kind
+storage:
+  retain: false
+networkPolicy:
+  enabled: false

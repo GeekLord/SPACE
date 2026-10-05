@@ -1,0 +1,5 @@
+apiVersion: v2
+name: metrics-workload
+description: Synthetic producer fixture for the metrics integration checks
+type: application
+version: 0.1.0

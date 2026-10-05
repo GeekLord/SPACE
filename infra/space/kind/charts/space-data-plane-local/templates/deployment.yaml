@@ -1,0 +1,99 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-data-plane
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-data-plane
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    team: {{ .Values.datadogTeam | quote }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: space-data-plane
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      annotations:
+        ad.datadoghq.com/tags: '{"team":"{{ .Values.datadogTeam }}"}'
+      labels:
+        app.kubernetes.io/name: space-data-plane
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        team: {{ .Values.datadogTeam | quote }}
+    spec:
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ .Release.Name }}-data-plane
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: data-plane
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/space/bin/space-data-plane-svc"]
+          env:
+            - name: SPACE_CLUSTER_API_TOKEN_PATH
+              value: "/var/run/space-publication/cluster-api.token"
+            # Local Kind only; deployed services require authenticated internal RPC TLS.
+            - name: SPACE_INTERNAL_RPC_INSECURE_DEV
+              value: "true"
+            # Datadog tracing — see datadog-agent-local chart.
+            {{- include "space-kind-telemetry.env" . | nindent 12 }}
+            - name: SPACE_K8S_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: SPACE_K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: SPACE_INTERNAL_API_ENDPOINT
+              value: {{ .Values.internal.apiEndpoint | quote }}
+            {{- with .Values.grpcClient.endpointDiscovery }}
+            - name: SPACE_CLUSTER_API_ENDPOINT_DISCOVERY
+              value: {{ . | quote }}
+            {{- end }}
+            - name: SPACE_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.internal.secretName }}
+                  key: SPACE_INTERNAL_TOKEN
+            - name: SPACE_ECW_HOSTS
+              value: {{ .Values.ecwHosts | quote }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 15
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: publication-token
+              mountPath: /var/run/space-publication
+              readOnly: true
+      volumes:
+        - name: publication-token
+          projected:
+            defaultMode: 0444
+            sources:
+              - serviceAccountToken:
+                  path: cluster-api.token
+                  audience: space-cluster-api
+                  expirationSeconds: 3600

@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Prefer a system-installed gcloud (e.g., from install-tools.py google-cloud-cli).
+for candidate in /usr/bin/gcloud /usr/local/bin/gcloud /snap/bin/gcloud; do
+    if [ -x "${candidate}" ]; then
+        exec "${candidate}" "$@"
+    fi
+done
+
+IMAGE="${GOOGLE_CLOUD_SDK_IMAGE:-gcr.io/google.com/cloudsdktool/google-cloud-cli:stable}"
+CLOUDSDK_CONFIG_DIR="${HOME:-/tmp}/.config/gcloud"
+
+mkdir -p "${CLOUDSDK_CONFIG_DIR}"
+
+MOUNT_ARGS=(
+    -v "${CLOUDSDK_CONFIG_DIR}:/root/.config/gcloud"
+    -v "${PWD}:${PWD}"
+)
+HOST_MOUNTS=""
+
+add_host_mount() {
+    local path="$1"
+    local mount_path=""
+
+    case "${path}" in
+        /*) ;;
+        *) return ;;
+    esac
+
+    if [ -d "${path}" ]; then
+        mount_path="${path}"
+    else
+        mount_path="$(dirname "${path}")"
+    fi
+
+    case ":${HOST_MOUNTS}:" in
+        *":${mount_path}:"*) return ;;
+    esac
+
+    HOST_MOUNTS="${HOST_MOUNTS:+${HOST_MOUNTS}:}${mount_path}"
+    MOUNT_ARGS+=(-v "${mount_path}:${mount_path}")
+}
+
+for arg in "$@"; do
+    add_host_mount "${arg}"
+done
+
+exec docker run --rm \
+    -e CLOUDSDK_CONFIG=/root/.config/gcloud \
+    "${MOUNT_ARGS[@]}" \
+    -w "${PWD}" \
+    "${IMAGE}" \
+    gcloud "$@"

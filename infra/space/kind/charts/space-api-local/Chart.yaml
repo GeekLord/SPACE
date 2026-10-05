@@ -1,0 +1,13 @@
+apiVersion: v2
+name: space-api-local
+description: Local-only space-api-server chart targeting the KinD stack
+type: application
+version: 0.1.0
+appVersion: "0.8.0"
+dependencies:
+  - name: space-kind-telemetry
+    version: 0.1.0
+    repository: "file://../space-kind-telemetry"
+    import-values:
+      - child: telemetry
+        parent: telemetry

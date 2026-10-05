@@ -1,0 +1,63 @@
+name: OSS registry
+
+# Format-checks and validates infra/space/aws/oss-registry and the ECR module
+# it calls. A person applies the root, so pull requests get no AWS credentials:
+# a plan executes provider code, and a pull request can come from a fork.
+
+on:
+  pull_request:
+    paths:
+      - infra/space/aws/oss-registry/**
+      - infra/space/aws/modules/ecr-repositories/**
+      - .github/workflows/oss-registry.yml
+      - ci/scripts/tfswitch-lite.sh
+      - ci/scripts/ensure-uv.sh
+
+permissions:
+  contents: read
+
+env:
+  ROOT_DIR: infra/space/aws/oss-registry
+  MODULE_DIR: infra/space/aws/modules/ecr-repositories
+
+jobs:
+  validate:
+    if: github.repository == 'perplexityai/SPACE'
+    name: Validate the OSS registry root and ECR module
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Terraform
+        run: |
+          set -euo pipefail
+          UV_BIN="$(bash ci/scripts/ensure-uv.sh)" TFSWITCH_INSTALL_DIR="${RUNNER_TEMP}/bin" \
+            bash ci/scripts/tfswitch-lite.sh "$(tr -d '[:space:]' <"${ROOT_DIR}/.terraform-version")"
+          echo "${RUNNER_TEMP}/bin" >>"${GITHUB_PATH}"
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive -diff "${ROOT_DIR}" "${MODULE_DIR}"
+
+      # A provider or backend block would stop other roots from calling the
+      # module, the private repository's among them.
+      - name: Check the module configures no provider or backend
+        run: |
+          set -euo pipefail
+          if grep -rnE '^[[:space:]]*(provider|backend)[[:space:]]+"' --include='*.tf' "${MODULE_DIR}"; then
+            echo "::error::${MODULE_DIR} must not declare a provider or backend block."
+            exit 1
+          fi
+
+      - name: Validate
+        run: |
+          set -euo pipefail
+          for dir in "${MODULE_DIR}" "${ROOT_DIR}"; do
+            echo "::group::${dir}"
+            terraform -chdir="${dir}" init -backend=false -input=false -lockfile=readonly
+            terraform -chdir="${dir}" validate
+            echo "::endgroup::"
+          done

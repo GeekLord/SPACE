@@ -1,0 +1,69 @@
+syntax = "proto3";
+package space.node.api.v1;
+
+import "build/manager/v1/manager.proto";
+import "sandbox/manager/v1/manager.proto";
+import "template/manager/v1/manager.proto";
+import "node/v1/node.proto";
+import "node/api/v1/common.proto";
+
+// BuilderApi is the external API for a SPACE builder node.
+// Exposes template management and limited sandbox operations (query + cleanup).
+// Sandbox creation/start is internal to template-manager and builder.
+service BuilderApi {
+  // ── Sandbox query + cleanup (NO Create/Start/Kill) ─────────────────────────
+
+  rpc SandboxState(space.sandbox.manager.v1.StateRequest) returns (space.sandbox.manager.v1.StateResponse);
+  rpc ListSandboxes(space.sandbox.manager.v1.ListRequest) returns (space.sandbox.manager.v1.ListResponse);
+  rpc StopSandbox(space.sandbox.manager.v1.StopRequest) returns (space.sandbox.manager.v1.StopResponse);
+  rpc DeleteSandbox(space.sandbox.manager.v1.DeleteRequest) returns (space.sandbox.manager.v1.DeleteResponse);
+
+  // ── Template management (via template-manager) ─────────────────────────────
+
+  rpc DeleteTemplate(space.template.manager.v1.DeleteTemplateRequest) returns (space.template.manager.v1.DeleteTemplateResponse);
+  rpc DeleteTemplateBuild(space.template.manager.v1.DeleteTemplateBuildRequest) returns (space.template.manager.v1.DeleteTemplateBuildResponse);
+  rpc ListTemplates(space.template.manager.v1.ListTemplatesRequest) returns (space.template.manager.v1.ListTemplatesResponse);
+  rpc GetTemplate(space.template.manager.v1.GetTemplateRequest) returns (space.template.manager.v1.GetTemplateResponse);
+  rpc UpdateTemplateSettings(space.template.manager.v1.UpdateTemplateSettingsRequest) returns (space.template.manager.v1.UpdateTemplateSettingsResponse);
+  rpc UpdateTemplateSnapshotPolicy(space.template.manager.v1.UpdateTemplateSnapshotPolicyRequest) returns (space.template.manager.v1.UpdateTemplateSnapshotPolicyResponse);
+  rpc CreatePool(space.template.manager.v1.CreatePoolRequest) returns (space.template.manager.v1.CreatePoolResponse);
+  rpc DeletePool(space.template.manager.v1.DeletePoolRequest) returns (space.template.manager.v1.DeletePoolResponse);
+  rpc PoolStatus(space.template.manager.v1.PoolStatusRequest) returns (space.template.manager.v1.PoolStatusResponse);
+
+  // ── Network (via node-manager) ─────────────────────────────────────────────
+
+
+  // ── Template transfer ───────────────────────────────────────────────────────
+
+  // Pull a template from a remote source onto this node.
+  rpc PullTemplate(PullTemplateRequest) returns (PullTemplateResponse);
+
+  // Export a template for transfer to another node.
+  rpc NodeExportTemplate(space.template.manager.v1.ExportTemplateRequest) returns (stream space.template.manager.v1.ExportTemplateChunk);
+
+  // List templates on this node with content hashes.
+  rpc ListNodeTemplates(ListNodeTemplatesRequest) returns (ListNodeTemplatesResponse);
+
+  // ── Node-level orchestration ───────────────────────────────────────────────
+
+  rpc RefreshFacetState(RefreshFacetStateRequest) returns (RefreshFacetStateResponse);
+  rpc TriggerStateReconciliation(TriggerStateReconciliationRequest) returns (TriggerStateReconciliationResponse);
+
+  // ── Template build (proxy to space-buildmgr-svc on this node) ─────────────
+  //
+  // Forwards requests to space-buildmgr-svc over its local Unix socket.
+  // Callers that need host->guest COPY must first stage payloads via
+  // UploadBuildBlob and reference them by sha256 inside Recipe.Step.Copy.
+
+  rpc BuildTemplate(build.manager.v1.StartBuildRequest) returns (BuildTemplateResponse);
+  rpc GetBuildTemplateStatus(build.manager.v1.GetBuildStatusRequest) returns (build.manager.v1.GetBuildStatusResponse);
+  // Streaming pass-through to space-buildmgr-svc's BuildManager/UploadBlob.
+  // Lets remote callers stage Recipe.Step.Copy payloads without direct
+  // access to the daemon's Unix socket.
+  rpc UploadBuildBlob(stream build.manager.v1.UploadBlobChunk) returns (build.manager.v1.UploadBlobResponse);
+}
+
+message BuildTemplateResponse {
+  string job_id = 1;
+  string builder_node_id = 2;
+}

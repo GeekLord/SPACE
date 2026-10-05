@@ -1,0 +1,62 @@
+# syntax=docker/dockerfile:1.7
+
+FROM public.ecr.aws/docker/library/node:22-bookworm AS builder
+
+ENV NEXT_TELEMETRY_DISABLED=1
+
+# next.config.js evaluates `process.env.NEXT_PUBLIC_API_URL` ONCE at build
+# time and bakes the resulting `rewrites()` destination into
+# `.next/required-server-files.json` — runtime overrides are ignored. The
+# default preserves the historical behavior (proxy /api → localhost:8080)
+# for builds that don't pass --build-arg. Local KinD and the Buildkite bundle
+# build pass `http://space-api:8080` so the UI pod's rewrite resolves via
+# cluster DNS.
+ARG NEXT_PUBLIC_API_URL=http://localhost:8080
+ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+
+# Same build-time bake for the data-plane rewrite (process stream events
+# + session attach/proxy URLs). Default preserves the historical localhost
+# behavior; the kind build-images.sh passes `http://space-data-plane:8090`
+# so the in-cluster UI pod's rewrite resolves via Service DNS without the
+# browser ever crossing origins.
+ARG NEXT_PUBLIC_DATA_PLANE_URL=http://localhost:8090
+ENV NEXT_PUBLIC_DATA_PLANE_URL=${NEXT_PUBLIC_DATA_PLANE_URL}
+
+WORKDIR /workspace/ui
+
+COPY ui/package.json ui/package-lock.json ./
+
+RUN npm ci
+
+COPY ui/ ./
+
+RUN npm run build
+
+# Requires `output: "standalone"` in next.config.js — the build will fail
+# here if standalone output is not configured.
+RUN test -d .next/standalone || { echo "ERROR: .next/standalone not found. Set output: 'standalone' in next.config.js" >&2; exit 1; } \
+    && mkdir -p /runtime/space/ui/.next/static \
+    && cp -R .next/standalone/. /runtime/space/ui/ \
+    && cp -R .next/static/. /runtime/space/ui/.next/static/ \
+    && if [ -d public ]; then \
+         mkdir -p /runtime/space/ui/public; \
+         cp -R public/. /runtime/space/ui/public/; \
+       fi
+
+FROM public.ecr.aws/docker/library/node:22-bookworm-slim
+
+ENV NEXT_TELEMETRY_DISABLED=1 \
+    PORT=3000 \
+    HOSTNAME=0.0.0.0
+
+WORKDIR /space/ui
+
+LABEL org.opencontainers.image.title="space-ui"
+LABEL org.opencontainers.image.description="Deployable SPACE UI image."
+
+
+COPY --from=builder /runtime/space/ui/ /space/ui/
+
+EXPOSE 3000
+
+USER node

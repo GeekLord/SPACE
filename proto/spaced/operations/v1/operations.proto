@@ -1,0 +1,325 @@
+syntax = "proto3";
+package space.spaced.operations.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+// Canonical data-plane operation payloads forwarded across sandbox routing,
+// spaced-host-svc, and spaced-guest-svc.
+
+message StatRequest {
+  string path = 1;
+  optional string user = 2;
+}
+message StatResponse {
+  FileInfo info = 1;
+}
+
+enum FileType {
+  FILE_TYPE_UNSPECIFIED = 0;
+  FILE_TYPE_FILE = 1;
+  FILE_TYPE_DIRECTORY = 2;
+  FILE_TYPE_SYMLINK = 3;
+  FILE_TYPE_OTHER = 4;
+}
+
+message FileInfo {
+  string path = 1;
+  optional string name = 2;
+  FileType file_type = 3;
+  uint64 size_bytes = 4;
+  uint32 mode = 5;
+  optional google.protobuf.Timestamp modified_at = 6;
+  uint32 owner_uid = 7;
+  uint32 owner_gid = 8;
+  optional string symlink_target = 9;
+  // Hard links to this inode. 1 for an ordinary file; a caller that treats
+  // extra links as a trust boundary needs the real count, not an assumption.
+  // Absent when the guest cannot report it, which is not the same as any
+  // count -- a caller must handle that case rather than infer one.
+  optional uint64 link_count = 10;
+}
+
+message ListRequest {
+  string path = 1;
+  optional uint32 depth = 2;
+  optional string user = 3;
+}
+
+message ReadRequest {
+  string path = 1;
+  uint64 offset = 2;
+  optional uint64 length = 3;
+  optional string user = 4;
+}
+message FileChunk { bytes data = 1; }
+
+message WriteRequest {
+  oneof message {
+    WriteOpen open = 1;
+    bytes data = 2;
+  }
+}
+
+message WriteOpen {
+  string path = 1;
+  bool append = 2;
+  optional string idempotency_key = 3;
+  optional string user = 4;
+}
+message WriteResponse { uint64 bytes_written = 1; }
+
+message WriteBatchEntry {
+  string path = 1;
+  bytes data = 2;
+  bool append = 3;
+}
+message WriteBatchRequest {
+  repeated WriteBatchEntry entries = 1;
+  optional string idempotency_key = 2;
+  optional string user = 3;
+}
+message WriteBatchResponse { uint64 files_written = 1; }
+
+message MkdirRequest {
+  string path = 1;
+  bool parents = 2;
+  bool exist_ok = 3;
+  optional string user = 4;
+}
+message MkdirResponse {}
+
+message RemoveRequest {
+  string path = 1;
+  bool recursive = 2;
+  bool missing_ok = 3;
+  optional string user = 4;
+}
+message RemoveResponse {}
+
+message RenameRequest {
+  string old_path = 1;
+  string new_path = 2;
+  optional string idempotency_key = 3;
+  optional string user = 4;
+}
+message RenameResponse {}
+
+message NormalizeWatchRootRequest {
+  string path = 1;
+  optional string user = 2;
+}
+message NormalizeWatchRootResponse { string root = 1; }
+
+message WatchRequest {
+  string path = 1;
+  bool recursive = 2;
+  bool include_metadata_events = 3;
+  repeated string include_globs = 4;
+  repeated string exclude_globs = 5;
+  optional bool use_default_excludes = 6;
+  optional string user = 7;
+}
+
+enum FileEventKind {
+  FILE_EVENT_KIND_UNSPECIFIED = 0;
+  FILE_EVENT_KIND_CREATED = 1;
+  FILE_EVENT_KIND_MODIFIED = 2;
+  FILE_EVENT_KIND_REMOVED = 3;
+  FILE_EVENT_KIND_RENAMED = 4;
+  FILE_EVENT_KIND_CHMOD = 5;
+}
+
+message FileEvent {
+  string path = 1;
+  FileEventKind kind = 2;
+  optional google.protobuf.Timestamp observed_at = 3;
+}
+
+message CreateWatcherRequest {
+  string root = 1;
+  bool recursive = 2;
+  bool include_metadata_events = 3;
+  repeated string include_globs = 4;
+  repeated string exclude_globs = 5;
+  optional bool use_default_excludes = 6;
+  optional string user = 7;
+}
+message CreateWatcherResponse {
+  string watcher_id = 1;
+  string root = 2;
+}
+
+message GetWatcherEventsRequest { string watcher_id = 1; }
+message GetWatcherEventsResponse { repeated FileEvent events = 1; }
+message RemoveWatcherRequest { string watcher_id = 1; }
+message RemoveWatcherResponse {}
+
+message EnableFileChangesRequest {
+  // Empty selects /home/user and /tmp.
+  // Every selected root must be an accessible directory; setup fails rather
+  // than silently monitoring a subset. Create missing roots before enabling.
+  repeated string roots = 1;
+  repeated string include_globs = 2;
+  repeated string exclude_globs = 3;
+  optional bool use_default_excludes = 4;
+  optional string user = 5;
+}
+message EnableFileChangesResponse {
+  optional google.protobuf.Timestamp observed_since = 1;
+}
+message DisableFileChangesRequest { optional string user = 1; }
+message DisableFileChangesResponse {}
+
+message GetModifiedFilesRequest {
+  optional google.protobuf.Duration window = 1;
+  optional google.protobuf.Timestamp since = 2;
+  optional string cursor = 3;
+  optional string user = 4;
+}
+message ModifiedFile {
+  // Relative to root. Older guests omit root; callers must not infer one.
+  string path = 1;
+  optional google.protobuf.Timestamp last_modified_at = 2;
+  repeated FileEventKind kinds = 3;
+  // Absolute watched root identifying this path. Empty only for older guests.
+  string root = 4;
+}
+message GetModifiedFilesResponse {
+  repeated ModifiedFile files = 1;
+  optional google.protobuf.Timestamp observed_since = 2;
+  optional google.protobuf.Timestamp retained_since = 3;
+  optional string cursor = 4;
+  bool monitoring_enabled = 5;
+  bool overflowed = 6;
+}
+
+message StartRequest {
+  repeated string command = 1;
+  optional string cwd = 2;
+  map<string, string> env = 3;
+  optional string user = 4;
+  optional google.protobuf.Duration timeout = 5;
+  bool background = 6;
+  optional string idempotency_key = 7;
+  optional string tag = 8;
+  bool stdin = 9;
+  optional PtyConfig pty = 10;
+  // Skip sandbox-configured process environment; request env still applies.
+  bool clean_env = 11;
+  // Caller-assigned process identity. When omitted the guest mints one, which
+  // is what the E2B compatibility path does. The native data plane derives this
+  // from the data-plane session id so the control plane can return a usable
+  // process id before the process exists, and so a retried start is refused
+  // rather than executing the command twice.
+  optional string process_id = 12;
+}
+message PtySize {
+  uint32 rows = 1;
+  uint32 cols = 2;
+}
+message PtyConfig {
+  PtySize size = 1;
+}
+message ConnectProcessRequest {
+  string process_id = 1;
+  optional google.protobuf.Duration timeout = 2;
+  // Optional process-output journal cursor. When omitted, ConnectProcess
+  // follows the live tail. Native public data-plane replay sets this to the
+  // number of stdout/stderr events already durably captured so output emitted
+  // while a client was disconnected is replayed from the guest journal.
+  optional uint64 output_cursor = 3;
+}
+message ListProcessesRequest {}
+message ProcessInfo {
+  string process_id = 1;
+  uint32 pid = 2;
+  repeated string command = 3;
+  optional string cwd = 4;
+  map<string, string> env = 5;
+  optional string user = 6;
+  optional string tag = 7;
+  optional bool pty = 8;
+}
+message SendSignalRequest {
+  string process_id = 1;
+  int32 signal = 2;
+}
+message SendSignalResponse {}
+message SendInputRequest {
+  string process_id = 1;
+  // Sensitive process input. Callers must not log or format this field.
+  bytes data = 2;
+}
+message SendInputResponse {}
+// Closes pipe stdin and delivers EOF. PTYs have no half-close: returns
+// FailedPrecondition and leaves terminal input usable.
+message CloseStdinRequest { string process_id = 1; }
+message CloseStdinResponse {}
+message ResizePtyRequest {
+  string process_id = 1;
+  PtySize size = 2;
+}
+message ResizePtyResponse {}
+message KillRequest { string process_id = 1; }
+message KillResponse {}
+
+message ProcessEvent {
+  string process_id = 1;
+  optional uint32 pid = 2;
+  oneof event {
+    ProcessStarted started = 3;
+    ProcessConnected connected = 4;
+    ProcessOutput stdout = 5;
+    ProcessOutput stderr = 6;
+    ProcessExit exit = 7;
+  }
+}
+message ProcessStarted { optional google.protobuf.Timestamp start_time = 1; }
+message ProcessConnected {}
+message ProcessOutput { bytes data = 1; }
+message ProcessExit {
+  oneof outcome {
+    ProcessExited exited = 1;
+    ProcessSignaled signaled = 2;
+    ProcessTimedOut timed_out = 3;
+    ProcessUnknown unknown = 4;
+  }
+}
+message ProcessExited { int32 exit_code = 1; }
+message ProcessSignaled { optional int32 signal = 1; }
+message ProcessTimedOut { optional int32 signal = 1; }
+message ProcessUnknown {}
+
+message OpenLoopbackBridgeRequest {
+  uint32 port = 1;
+  google.protobuf.Duration wait_timeout = 2;
+}
+message OpenLoopbackBridgeResponse {
+  LoopbackBridgeStatus status = 1;
+  string detail = 2;
+  string service_generation = 3;
+}
+message CloseLoopbackBridgeRequest { uint32 port = 1; }
+message CloseLoopbackBridgeResponse {}
+
+enum LoopbackBridgeStatus {
+  LOOPBACK_BRIDGE_STATUS_UNSPECIFIED = 0;
+  LOOPBACK_BRIDGE_STATUS_DIRECT = 1;
+  LOOPBACK_BRIDGE_STATUS_LOOPBACK_FORWARDED = 2;
+  LOOPBACK_BRIDGE_STATUS_WAITING_FOR_LISTENER = 3;
+  LOOPBACK_BRIDGE_STATUS_BIND_CONFLICT = 4;
+  LOOPBACK_BRIDGE_STATUS_FAILED = 5;
+}
+
+enum ResumeReason {
+  RESUME_REASON_UNSPECIFIED = 0;
+  RESUME_REASON_SNAPSHOT_RESTORE = 1;
+  RESUME_REASON_SUSPEND_RESUME = 2;
+}
+
+enum ClockSyncStatus {
+  CLOCK_SYNC_STATUS_UNSPECIFIED = 0;
+  CLOCK_SYNC_STATUS_SYNCED = 1;
+  CLOCK_SYNC_STATUS_FAILED = 2;
+}

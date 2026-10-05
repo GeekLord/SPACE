@@ -1,0 +1,12 @@
+telemetry:
+  # Empty version retains the image tag; explicit experiments use revision-phase.
+  version: ""
+  phase: ""
+  owner: ""
+  cluster: space-local
+  metricsSink: datadog
+  traceExporter: auto
+  otlpMetricsEndpoint: "http://collector.space-metrics.svc.cluster.local:4317"
+  otlpTracesEndpoint: "http://collector.space-traces.svc.cluster.local:4317"
+  otlpProtocol: grpc
+  traceSampler: ""

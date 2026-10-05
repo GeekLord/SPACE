@@ -1,0 +1,20 @@
+# Copy to an operator-owned values file. No UI access by default.
+profile: shared
+auth:
+  anonymous: false
+  existingSecret: "" # Required: an existing Secret holding the admin credentials.
+persistence:
+  enabled: true # Without this, accounts and annotations reset on every restart.
+  storageClassName: null # Required when enabled: a reviewed RWO class, or existingClaim.
+  size: 1Gi
+scheduling:
+  nodeSelector: {}
+  tolerations: []
+networkPolicy:
+  uiPeers: [] # Explicit peers for the UI, for example a reviewed ingress controller.
+  backendEgress: [] # One rule per backend namespace; see the deployment runbook.
+datasources:
+  # Point each at the namespace where you installed that backend.
+  prometheus: {enabled: false, url: ""}
+  loki: {enabled: false, url: ""}
+  tempo: {enabled: false, url: ""}

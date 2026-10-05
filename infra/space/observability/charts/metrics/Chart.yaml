@@ -1,0 +1,9 @@
+apiVersion: v2
+name: space-metrics
+description: Opt-in private SPACE OTLP metrics canary (Collector and Prometheus)
+type: application
+version: 0.2.0
+dependencies:
+  - name: common
+    version: 0.1.0
+    repository: "file://../common"

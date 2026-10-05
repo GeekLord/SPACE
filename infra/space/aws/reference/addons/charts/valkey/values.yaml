@@ -1,0 +1,26 @@
+# Set by addons/valkey.tf. The defaults here are only what a bare
+# `helm template` needs to render.
+
+# Changes whenever a file in this chart does, so the helm provider sees a diff.
+# Unused by the templates.
+chartChecksum: ""
+
+# Required; addons/variables.tf pins it.
+image: ""
+
+# Required; passed with set_sensitive.
+password: ""
+
+nodeSelector: {}
+
+# maxmemory stays under the container's memory limit, so Valkey evicts before
+# the kernel kills it. volatile-lru is ElastiCache's default policy.
+maxmemory: 256mb
+maxmemoryPolicy: volatile-lru
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 384Mi

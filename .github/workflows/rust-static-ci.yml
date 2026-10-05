@@ -1,0 +1,148 @@
+name: Rust Static CI
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  validation:
+    if: github.repository == 'perplexityai/SPACE'
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Rust format
+            command: bash ci/scripts/run-rust-checks.sh fmt
+            runner: ubuntu-24.04
+            rust_cache: false
+            timeout: 15
+          - name: Rust clippy
+            command: bash ci/scripts/run-rust-checks.sh clippy
+            runner: ubuntu-24.04-16core
+            rust_cache: true
+            rust_cache_key: clippy
+            rust_cache_size: 2G
+            rust_cache_refresh_misses: 20
+            timeout: 45
+
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Get the CI image
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: bash ci/scripts/ci-image.sh ensure "space-ci:${GITHUB_SHA}"
+
+      # Keep Clippy's compiler outputs separate from the test graph: the two
+      # modes use different rustc invocations and cannot reliably share keys.
+      # The snapshot lifecycle matches common-ci.yml.
+      - name: Name the Rust compiler cache
+        id: rust-cache-key
+        if: matrix.rust_cache == true
+        env:
+          FAMILY: space-sccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.rust_cache_key }}
+          INPUTS: >-
+            ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', 'ci/Dockerfile.ci',
+            'ci/scripts/run-rust-checks.sh') }}
+        run: |
+          {
+            echo "family=${FAMILY}-"
+            echo "inputs=${FAMILY}-${INPUTS}-"
+            echo "key=${FAMILY}-${INPUTS}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          } >>"${GITHUB_OUTPUT}"
+
+      - name: Restore the Rust compiler cache
+        id: restore-rust-cache
+        if: matrix.rust_cache == true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/space-sccache
+          key: ${{ steps.rust-cache-key.outputs.key }}
+          restore-keys: |
+            ${{ steps.rust-cache-key.outputs.inputs }}
+            ${{ steps.rust-cache-key.outputs.family }}
+
+      - name: Run ${{ matrix.name }}
+        env:
+          SPACE_CI_COMMAND: ${{ matrix.command }}
+          SPACE_CI_RUST_CACHE: ${{ matrix.rust_cache }}
+          SPACE_CI_SCCACHE_DIR: ${{ runner.temp }}/space-sccache
+          SPACE_CI_SCCACHE_RUN_DIR: ${{ runner.temp }}/space-sccache-run
+          SPACE_CI_SCCACHE_SIZE: ${{ matrix.rust_cache_size }}
+        run: |
+          set -euo pipefail
+
+          docker_args=(
+            --rm
+            --volume "${GITHUB_WORKSPACE}:/workspace"
+            --workdir /workspace
+            --env CI=true
+            --env CARGO_INCREMENTAL=0
+            --env GITHUB_ACTIONS=true
+            --env SPACE_CI_COMMAND
+          )
+
+          if [[ "${SPACE_CI_RUST_CACHE}" == true ]]; then
+            mkdir -p "${SPACE_CI_SCCACHE_DIR}" "${SPACE_CI_SCCACHE_RUN_DIR}"
+            touch "${SPACE_CI_SCCACHE_RUN_DIR}/started"
+            docker_args+=(
+              --volume "${SPACE_CI_SCCACHE_DIR}:/sccache"
+              --volume "${SPACE_CI_SCCACHE_RUN_DIR}:/sccache-run"
+              --env RUSTC_WRAPPER=sccache
+              --env SCCACHE_CACHE_SIZE="${SPACE_CI_SCCACHE_SIZE}"
+              --env SCCACHE_DIR=/sccache
+              --env SPACE_CI_SCCACHE_STATS=/sccache-run/stats.json
+            )
+          fi
+
+          docker run "${docker_args[@]}" "space-ci:${GITHUB_SHA}" \
+            bash -c 'git config --global --add safe.directory /workspace && exec bash -c "$SPACE_CI_COMMAND"'
+
+      - name: Decide whether to refresh the Rust compiler cache
+        id: refresh-rust-cache
+        if: success() && matrix.rust_cache == true
+        env:
+          KEY: ${{ steps.rust-cache-key.outputs.key }}
+          INPUTS_PREFIX: ${{ steps.rust-cache-key.outputs.inputs }}
+          RESTORED_KEY: ${{ steps.restore-rust-cache.outputs.cache-matched-key }}
+          REFRESH_MISSES: ${{ matrix.rust_cache_refresh_misses }}
+          STATS: ${{ runner.temp }}/space-sccache-run/stats.json
+        run: >-
+          python3 ci/scripts/sccache-snapshot.py decide --key "${KEY}" --inputs-prefix "${INPUTS_PREFIX}"
+          --restored-key "${RESTORED_KEY}" --refresh-misses "${REFRESH_MISSES}" --stats "${STATS}"
+
+      - name: Prepare the Rust compiler cache for upload
+        if: >-
+          github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+          steps.refresh-rust-cache.outputs.save == 'true'
+        env:
+          SPACE_CI_SCCACHE_DIR: ${{ runner.temp }}/space-sccache
+          SPACE_CI_SCCACHE_RUN_DIR: ${{ runner.temp }}/space-sccache-run
+          TRIM: ${{ steps.refresh-rust-cache.outputs.trim }}
+        run: |
+          set -euo pipefail
+          sudo chown -R "$(id -u):$(id -g)" "${SPACE_CI_SCCACHE_DIR}"
+          if [[ "${TRIM}" == true ]]; then
+            unused="$(find "${SPACE_CI_SCCACHE_DIR}" -type f ! -newer "${SPACE_CI_SCCACHE_RUN_DIR}/started" -print -delete | wc -l)"
+            echo "Deleted ${unused} entries this run did not use."
+          fi
+          du -sh "${SPACE_CI_SCCACHE_DIR}"
+
+      - name: Save the Rust compiler cache
+        if: >-
+          github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+          steps.refresh-rust-cache.outputs.save == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/space-sccache
+          key: ${{ steps.rust-cache-key.outputs.key }}

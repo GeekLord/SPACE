@@ -1,0 +1,563 @@
+use pplx_space_common_core::types::{OrgId, SandboxOwnerSource, UserId};
+
+use axum::{
+    Extension, Json,
+    extract::{Path, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
+use pplx_space_common_core::{
+    sql,
+    types::{KekProvider, platform_default_kek_provider},
+};
+use uuid::Uuid;
+
+use super::super::authz;
+use super::support;
+use crate::{
+    auth::hash_password,
+    middleware::auth::AuthUser,
+    models::{
+        AdminUserResponse, Cluster, CreateOrgRequest, CreateUserRequest, OrgMasterKey,
+        Organization, UpdateClusterRequest, UpdateOrgRequest, UpdateUserRequest,
+        UpdateUserRoleRequest, User,
+    },
+    routes::AppState,
+    user_role::UserRole,
+};
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum IdentityAdminError {
+    #[error("not authorized")]
+    Forbidden,
+    #[error("resource not found")]
+    NotFound,
+    #[error("cannot modify your own role or delete yourself")]
+    SelfMutation,
+    #[error("{0}")]
+    InvalidRequest(&'static str),
+    #[error("internal server error")]
+    Internal(#[source] sqlx::Error),
+    #[error("internal server error")]
+    Password(#[from] bcrypt::BcryptError),
+    /// A statement lost a race for a lock. `status` and `message` come from
+    /// [`support::contention_disposition`] so this surface answers exactly as
+    /// the handlers that return `support::db_error` do — 503 for `55P03`, 409
+    /// for a serialization failure or deadlock.
+    ///
+    /// Every statement here can reach it, not only `set_org_master_key`'s
+    /// explicit `SELECT ... FOR UPDATE` on `organizations`: the password and
+    /// role writes take row locks, and a plain admin `SELECT` blocks behind
+    /// DDL on the table it reads.
+    #[error("{message}")]
+    Contended {
+        status: StatusCode,
+        message: &'static str,
+    },
+}
+
+/// Classify rather than derive `#[from]`: the derive would send every SQLSTATE
+/// to `Internal`, and a lost lock race is not an internal failure.
+impl From<sqlx::Error> for IdentityAdminError {
+    fn from(error: sqlx::Error) -> Self {
+        // `ReadOnly` even though most of this surface writes. This is a blanket
+        // conversion covering both the master-key write (which takes a
+        // `SELECT ... FOR UPDATE` on `organizations`) and plain admin reads, so
+        // one scope has to answer for both. `Writing` would tell a read that
+        // its own write raced another admin write, which is a false statement
+        // to the caller; `ReadOnly` only withholds the write-specific 409 and
+        // answers every contention SQLSTATE with the retryable 503. Both are
+        // retryable, so the cost of under-claiming is a less specific status,
+        // not a wrong disposition — and that is the direction to err in.
+        match support::contention_disposition(support::ContentionScope::ReadOnly, &error) {
+            Some((status, message)) => Self::Contended { status, message },
+            None => Self::Internal(error),
+        }
+    }
+}
+
+impl IdentityAdminError {
+    const fn status(&self) -> StatusCode {
+        match self {
+            Self::Forbidden => StatusCode::FORBIDDEN,
+            Self::NotFound => StatusCode::NOT_FOUND,
+            Self::SelfMutation => StatusCode::CONFLICT,
+            Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Internal(_) | Self::Password(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Contended { status, .. } => *status,
+        }
+    }
+}
+
+impl IntoResponse for IdentityAdminError {
+    fn into_response(self) -> Response {
+        let status = self.status();
+        (
+            status,
+            Json(serde_json::json!({ "error": self.to_string() })),
+        )
+            .into_response()
+    }
+}
+
+pub(super) async fn list_orgs(
+    State(state): State<AppState>,
+    Extension(AuthUser(actor)): Extension<AuthUser>,
+) -> Result<Json<Vec<Organization>>, IdentityAdminError> {
+    if is_managing_org_admin(&state, &actor).await? {
+        return Ok(Json(
+            sqlx::query_as::<_, Organization>(sql!(
+                "SELECT * FROM organizations ORDER BY name, id"
+            ))
+            .fetch_all(&state.pool)
+            .await?,
+        ));
+    }
+
+    Ok(Json(
+        sqlx::query_as::<_, Organization>(sql!("SELECT * FROM organizations WHERE id = $1"))
+            .bind(actor.org_id)
+            .fetch_all(&state.pool)
+            .await?,
+    ))
+}
+
+pub(super) async fn create_org(
+    State(state): State<AppState>,
+    Extension(AuthUser(actor)): Extension<AuthUser>,
+    Json(request): Json<CreateOrgRequest>,
+) -> Result<(StatusCode, Json<Organization>), IdentityAdminError> {
+    require_managing_org_admin(&state, &actor).await?;
+    let org = sqlx::query_as::<_, Organization>(sql!(
+        "INSERT INTO organizations (
+             id, name, slug, parent_id, theme_primary, theme_secondary, logo_url
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING *"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(request.name)
+    .bind(request.slug)
+    .bind(request.parent_id)
+    .bind(request.theme_primary)
+    .bind(request.theme_secondary)
+    .bind(request.logo_url)
+    .fetch_one(&state.pool)
+    .await?;
+
+    Ok((StatusCode::CREATED, Json(org)))
+}
+
+pub(super) async fn get_org(
+    State(state): State<AppState>,
+    Extension(AuthUser(actor)): Extension<AuthUser>,
+    Path(org_id): Path<OrgId>,
+) -> Result<Json<Organization>, IdentityAdminError> {
+    require_org_visible(&state, &actor, org_id).await?;
+    let org = sqlx::query_as::<_, Organization>(sql!("SELECT * FROM organizations WHERE id = $1"))
+        .bind(org_id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(IdentityAdminError::NotFound)?;
+    Ok(Json(org))
+}
+
+pub(super) async fn update_org(
+    State(state): State<AppState>,
+    Extension(AuthUser(actor)): Extension<AuthUser>,
+    Path(org_id): Path<OrgId>,
+    Json(request): Json<UpdateOrgRequest>,
+) -> Result<Json<Organization>, IdentityAdminError> {
+    require_org_admin(&state, &actor, org_id).await?;
+    let (theme_primary_present, theme_primary) = nullable_patch_bind(request.theme_primary);
+    let (theme_secondary_present, theme_secondary) = nullable_patch_bind(request.theme_secondary);
+    let (logo_url_present, logo_url) = nullable_patch_bind(request.logo_url);
+    let (snapshot_base_object_storage_uri_present, snapshot_base_object_storage_uri) =
+        nullable_patch_bind(request.snapshot_base_object_storage_uri);
+
+    // The KEK existence check reads the credential-fenced org_master_keys
+    // table, so it runs on the credentials lane ahead of the org-update
+    // transaction rather than inside it. Key provisioning is owned by the
+    // credential authority; this API only checks whether an active key uses a
+    // supported authority provider or the configured backend can provision
+    // one lazily.
+    if request.byok_enabled == Some(true) {
+        ensure_byok_enable_allowed(
+            active_kek_provider(&state.credentials_pool, org_id).await?,
+            platform_default_kek_provider(),
+        )?;
+    }
+    let mut tx = state.pool.begin().await?;
+    let org = sqlx::query_as::<_, Organization>(sql!(
+        "UPDATE organizations
+         SET name = COALESCE($2, name),
+             slug = COALESCE($3, slug),
+             theme_primary = CASE WHEN $4 THEN $5 ELSE theme_primary END,
+             theme_secondary = CASE WHEN $6 THEN $7 ELSE theme_secondary END,
+             logo_url = CASE WHEN $8 THEN $9 ELSE logo_url END,
+             snapshot_base_object_storage_uri =
+                 CASE WHEN $10 THEN $11 ELSE snapshot_base_object_storage_uri END,
+             byok_enabled = COALESCE($12, byok_enabled),
+             updated_at = NOW()
+         WHERE id = $1
+         RETURNING *"
+    ))
+    .bind(org_id)
+    .bind(request.name)
+    .bind(request.slug)
+    .bind(theme_primary_present)
+    .bind(theme_primary)
+    .bind(theme_secondary_present)
+    .bind(theme_secondary)
+    .bind(logo_url_present)
+    .bind(logo_url)
+    .bind(snapshot_base_object_storage_uri_present)
+    .bind(snapshot_base_object_storage_uri)
+    .bind(request.byok_enabled)
+    .fetch_optional(tx.as_mut())
+    .await?
+    .ok_or(IdentityAdminError::NotFound)?;
+    tx.commit().await?;
+    Ok(Json(org))
+}
+
+/// BYOK may only be switched on for an org that can obtain an active master
+/// key: the flag stamps `volume_encryption` on new sandboxes at create, and
+/// credmgr refuses to mint volume DEKs without an active KEK — a keyless org
+/// toggled on would create encrypted sandboxes that can never start.
+///
+/// An org already holding an active KEK is allowed only when the credential
+/// authority supports that provider. In particular, a historical AWS KMS row
+/// cannot enable BYOK after that backend has been removed: the row prevents
+/// lazy provisioning and would fail when the first volume DEK is issued. A
+/// keyless org is allowed only when the platform default provisions its KEK
+/// lazily on first use (intermediate-key-broker, minted by the credmgr authority
+/// on the org's first Encrypt / sandbox volume DEK).
+fn ensure_byok_enable_allowed(
+    active_kek_provider: Option<KekProvider>,
+    platform_default_kek_provider: Option<KekProvider>,
+) -> Result<(), IdentityAdminError> {
+    match active_kek_provider {
+        Some(KekProvider::InMemory | KekProvider::IntermediateKeyBroker) => Ok(()),
+        Some(KekProvider::AwsKms) => Err(IdentityAdminError::InvalidRequest(
+            "cannot enable BYOK: the organization's active master key provider is not supported \
+             by the credential authority",
+        )),
+        None if platform_default_kek_provider.is_some_and(KekProvider::provisions_lazily) => Ok(()),
+        None => Err(IdentityAdminError::InvalidRequest(
+            "cannot enable BYOK: the organization has no active master key and \
+             the platform has no lazy key provider",
+        )),
+    }
+}
+
+async fn active_kek_provider(
+    credentials_pool: &pplx_space_common_svc::sql::CredentialsPool,
+    org_id: OrgId,
+) -> Result<Option<KekProvider>, IdentityAdminError> {
+    let provider: Option<String> = sqlx::query_scalar(sql!(
+        "SELECT provider FROM org_master_keys WHERE org_id = $1 AND retired_at IS NULL"
+    ))
+    .bind(org_id)
+    .fetch_optional(credentials_pool.pool())
+    .await?;
+    parse_active_kek_provider(provider)
+}
+
+fn parse_active_kek_provider(
+    provider: Option<String>,
+) -> Result<Option<KekProvider>, IdentityAdminError> {
+    provider
+        .map(|provider| {
+            KekProvider::parse(&provider).map_err(|_| {
+                IdentityAdminError::InvalidRequest(
+                    "cannot enable BYOK: the organization's active master key provider is not \
+                     supported by the credential authority",
+                )
+            })
+        })
+        .transpose()
+}
+
+/// Active (non-retired) master key for the org, or `null` when the org
+/// has none yet (the credential seal path lazily mints one from the
+/// platform-default env config on first use).
+pub(super) async fn get_org_master_key(
+    State(state): State<AppState>,
+    Extension(AuthUser(actor)): Extension<AuthUser>,
+    Path(org_id): Path<OrgId>,
+) -> Result<Json<Option<OrgMasterKey>>, IdentityAdminError> {
+    require_org_visible(&state, &actor, org_id).await?;
+    require_org_exists(&state, org_id).await?;
+    let key = sqlx::query_as::<_, OrgMasterKey>(sql!(
+        "SELECT * FROM org_master_keys WHERE org_id = $1 AND retired_at IS NULL"
+    ))
+    .bind(org_id)
+    .fetch_optional(state.credentials_pool.pool())
+    .await?;
+    Ok(Json(key))
+}
+
+pub(super) async fn delete_org(
+    State(state): State<AppState>,
+    Extension(AuthUser(actor)): Extension<AuthUser>,
+    Path(org_id): Path<OrgId>,
+) -> Result<StatusCode, IdentityAdminError> {
+    require_managing_org_admin(&state, &actor).await?;
+    let cluster = fetch_cluster(&state).await?;
+    if org_id == cluster.managing_org_id {
+        return Err(IdentityAdminError::Forbidden);
+    }
+    let result = sqlx::query(sql!("DELETE FROM organizations WHERE id = $1"))
+        .bind(org_id)
+        .execute(&state.pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(IdentityAdminError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub(super) async fn list_users_for_org(
+    State(state): State<AppState>,
+    Extension(AuthUser(actor)): Extension<AuthUser>,
+    Path(org_id): Path<OrgId>,
+) -> Result<Json<Vec<AdminUserResponse>>, IdentityAdminError> {
+    require_org_visible(&state, &actor, org_id).await?;
+    let users = sqlx::query_as::<_, User>(sql!(
+        "SELECT * FROM users WHERE org_id = $1 ORDER BY email ASC, id ASC"
+    ))
+    .bind(org_id)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(users.into_iter().map(Into::into).collect()))
+}
+
+pub(super) async fn create_user_for_org(
+    State(state): State<AppState>,
+    Extension(AuthUser(actor)): Extension<AuthUser>,
+    Path(org_id): Path<OrgId>,
+    Json(request): Json<CreateUserRequest>,
+) -> Result<(StatusCode, Json<AdminUserResponse>), IdentityAdminError> {
+    if !authz::can_create_user_with_role(&state.pool, &actor, org_id, request.role).await? {
+        return Err(IdentityAdminError::Forbidden);
+    }
+    let user = sqlx::query_as::<_, User>(sql!(
+        "INSERT INTO users (id, email, password_hash, display_name, org_id, role)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING *"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(request.email)
+    .bind(hash_password(&request.password)?)
+    .bind(request.display_name)
+    .bind(org_id)
+    .bind(request.role)
+    .fetch_one(&state.pool)
+    .await?;
+
+    Ok((StatusCode::CREATED, Json(user.into())))
+}
+
+pub(super) async fn get_user(
+    State(state): State<AppState>,
+    Extension(AuthUser(actor)): Extension<AuthUser>,
+    Path(user_id): Path<UserId>,
+) -> Result<Json<AdminUserResponse>, IdentityAdminError> {
+    let user = fetch_user(&state, user_id).await?;
+    require_org_visible(&state, &actor, user.org_id).await?;
+    Ok(Json(user.into()))
+}
+
+pub(super) async fn update_user(
+    State(state): State<AppState>,
+    Extension(AuthUser(actor)): Extension<AuthUser>,
+    Path(user_id): Path<UserId>,
+    Json(request): Json<UpdateUserRequest>,
+) -> Result<Json<AdminUserResponse>, IdentityAdminError> {
+    let target = fetch_user(&state, user_id).await?;
+    if !authz::can_update_user_profile(&state.pool, &actor, &target).await? {
+        return Err(IdentityAdminError::Forbidden);
+    }
+    if request.password.is_some() && target.owner_source == SandboxOwnerSource::FederatedIdentity {
+        return Err(IdentityAdminError::InvalidRequest(
+            "federated users cannot have local passwords",
+        ));
+    }
+    let password_changed = request.password.is_some();
+    let password_hash = match request.password {
+        Some(password) => Some(hash_password(&password)?),
+        None => None,
+    };
+    let mut tx = state.pool.begin().await?;
+    let user = sqlx::query_as::<_, User>(sql!(
+        "UPDATE users
+         SET email = COALESCE($2, email),
+             password_hash = COALESCE($3, password_hash),
+             display_name = COALESCE($4, display_name),
+             updated_at = NOW()
+         WHERE id = $1
+         RETURNING *"
+    ))
+    .bind(user_id)
+    .bind(request.email)
+    .bind(password_hash)
+    .bind(request.display_name)
+    .fetch_optional(tx.as_mut())
+    .await?
+    .ok_or(IdentityAdminError::NotFound)?;
+    if password_changed {
+        sqlx::query(sql!("DELETE FROM sessions WHERE user_id = $1"))
+            .bind(user_id)
+            .execute(tx.as_mut())
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(Json(user.into()))
+}
+
+pub(super) async fn update_user_role(
+    State(state): State<AppState>,
+    Extension(AuthUser(actor)): Extension<AuthUser>,
+    Path(user_id): Path<UserId>,
+    Json(request): Json<UpdateUserRoleRequest>,
+) -> Result<Json<AdminUserResponse>, IdentityAdminError> {
+    if user_id == actor.id {
+        return Err(IdentityAdminError::SelfMutation);
+    }
+    let target = fetch_user(&state, user_id).await?;
+    if !authz::can_update_user_role(&state.pool, &actor, &target, request.role).await? {
+        return Err(IdentityAdminError::Forbidden);
+    }
+    let user = sqlx::query_as::<_, User>(sql!(
+        "UPDATE users SET role = $2, updated_at = NOW() WHERE id = $1 RETURNING *"
+    ))
+    .bind(user_id)
+    .bind(request.role)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(IdentityAdminError::NotFound)?;
+    Ok(Json(user.into()))
+}
+
+pub(super) async fn delete_user(
+    State(state): State<AppState>,
+    Extension(AuthUser(actor)): Extension<AuthUser>,
+    Path(user_id): Path<UserId>,
+) -> Result<StatusCode, IdentityAdminError> {
+    if user_id == actor.id {
+        return Err(IdentityAdminError::SelfMutation);
+    }
+    let target = fetch_user(&state, user_id).await?;
+    require_org_admin(&state, &actor, target.org_id).await?;
+    let result = sqlx::query(sql!("DELETE FROM users WHERE id = $1"))
+        .bind(user_id)
+        .execute(&state.pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(IdentityAdminError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub(super) async fn get_cluster(
+    State(state): State<AppState>,
+) -> Result<Json<Cluster>, IdentityAdminError> {
+    Ok(Json(fetch_cluster(&state).await?))
+}
+
+pub(super) async fn update_cluster(
+    State(state): State<AppState>,
+    Extension(AuthUser(actor)): Extension<AuthUser>,
+    Json(request): Json<UpdateClusterRequest>,
+) -> Result<Json<Cluster>, IdentityAdminError> {
+    require_managing_org_admin(&state, &actor).await?;
+    let cluster = sqlx::query_as::<_, Cluster>(sql!(
+        "UPDATE clusters
+         SET managing_org_id = $1, updated_at = NOW()
+         WHERE singleton
+         RETURNING *"
+    ))
+    .bind(request.managing_org_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(IdentityAdminError::NotFound)?;
+    Ok(Json(cluster))
+}
+
+async fn fetch_user(state: &AppState, user_id: UserId) -> Result<User, IdentityAdminError> {
+    sqlx::query_as::<_, User>(sql!("SELECT * FROM users WHERE id = $1"))
+        .bind(user_id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(IdentityAdminError::NotFound)
+}
+
+async fn require_org_exists(state: &AppState, org_id: OrgId) -> Result<(), IdentityAdminError> {
+    let exists: bool = sqlx::query_scalar(sql!(
+        "SELECT EXISTS (SELECT 1 FROM organizations WHERE id = $1)"
+    ))
+    .bind(org_id)
+    .fetch_one(&state.pool)
+    .await?;
+    if exists {
+        return Ok(());
+    }
+    Err(IdentityAdminError::NotFound)
+}
+
+async fn fetch_cluster(state: &AppState) -> Result<Cluster, IdentityAdminError> {
+    sqlx::query_as::<_, Cluster>(sql!("SELECT * FROM clusters WHERE singleton"))
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(IdentityAdminError::NotFound)
+}
+
+async fn require_org_visible(
+    state: &AppState,
+    actor: &User,
+    org_id: OrgId,
+) -> Result<(), IdentityAdminError> {
+    if actor.org_id == org_id || is_managing_org_admin(state, actor).await? {
+        return Ok(());
+    }
+    Err(IdentityAdminError::Forbidden)
+}
+
+async fn require_org_admin(
+    state: &AppState,
+    actor: &User,
+    org_id: OrgId,
+) -> Result<(), IdentityAdminError> {
+    if actor.role == UserRole::OrganizationAdmin
+        && (actor.org_id == org_id || is_managing_org_admin(state, actor).await?)
+    {
+        return Ok(());
+    }
+    Err(IdentityAdminError::Forbidden)
+}
+
+async fn require_managing_org_admin(
+    state: &AppState,
+    actor: &User,
+) -> Result<(), IdentityAdminError> {
+    if is_managing_org_admin(state, actor).await? {
+        return Ok(());
+    }
+    Err(IdentityAdminError::Forbidden)
+}
+
+async fn is_managing_org_admin(state: &AppState, actor: &User) -> Result<bool, IdentityAdminError> {
+    Ok(authz::is_managing_org_admin(&state.pool, actor).await?)
+}
+
+fn nullable_patch_bind<T>(patch: Option<crate::models::NullablePatch<T>>) -> (bool, Option<T>) {
+    match patch {
+        Some(crate::models::NullablePatch::Set(value)) => (true, Some(value)),
+        Some(crate::models::NullablePatch::Clear) => (true, None),
+        None => (false, None),
+    }
+}
+
+#[cfg(test)]
+mod tests;

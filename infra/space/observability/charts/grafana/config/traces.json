@@ -1,0 +1,119 @@
+{
+  "uid": "space-traces",
+  "title": "SPACE: Traces",
+  "schemaVersion": 39,
+  "version": 1,
+  "tags": [
+    "space",
+    "kind"
+  ],
+  "timezone": "browser",
+  "editable": false,
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "links": [
+    {
+      "title": "Metrics",
+      "type": "link",
+      "url": "/d/space-main-health",
+      "keepTime": true
+    },
+    {
+      "title": "Logs",
+      "type": "link",
+      "url": "/d/space-main-health-logs",
+      "keepTime": true
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "service",
+        "label": "Service regex",
+        "type": "textbox",
+        "query": ".*",
+        "current": {
+          "text": ".*",
+          "value": ".*"
+        },
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "How to inspect traces",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 4
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Search covers the selected time range. Tempo excludes the newest 30 seconds; allow a refresh after traffic. Click a Trace ID to open the detail dashboard (anonymous Viewer works; no Explore login required). This is stored-trace inspection, not Datadog APM metric parity. Metrics, logs, sampling, and application tracing defaults are unchanged."
+      }
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Stored traces",
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 24,
+        "h": 10
+      },
+      "datasource": {
+        "type": "tempo",
+        "uid": "space-tempo"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "tempo",
+            "uid": "space-tempo"
+          },
+          "queryType": "traceql",
+          "query": "{resource.service.name =~ \"${service:raw}\"}",
+          "limit": 50,
+          "tableType": "traces",
+          "filters": []
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "traceID"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "View trace in this dashboard",
+                    "url": "/d/space-trace-detail?${__url_time_range}&var-traceId=${__value.raw}",
+                    "targetBlank": false
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

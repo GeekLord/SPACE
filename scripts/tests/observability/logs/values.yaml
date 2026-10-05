@@ -1,0 +1,8 @@
+# Apply after the Kind deployment profile only while running these checks.
+validationEcho: true
+collection:
+  podTargets:
+    - {path: "/var/log/pods/space_*/*/*.log", namespace: space}
+    - {path: "/var/log/pods/space-logs_logs-fixture-*/*/*.log", namespace: space-logs}
+  journal:
+    keepRegex: "(space-.*\\.service|containerd\\.service);.*|.*;space-oss-log-fixture"

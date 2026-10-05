@@ -1,0 +1,322 @@
+use std::time::Duration;
+
+use tonic::metadata::{MetadataMap, MetadataValue};
+use tonic::{Code, Status};
+
+pub const RETRY_AFTER_MS_METADATA: &str = "x-space-retry-after-ms";
+/// Metadata key marking a `Status` as a *terminal* sandbox desired-state apply
+/// precondition: the node cannot make the desired state converge by retrying
+/// while cluster state is unchanged — the guest is unreachable because the
+/// sandbox is in a non-thawing state, or the auto-lifecycle target state is
+/// stuck (`Failed`/`CleanupRequired`/`CleanupFailed`/`Quarantined`). The reconcile-queue ref
+/// should complete until a lifecycle or cluster repair changes the state.
+/// Absence means the failure is transient — a still-initializing guest (`guest_not_ready`),
+/// a mid-transition lifecycle state (`Starting`/`Resuming`/`Suspending`) — and
+/// the queue should re-drive it. The tonic `Code` alone can't carry this
+/// because sbx-manager answers `FailedPrecondition` for both cases.
+pub const DESIRED_STATE_APPLY_TERMINAL_METADATA: &str = "space-desired-state-apply-terminal";
+const DESIRED_STATE_APPLY_TERMINAL: &str = "1";
+const SANDBOX_SERVICE_ROUTE_ERROR_METADATA: &str = "space-route-error";
+const SANDBOX_SERVICE_ROUTE_NOT_READY: &str = "sandbox_service_route_not_ready";
+const NODE_API_ERROR_METADATA: &str = "space-node-api-error";
+const UDS_PER_SANDBOX_LIMIT_EXCEEDED: &str = "uds_per_sandbox_limit_exceeded";
+const GUEST_CAPABILITY_ERROR_METADATA: &str = "space-guest-capability-error";
+const GUEST_CAPABILITY_UNSUPPORTED: &str = "guest_capability_unsupported";
+const GUEST_CAPABILITY_METADATA: &str = "space-guest-capability";
+
+/// A guest application listener refused TCP establishment. This is not a
+/// platform transport failure and must not invalidate runtime routing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuestServiceUnavailable;
+
+const GUEST_SERVICE_ERROR_METADATA: &str = "space-guest-service-error";
+const GUEST_CONNECTION_REFUSED: &str = "connection_refused";
+
+impl GuestServiceUnavailable {
+    pub fn from_status(status: &Status) -> Option<Self> {
+        (status.code() == Code::FailedPrecondition
+            && status
+                .metadata()
+                .get(GUEST_SERVICE_ERROR_METADATA)
+                .and_then(|value| value.to_str().ok())
+                == Some(GUEST_CONNECTION_REFUSED))
+        .then_some(Self)
+    }
+
+    pub fn into_status(self) -> Status {
+        let mut status = Status::failed_precondition("Sandbox service is not reachable");
+        status.metadata_mut().insert(
+            GUEST_SERVICE_ERROR_METADATA,
+            MetadataValue::from_static(GUEST_CONNECTION_REFUSED),
+        );
+        status
+    }
+}
+
+/// Classify only errors from a TCP connect to an authenticated guest endpoint.
+/// Internal RPC socket errors must never pass through this boundary.
+pub fn guest_service_connect_status(error: &std::io::Error) -> Status {
+    if error.kind() == std::io::ErrorKind::ConnectionRefused {
+        GuestServiceUnavailable.into_status()
+    } else {
+        Status::unavailable(format!("service port ingress connect failed: {error}"))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuestCapability {
+    InteractiveProcessControl,
+}
+
+impl GuestCapability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InteractiveProcessControl => "interactive_process_control",
+        }
+    }
+}
+
+impl std::fmt::Display for GuestCapability {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for GuestCapability {
+    type Err = GuestCapabilityParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(match value {
+            "interactive_process_control" => Self::InteractiveProcessControl,
+            _ => {
+                return Err(GuestCapabilityParseError {
+                    value: value.to_owned(),
+                });
+            }
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+#[error("unsupported guest capability {value:?}")]
+pub struct GuestCapabilityParseError {
+    value: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuestCapabilityUnsupported {
+    pub capability: GuestCapability,
+}
+
+impl GuestCapabilityUnsupported {
+    pub fn from_metadata(metadata: &MetadataMap) -> Option<Self> {
+        guest_capability_unsupported_from_metadata(metadata)
+    }
+
+    pub fn from_status(status: &Status) -> Option<Self> {
+        if status.code() != Code::FailedPrecondition {
+            return None;
+        }
+        Self::from_metadata(status.metadata())
+    }
+}
+
+pub fn guest_capability_unsupported_status(
+    capability: GuestCapability,
+    message: impl Into<String>,
+) -> Status {
+    let mut status = Status::failed_precondition(message.into());
+    status.metadata_mut().insert(
+        GUEST_CAPABILITY_ERROR_METADATA,
+        MetadataValue::from_static(GUEST_CAPABILITY_UNSUPPORTED),
+    );
+    status.metadata_mut().insert(
+        GUEST_CAPABILITY_METADATA,
+        MetadataValue::from_static(capability.as_str()),
+    );
+    status
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RateLimited {
+    pub try_again: Option<Duration>,
+}
+
+impl RateLimited {
+    pub fn from_status(status: &Status) -> Option<Self> {
+        if status.code() != Code::ResourceExhausted {
+            return None;
+        }
+        Some(Self {
+            try_again: retry_after_from_metadata(status.metadata())
+                .or_else(|| retry_after_from_message(status.message())),
+        })
+    }
+}
+
+pub fn rate_limited_status(message: impl Into<String>, try_again: Option<Duration>) -> Status {
+    let status = Status::resource_exhausted(message.into());
+    match try_again {
+        Some(try_again) => with_retry_after(status, try_again),
+        None => status,
+    }
+}
+
+/// Attach a retry hint to any `Status` via [`RETRY_AFTER_MS_METADATA`]. The
+/// refusing server knows when its precondition will next be satisfiable
+/// (for example the end of a quiescence window); a reconciling client that
+/// reads it with [`retry_after`] can back the item off exactly that long
+/// instead of applying its flat defer back-off to every refusal.
+pub fn with_retry_after(mut status: Status, try_again: Duration) -> Status {
+    if let Ok(value) = MetadataValue::try_from(try_again.as_millis().to_string()) {
+        status.metadata_mut().insert(RETRY_AFTER_MS_METADATA, value);
+    }
+    status
+}
+
+/// The retry hint carried by [`RETRY_AFTER_MS_METADATA`], if the server set
+/// one (see [`with_retry_after`]). Metadata only: the message-text fallback
+/// exists solely for the rate-limit status.
+pub fn retry_after(status: &Status) -> Option<Duration> {
+    retry_after_from_metadata(status.metadata())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SandboxServiceRouteNotReady;
+
+impl SandboxServiceRouteNotReady {
+    pub fn from_metadata(metadata: &MetadataMap) -> Option<Self> {
+        sandbox_service_route_not_ready_from_metadata(metadata).then_some(Self)
+    }
+
+    pub fn from_status(status: &Status) -> Option<Self> {
+        if !matches!(
+            status.code(),
+            Code::FailedPrecondition | Code::Unavailable | Code::DeadlineExceeded
+        ) {
+            return None;
+        }
+        (Self::from_metadata(status.metadata()).is_some()
+            || sandbox_service_route_not_ready_from_message(status.message()))
+        .then_some(Self)
+    }
+}
+
+pub fn sandbox_service_route_not_ready_status(code: Code, message: impl Into<String>) -> Status {
+    let mut status = Status::new(code, message.into());
+    status.metadata_mut().insert(
+        SANDBOX_SERVICE_ROUTE_ERROR_METADATA,
+        MetadataValue::from_static(SANDBOX_SERVICE_ROUTE_NOT_READY),
+    );
+    status
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UdsPerSandboxLimitExceeded;
+
+impl UdsPerSandboxLimitExceeded {
+    pub fn from_metadata(metadata: &MetadataMap) -> Option<Self> {
+        uds_per_sandbox_limit_exceeded_from_metadata(metadata).then_some(Self)
+    }
+
+    pub fn from_status(status: &Status) -> Option<Self> {
+        if status.code() != Code::ResourceExhausted {
+            return None;
+        }
+        Self::from_metadata(status.metadata())
+    }
+}
+
+pub fn uds_per_sandbox_limit_exceeded_status(message: impl Into<String>) -> Status {
+    let mut status = Status::resource_exhausted(message.into());
+    status.metadata_mut().insert(
+        NODE_API_ERROR_METADATA,
+        MetadataValue::from_static(UDS_PER_SANDBOX_LIMIT_EXCEEDED),
+    );
+    status
+}
+
+/// Tag `status` as a terminal sandbox desired-state apply precondition (see
+/// [`DESIRED_STATE_APPLY_TERMINAL_METADATA`]). The caller passes the
+/// already-built precondition `Status`; the marker rides the trailing metadata
+/// to the reconciling client, which classifies it with
+/// [`is_desired_state_apply_terminal`].
+pub fn mark_desired_state_apply_terminal(mut status: Status) -> Status {
+    status.metadata_mut().insert(
+        DESIRED_STATE_APPLY_TERMINAL_METADATA,
+        MetadataValue::from_static(DESIRED_STATE_APPLY_TERMINAL),
+    );
+    status
+}
+
+/// Whether `status` carries the terminal desired-state apply marker set by
+/// [`mark_desired_state_apply_terminal`].
+pub fn is_desired_state_apply_terminal(status: &Status) -> bool {
+    status
+        .metadata()
+        .get(DESIRED_STATE_APPLY_TERMINAL_METADATA)
+        .and_then(|value| value.to_str().ok())
+        == Some(DESIRED_STATE_APPLY_TERMINAL)
+}
+
+fn retry_after_from_metadata(metadata: &MetadataMap) -> Option<Duration> {
+    let millis = metadata
+        .get(RETRY_AFTER_MS_METADATA)?
+        .to_str()
+        .ok()?
+        .parse::<u64>()
+        .ok()?;
+    Some(Duration::from_millis(millis))
+}
+
+fn retry_after_from_message(message: &str) -> Option<Duration> {
+    let marker = "retry_after_ms=";
+    let start = message.find(marker)? + marker.len();
+    let digits: String = message
+        .get(start..)?
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    Some(Duration::from_millis(digits.parse().ok()?))
+}
+
+fn sandbox_service_route_not_ready_from_metadata(metadata: &MetadataMap) -> bool {
+    metadata
+        .get(SANDBOX_SERVICE_ROUTE_ERROR_METADATA)
+        .and_then(|value| value.to_str().ok())
+        == Some(SANDBOX_SERVICE_ROUTE_NOT_READY)
+}
+
+fn sandbox_service_route_not_ready_from_message(message: &str) -> bool {
+    message.contains("sandbox service route")
+}
+
+fn uds_per_sandbox_limit_exceeded_from_metadata(metadata: &MetadataMap) -> bool {
+    metadata
+        .get(NODE_API_ERROR_METADATA)
+        .and_then(|value| value.to_str().ok())
+        == Some(UDS_PER_SANDBOX_LIMIT_EXCEEDED)
+}
+
+fn guest_capability_unsupported_from_metadata(
+    metadata: &MetadataMap,
+) -> Option<GuestCapabilityUnsupported> {
+    let marker = metadata
+        .get(GUEST_CAPABILITY_ERROR_METADATA)
+        .and_then(|value| value.to_str().ok())?;
+    if marker != GUEST_CAPABILITY_UNSUPPORTED {
+        return None;
+    }
+    let capability = metadata
+        .get(GUEST_CAPABILITY_METADATA)
+        .and_then(|value| value.to_str().ok())?
+        .parse()
+        .ok()?;
+    Some(GuestCapabilityUnsupported { capability })
+}
+
+#[cfg(test)]
+mod tests;

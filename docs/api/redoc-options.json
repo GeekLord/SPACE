@@ -1,0 +1,36 @@
+{
+  "disableGoogleFont": true,
+  "disableSearch": true,
+  "hideDownloadButton": true,
+  "hideHostname": false,
+  "pathInMiddlePanel": true,
+  "requiredPropsFirst": true,
+  "onlyRequiredInSamples": true,
+  "schemaDefinitionsTagName": "Schemas",
+  "showExtensions": [
+    "x-space-max-utf8-bytes",
+    "x-space-max-aggregate-utf8-bytes"
+  ],
+  "theme": {
+    "breakpoints": {
+      "small": "50rem",
+      "medium": "200rem",
+      "large": "220rem"
+    },
+    "spacing": { "sectionHorizontal": 28, "sectionVertical": 24 },
+    "sidebar": { "width": "270px" },
+    "rightPanel": { "backgroundColor": "#e1e6e8", "textColor": "#fff" },
+    "codeBlock": { "backgroundColor": "#263238" },
+    "colors": {
+      "responses": {
+        "success": { "tabTextColor": "#a0fbaa" },
+        "error": { "tabTextColor": "#ffaaaa" }
+      }
+    },
+    "typography": {
+      "fontFamily": "system-ui, sans-serif",
+      "headings": { "fontFamily": "system-ui, sans-serif" },
+      "code": { "fontFamily": "monospace" }
+    }
+  }
+}

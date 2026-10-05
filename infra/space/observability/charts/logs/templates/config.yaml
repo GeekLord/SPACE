@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: logs-config
+data:
+  config.alloy: |
+{{ tpl (.Files.Get "config/config.alloy") . | indent 4 }}
+  loki.yaml: |
+{{ tpl (.Files.Get "config/loki.yaml") . | indent 4 }}

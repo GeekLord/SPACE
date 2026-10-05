@@ -1,0 +1,201 @@
+image:
+  repository: space-cluster-controller
+  tag: local
+  pullPolicy: IfNotPresent
+
+datadogTeam: team-space
+clusterId: "kind-local"
+
+# Env master for the cluster activation limiter, which this process evaluates
+# independently of space-api because the public-operation dispatcher builds its
+# own config. **Must equal `clusterActivationAdmission.enabled` in
+# `charts/space-api-local/values.yaml`** — the two copies of the limiter are
+# one guardrail, and a bench that disables it in one place has not disabled it.
+#
+# Empty rather than the binary's own default, and rendered either way: an
+# unrecognised value reads as "not configured" (`env_flag`), so an empty one
+# leaves whichever default the binary ships.
+clusterActivationAdmission:
+  enabled: ""
+
+# Telemetry defaults come from the space-kind-telemetry library.
+telemetry: {}
+
+# Names must match space-api-local so RBAC bindings re-use that chart's
+# Role and ClusterRole.
+apiReleaseName: space
+apiServiceAccount: space-api
+
+# One replica by default: every other kind suite reads
+# `logs deploy/space-cluster-controller` and expects one pod's log to be the
+# whole story, which stops being true the moment a standby exists. The
+# leader-election suite scales this up for its own scenarios and scales it back.
+replicaCount: 1
+
+nodeSelector:
+  space.pplx.net/infra: "true"
+
+serviceAccount:
+  name: space-cluster-controller
+
+# Same KubernetesSubstrate env block as the api-server. The cluster-controller
+# requires SPACE_K8S_CONTROL_PLANE=true to even start, and shares the same
+# substrate plumbing for orphan-sweep + warm-pool reconcilers.
+k8s:
+  sandboxNamespace: space
+  # Must match space-api-local's value: both substrate instances (api-server
+  # + cluster-controller) read SPACE_SANDBOX_POD_IMAGE from env at startup
+  # and would otherwise create per-sandbox pods with different images, the
+  # cluster-controller side pulling pause:3.10 from docker.io and failing
+  # with ImagePullBackOff in KinD.
+  # Matches space-api-local. registry.k8s.io/pause:3.10 is what the SPACE
+  # shim sees — the shim hijacks the pause container into a real sandbox
+  # via sandbox-manager.
+  sandboxPodImage: registry.k8s.io/pause:3.10
+  sandboxNodeSelectorKey: node.kubernetes.io/space-enabled
+  sandboxNodeSelectorValue: "true"
+
+internal:
+  secretName: space-internal
+
+# Route-token signing material. This lives in its own Secret, written by the
+# space-api-local chart, and NOT in `internal.secretName` — the sibling
+# space-api-local and space-internal-api-local charts already read it this way.
+# The cluster-controller was left reading it out of `space-internal`, where it is
+# never written, so the process failed at startup with "SPACE API Ed25519 route
+# token signing configuration is missing" and the pod crash-looped on the kind
+# harness. Keep these three aligned with the api charts. The signing key is
+# mounted as a file; the key id and issuer are read from the environment.
+spaceApiRouteToken:
+  ed25519:
+    signingSecretName: space-route-signing
+    signingKey: signing-key.pem
+    signingKeyId: SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID
+    issuer: SPACE_API_ROUTE_ED25519_ISSUER
+
+postgres:
+  # Dev-default managed-login passwords; the roles are provisioned by the
+  # api chart's bootstrap-roles initContainer with the same values.
+  managedUserPassword: space-dev-user
+  managedCredentialsPassword: space-dev-creds
+
+snapshotBucket: snapshots
+snapshotRegion: us-east-1
+snapshotEndpoint: http://seaweedfs:8333
+snapshotCredentialsSecretName: space-seaweedfs
+
+# Per-reconciler env overrides. Empty defaults keep prod-equivalent intervals.
+reconcilers:
+  # publicOperationDispatcher claims `state=queued` rows in public_operations
+  # and executes them — this is what materializes per-sandbox K8s pods when
+  # /v1/sandboxes is POSTed under KubernetesSubstrate. It is ON by default in
+  # the binary, so the explicit enable below is redundant but keeps local
+  # smoke deployments independent of that default; setting it to false leaves
+  # CreateSandbox returning 202 with the operation `queued` forever. Tight
+  # ticks/concurrency keep local smoke turnaround snappy.
+  publicOperationDispatcher:
+    env:
+      SPACE_PUBLIC_OPERATION_DISPATCHER_ENABLED: "true"
+      SPACE_PUBLIC_OPERATION_DISPATCHER_TICK_SECS: "1"
+      SPACE_PUBLIC_OPERATION_DISPATCHER_CLAIM_LIMIT: "64"
+      SPACE_PUBLIC_OPERATION_DISPATCHER_EXECUTION_CONCURRENCY: "16"
+      SPACE_PUBLIC_OPERATION_DISPATCHER_CLAIM_STALE_SECS: "60"
+  # These repairs are live when enabled. Keep kind explicitly disabled until
+  # the end-to-end and smoke suites exercise their default-on behavior.
+  failedRestorableRepair:
+    env:
+      SPACE_FAILED_RESTORABLE_REPAIR_ENABLED: "false"
+  startedSandboxRepair:
+    env:
+      SPACE_STARTED_SANDBOX_REPAIR_ENABLED: "false"
+  orphanedSandboxes:
+    env: {}
+  warmPool:
+    env: {}
+  # Default-on locally so the kind e2e node-drain test can exercise the
+  # reconciler without an extra opt-in.
+  #
+  # Terminator backend is `kube-delete` for kind: the reconciler
+  # actually removes the kube Node object, which is the closest
+  # provider-agnostic analogue of an EC2 ASG terminate. The smoke
+  # test verifies the Node disappears, then re-registers it by
+  # restarting kubelet inside the kind worker container
+  # (`docker exec <name> systemctl restart kubelet`) so subsequent
+  # runs still see two workers. Switch to `noop` only if you want
+  # to exercise the state machine without touching the kube Node.
+  nodeDrain:
+    env:
+      SPACE_NODE_DRAIN_ENABLED: "true"
+      # Enable the opt-in node-census residency discount for standing SQL
+      # coverage. Keep this aligned with the API chart's nodeCensusResidency
+      # setting. `local.gentle_drain_leaves_sandbox_resident` exercises the
+      # drain; store tests separately verify stale-census safety.
+      SPACE_NODE_DRAIN_NODE_CENSUS_RESIDENCY: "true"
+      SPACE_NODE_DRAIN_TERMINATOR_KIND: "kube-delete"
+  # Default-on locally to exercise drained -> terminating -> deleted with the
+  # kube-delete backend. Drain scenarios that need the node afterward set
+  # space.pplx.net/drain-keep.
+  drainedNodeTerminator:
+    env:
+      SPACE_DRAINED_NODE_TERMINATOR_ENABLED: "true"
+  # Kube-node-sync: proactively registers labeled kube Nodes in SPACE so
+  # they appear in the admin UI without needing a sandbox to land there
+  # first. Enabled in kind where the node-api-svc DaemonSet doesn't run.
+  kubeNodeSync:
+    env:
+      SPACE_KUBE_NODE_SYNC_ENABLED: "true"
+  # Transient-lifecycle sweeper: cluster-wide backstop for sandbox rows
+  # wedged in a transient lifecycle. Default-off here too — the kind e2e
+  # tests that need it can opt in via per-test env overrides.
+  # Keep the default off: a globally-on sweeper acts on rows the other suites
+  # are mid-way through using. The suite that opts in restores these values on
+  # exit and verifies the restore. The suite owns its scope and cleanup.
+  transientLifecycleSweeper:
+    env:
+      SPACE_TRANSIENT_LIFECYCLE_SWEEPER_ENABLED: "false"
+      SPACE_TRANSIENT_LIFECYCLE_SWEEPER_DEFAULT_AGE_SECS: "60"
+  # Stuck-snapshot reaper: cluster-wide backstop for suspend-snapshot rows
+  # wedged in `state = 'creating'` past the upload worker's retry window.
+  # Default-off here too — kind e2e tests that need it can opt in via
+  # per-test env overrides.
+  stuckSnapshotReaper:
+    env:
+      SPACE_STUCK_SNAPSHOT_REAPER_ENABLED: "false"
+  snapshotRetentionSweeper:
+    minAgeSeconds: "3600"
+    env:
+      SPACE_SNAPSHOT_RETENTION_SWEEPER_ENABLED: "true"
+  snapshotStorageSweeper:
+    env:
+      SPACE_SNAPSHOT_STORAGE_SWEEPER_ENABLED: "true"
+  # Suspended-execution reaper: retires stale active execution rows on
+  # suspended sandboxes whose pod is gone, and clears the stale placement
+  # bookkeeping. Default-off here too — kind e2e tests that need it can opt
+  # in via per-test env overrides.
+  suspendedExecutionReaper:
+    env:
+      SPACE_SUSPENDED_EXECUTION_REAPER_ENABLED: "false"
+  # Orphaned-restore-pod GC: reaps restore pods their owning row has provably
+  # superseded (row deleted, no active execution on a reverted row, or a
+  # strictly-older generation). Default-off and dry-run here too — kind e2e
+  # tests that need it can opt in via per-test env overrides (and shrink
+  # THRESHOLD_SECS to make an orphan reapable within the test window).
+  orphanedRestorePodGc:
+    env:
+      SPACE_ORPHANED_RESTORE_POD_GC_ENABLED: "false"
+      SPACE_ORPHANED_RESTORE_POD_GC_DRY_RUN: "true"
+      SPACE_ORPHANED_RESTORE_POD_GC_INTERVAL_SECS: "5"
+      SPACE_ORPHANED_RESTORE_POD_GC_THRESHOLD_SECS: "300"
+      SPACE_ORPHANED_RESTORE_POD_GC_TICK_BUDGET_SECS: "4"
+
+resources:
+  requests:
+    cpu: 25m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+# BYOK: stamp volume_encryption on creates for byok_enabled orgs (matches
+# the space-api-local chart; the dispatcher executes creates here).
+byokVolumeEncryption: "1"

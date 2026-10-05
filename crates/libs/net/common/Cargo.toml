@@ -1,0 +1,38 @@
+[package]
+name = "pplx-space-net-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+host-sockets = ["dep:libc", "dep:nix", "dep:socket2", "dep:tokio"]
+serde = ["dep:serde", "dep:serde_json", "uuid/serde"]
+
+[dependencies]
+http = { workspace = true }
+hex = { workspace = true }
+libc = { workspace = true, optional = true }
+nix = { workspace = true, features = ["net", "uio"], optional = true }
+socket2 = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["net"], optional = true }
+prost = { workspace = true }
+serde = { workspace = true, features = ["derive"], optional = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[build-dependencies]
+anyhow = { workspace = true }
+pplx-space-common-proto-build = { workspace = true }
+tonic-prost-build = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -1,0 +1,52 @@
+name: Assume the reference apply role
+description: >-
+  Exchanges the job's GitHub OIDC token for one session on the reference
+  deployment's apply role and exports its credentials to later steps. The job
+  needs `id-token: write` and the `reference-deployment` environment, the only
+  one the role trusts.
+
+inputs:
+  role-arn:
+    description: ARN of the apply role (the bootstrap output `apply_role_arn`).
+    required: true
+  session-name:
+    description: Role session name, recorded in CloudTrail.
+    required: true
+  duration-seconds:
+    description: >-
+      Session length. Must outlast the job and stay within the role's
+      max_session_duration (four hours, set in bootstrap/).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Exchange the OIDC token for a role session
+      shell: bash
+      env:
+        ROLE_ARN: ${{ inputs.role-arn }}
+        SESSION_NAME: ${{ inputs.session-name }}
+        DURATION_SECONDS: ${{ inputs.duration-seconds }}
+      run: |
+        set -euo pipefail
+        token="$(curl -fsS \
+          -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" | jq -r .value)"
+        # Exchange once for a session longer than the job. The GitHub token
+        # itself expires in minutes, so an SDK refreshing from a token file
+        # would fail partway through a cluster create.
+        creds="$(aws sts assume-role-with-web-identity \
+          --role-arn "${ROLE_ARN}" \
+          --role-session-name "${SESSION_NAME}" \
+          --web-identity-token "${token}" \
+          --duration-seconds "${DURATION_SECONDS}" \
+          --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text)"
+        read -r key_id secret session <<<"${creds}"
+        for value in "${key_id}" "${secret}" "${session}"; do
+          echo "::add-mask::${value}"
+        done
+        {
+          echo "AWS_ACCESS_KEY_ID=${key_id}"
+          echo "AWS_SECRET_ACCESS_KEY=${secret}"
+          echo "AWS_SESSION_TOKEN=${session}"
+        } >>"${GITHUB_ENV}"

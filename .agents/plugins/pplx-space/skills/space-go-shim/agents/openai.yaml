@@ -1,0 +1,3 @@
+interface:
+  display_name: "SPACE Go Shim"
+  short_description: "Go containerd shim development and validation"

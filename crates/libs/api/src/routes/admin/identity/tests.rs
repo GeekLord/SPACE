@@ -1,0 +1,290 @@
+use super::*;
+use pplx_space_common_core::types::OrgId;
+
+#[tokio::test(flavor = "current_thread")]
+async fn password_update_revokes_existing_sessions_but_profile_update_does_not()
+-> pplx_space_test_env::TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let state = AppState::from_pool(db.pool.clone()).await?;
+    let actor = sqlx::query_as::<_, User>(sql!(
+        "SELECT u.*
+         FROM users u
+         JOIN clusters c ON c.managing_org_id = u.org_id
+         WHERE c.singleton
+           AND u.role = 'organization_admin'
+         ORDER BY u.id
+         LIMIT 1"
+    ))
+    .fetch_one(&db.pool)
+    .await?;
+    let initial_password_hash = hash_password("initial-password")?;
+    sqlx::query(sql!("UPDATE users SET password_hash = $2 WHERE id = $1"))
+        .bind(actor.id)
+        .bind(initial_password_hash)
+        .execute(&db.pool)
+        .await?;
+    let mut raw_tokens = Vec::new();
+    for _ in 0..2 {
+        let (raw_token, token_hash) = crate::auth::generate_session_token();
+        sqlx::query(sql!(
+            "INSERT INTO sessions (id, user_id, token_hash, expires_at)
+             VALUES ($1, $2, $3, NOW() + INTERVAL '1 hour')"
+        ))
+        .bind(Uuid::now_v7())
+        .bind(actor.id)
+        .bind(token_hash)
+        .execute(&db.pool)
+        .await?;
+        raw_tokens.push(raw_token);
+    }
+
+    let _ = update_user(
+        State(state.clone()),
+        Extension(AuthUser(actor.clone())),
+        Path(actor.id),
+        Json(UpdateUserRequest {
+            email: None,
+            password: None,
+            display_name: Some("Updated display name".to_string()),
+        }),
+    )
+    .await?;
+    for raw_token in &raw_tokens {
+        assert!(
+            crate::auth::get_session_user(&db.pool, raw_token)
+                .await?
+                .is_some(),
+            "a profile-only update must preserve every active session"
+        );
+    }
+
+    let _ = update_user(
+        State(state),
+        Extension(AuthUser(actor.clone())),
+        Path(actor.id),
+        Json(UpdateUserRequest {
+            email: None,
+            password: Some("replacement-password".to_string()),
+            display_name: None,
+        }),
+    )
+    .await?;
+    for raw_token in &raw_tokens {
+        assert!(
+            crate::auth::get_session_user(&db.pool, raw_token)
+                .await?
+                .is_none(),
+            "a password update must revoke every existing session"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn password_update_is_rejected_for_federated_user() -> pplx_space_test_env::TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let state = AppState::from_pool(db.pool.clone()).await?;
+    let actor = sqlx::query_as::<_, User>(sql!(
+        "SELECT u.*
+         FROM users u
+         JOIN clusters c ON c.managing_org_id = u.org_id
+         WHERE c.singleton
+           AND u.role = 'organization_admin'
+         ORDER BY u.id
+         LIMIT 1"
+    ))
+    .fetch_one(&db.pool)
+    .await?;
+    let org_id = OrgId::new();
+    let user_id = UserId::new();
+    let issuer = "https://identity.example.invalid";
+    sqlx::query(sql!(
+        "INSERT INTO organizations (
+             id, name, slug, owner_source, upstream_issuer, upstream_org_id
+         ) VALUES ($1, 'Federated Admin Test Org', $2, 'federated_identity', $3, $4)"
+    ))
+    .bind(org_id)
+    .bind(format!("federated-admin-{org_id}"))
+    .bind(issuer)
+    .bind(format!("org-{org_id}"))
+    .execute(&db.pool)
+    .await?;
+    let original_hash = "federated-user-no-local-password";
+    sqlx::query(sql!(
+        "INSERT INTO users (
+             id, email, password_hash, display_name, org_id, role,
+             owner_source, upstream_issuer, upstream_subject_id
+         ) VALUES ($1, $2, $3, 'Federated Admin Test User', $4, 'member',
+                   'federated_identity', $5, $6)"
+    ))
+    .bind(user_id)
+    .bind(format!("federated-{user_id}@example.invalid"))
+    .bind(original_hash)
+    .bind(org_id)
+    .bind(issuer)
+    .bind(format!("subject-{user_id}"))
+    .execute(&db.pool)
+    .await?;
+
+    let error = update_user(
+        State(state),
+        Extension(AuthUser(actor)),
+        Path(user_id),
+        Json(UpdateUserRequest {
+            email: None,
+            password: Some("must-not-be-installed".to_string()),
+            display_name: None,
+        }),
+    )
+    .await
+    .expect_err("federated users must not accept local passwords");
+    assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+    assert!(error.to_string().contains("federated users"));
+    let stored_hash: String =
+        sqlx::query_scalar(sql!("SELECT password_hash FROM users WHERE id = $1"))
+            .bind(user_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(stored_hash, original_hash);
+    Ok(())
+}
+
+/// Without a lazy platform provider, enabling BYOK for a keyless org would
+/// create encrypted sandboxes that cannot obtain a volume DEK.
+#[test]
+fn byok_enable_is_refused_for_keyless_org_without_lazy_provisioning() {
+    let err = ensure_byok_enable_allowed(None, None)
+        .expect_err("enabling BYOK without an active master key must be refused");
+    assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    assert!(err.to_string().contains("master key"), "{err}");
+}
+
+#[test]
+fn byok_enable_is_allowed_with_an_authority_supported_active_master_key() {
+    for provider in [KekProvider::InMemory, KekProvider::IntermediateKeyBroker] {
+        ensure_byok_enable_allowed(Some(provider), None)
+            .expect("org with an authority-supported active key may enable BYOK");
+    }
+}
+
+/// A historical AWS KMS row blocks lazy provisioning but cannot wrap a new
+/// volume DEK because the credential authority no longer serves that backend.
+#[test]
+fn byok_enable_is_refused_for_legacy_aws_kms_active_master_key() {
+    let err = ensure_byok_enable_allowed(
+        Some(KekProvider::AwsKms),
+        Some(KekProvider::IntermediateKeyBroker),
+    )
+    .expect_err("legacy AWS KMS active key must not enable BYOK");
+
+    assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    assert!(err.to_string().contains("not supported"), "{err}");
+}
+
+#[test]
+fn byok_enable_is_refused_for_unknown_active_master_key_provider() {
+    let err = parse_active_kek_provider(Some("unknown-provider".to_string()))
+        .expect_err("unknown active key provider must not enable BYOK");
+
+    assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    assert!(err.to_string().contains("not supported"), "{err}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn active_master_key_provider_is_loaded_for_byok_policy() -> pplx_space_test_env::TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = Uuid::from_u128(1);
+    sqlx::query(sql!(
+        "INSERT INTO org_master_keys (id, org_id, provider, key_identifier) \
+         VALUES ($1, $2, $3, $4)"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(org_id)
+    .bind(KekProvider::AwsKms.as_str())
+    .bind("legacy-key")
+    .execute(&db.pool)
+    .await?;
+
+    let credentials_pool = pplx_space_common_svc::sql::CredentialsPool::shared(db.pool.clone());
+    assert_eq!(
+        active_kek_provider(&credentials_pool, OrgId::from_uuid(org_id)).await?,
+        Some(KekProvider::AwsKms),
+        "the BYOK gate must evaluate the active row's provider, not mere row existence"
+    );
+    Ok(())
+}
+
+/// A keyless org may enable BYOK when the platform default provisions its
+/// KEK lazily (intermediate-key-broker), because the credmgr authority mints it
+/// on the org's first Encrypt / sandbox volume DEK. This closes the
+/// chicken-and-egg where enablement required a KEK that could only be minted
+/// after enablement.
+#[test]
+fn byok_enable_is_allowed_for_keyless_org_when_platform_provisions_lazily() {
+    ensure_byok_enable_allowed(None, Some(KekProvider::IntermediateKeyBroker))
+        .expect("keyless org on a lazy-provisioning platform may enable BYOK");
+}
+
+/// The identity handlers carry their own error enum instead of returning
+/// `support::db_error`'s tuple, so the disposition has to come from the shared
+/// helper rather than being restated here — a surface that re-derives the split
+/// is a surface where one handler's `40P01` and the next one's describe the
+/// same abort two ways.
+///
+/// What the helper answers depends on the `ContentionScope` the caller passes,
+/// and this conversion passes `ReadOnly`. That is a deliberate under-claim:
+/// it is one blanket `From` covering both `set_org_master_key`'s
+/// `SELECT ... FOR UPDATE` and five pure-read handlers, so `Writing` would tell
+/// a `list_orgs` caller that its own write lost a race — false, where the 503
+/// is merely less specific. The divergence from `db_error`'s hardcoded
+/// `Writing` is asserted below so it stays deliberate rather than becoming a
+/// drift nobody notices.
+#[tokio::test(flavor = "current_thread")]
+async fn identity_handlers_take_the_admin_surface_contention_disposition()
+-> pplx_space_test_env::TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_raw_pg_test_db().await? else {
+        return Ok(());
+    };
+    use super::super::support::{ContentionScope, contention_disposition};
+
+    // Under `ReadOnly` every contention SQLSTATE is retryable and none takes
+    // the write-specific 409.
+    let expected = [
+        ("55P03", StatusCode::SERVICE_UNAVAILABLE),
+        ("40001", StatusCode::SERVICE_UNAVAILABLE),
+        ("40P01", StatusCode::SERVICE_UNAVAILABLE),
+        ("23505", StatusCode::INTERNAL_SERVER_ERROR),
+    ];
+    for (sqlstate, status) in expected {
+        let error = pplx_space_db_test_fixtures::raise_sqlstate(&db.pool, sqlstate).await;
+        let via_enum = IdentityAdminError::from(error).status();
+        assert_eq!(via_enum, status, "{sqlstate} disposition");
+
+        // The same input through the shared helper: this enum must not invent
+        // its own split.
+        let via_helper = contention_disposition(
+            ContentionScope::ReadOnly,
+            &pplx_space_db_test_fixtures::raise_sqlstate(&db.pool, sqlstate).await,
+        )
+        .map_or(StatusCode::INTERNAL_SERVER_ERROR, |(status, _)| status);
+        assert_eq!(
+            via_enum, via_helper,
+            "{sqlstate} must come from the shared disposition"
+        );
+    }
+
+    // And the divergence from `db_error` is real, not incidental: a `40P01`
+    // earns the 409 there because that path hardcodes `Writing`. If this ever
+    // stops holding, the two have converged and the doc above is stale.
+    let (via_db_error, _) = super::super::support::db_error(
+        pplx_space_db_test_fixtures::raise_sqlstate(&db.pool, "40P01").await,
+    );
+    assert_eq!(via_db_error, StatusCode::CONFLICT);
+    Ok(())
+}

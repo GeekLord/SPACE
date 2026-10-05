@@ -1,0 +1,90 @@
+#!/bin/bash
+# SPACE worker node bootstrap (AL2023 EKS with nodeadm).
+#
+# The AMI handles: partitions, btrfs, groups, sysctl, hugepages, cgroups, Firecracker, jailer, kernel.
+# The Helm DaemonSet handles: node-manager, sandbox-manager, directory setup, user creation.
+# This script handles:
+#   1. The containerd shim binary (containerd discovers it by name on the host PATH)
+#   2. nodeadm init with the space containerd runtime registered
+# Templates are not this script's business — see the note below nodeadm init.
+set -euxo pipefail
+exec > /var/log/space-setup.log 2>&1
+
+${space_cache_nvme_mount}
+
+# Containerd shim — must exist before nodeadm starts containerd. Bootstrap
+# intentionally uses the stable main alias so shim deploys and emergency pins
+# are handled by the Helm updater without mutating worker node group user data.
+SHIM_NAME="containerd-shim-space-v2"
+SHIM_REF="main"
+SHIM_ROOT="/opt/space/shims/$${SHIM_NAME}"
+if [[ "$${SHIM_REF}" =~ ^[0-9a-f]{40}$ ]]; then
+  SHIM_RESOLVED_VERSION="$${SHIM_REF}"
+else
+  SHIM_RESOLVED_VERSION="$(aws s3 cp "s3://${bootstrap_bucket}/containerd-shim-space-v2/$${SHIM_REF}/version" - | tr -d '[:space:]')"
+fi
+SHIM_VERSION_DIR="$${SHIM_ROOT}/$${SHIM_RESOLVED_VERSION}"
+mkdir -p "$${SHIM_VERSION_DIR}"
+aws s3 cp "s3://${bootstrap_bucket}/containerd-shim-space-v2/$${SHIM_RESOLVED_VERSION}/containerd-shim-space-v2" "$${SHIM_VERSION_DIR}/$${SHIM_NAME}"
+aws s3 cp "s3://${bootstrap_bucket}/containerd-shim-space-v2/$${SHIM_RESOLVED_VERSION}/containerd-shim-space-v2.sha256" "$${SHIM_VERSION_DIR}/$${SHIM_NAME}.sha256"
+(cd "$${SHIM_VERSION_DIR}" && sha256sum -c "$${SHIM_NAME}.sha256")
+chmod +x "$${SHIM_VERSION_DIR}/$${SHIM_NAME}"
+ln -sfn "$${SHIM_RESOLVED_VERSION}" "$${SHIM_ROOT}/current.tmp"
+mv -Tf "$${SHIM_ROOT}/current.tmp" "$${SHIM_ROOT}/current"
+SHIM_WRAPPER_TMP="/usr/local/bin/.$${SHIM_NAME}.tmp"
+cat > "$${SHIM_WRAPPER_TMP}" <<'SHIMWRAPPER'
+#!/bin/bash
+set -euo pipefail
+SHIM_ROOT="/opt/space/shims/containerd-shim-space-v2"
+CURRENT_LINK="$${SHIM_ROOT}/current"
+CURRENT_VERSION="$(basename "$(readlink -f "$${CURRENT_LINK}")")"
+%{ if shim_dogstatsd_socket_path != null ~}
+export DD_DOGSTATSD_SOCKET="${shim_dogstatsd_socket_path}"
+%{ endif ~}
+export DD_ENV="${shim_environment}"
+export DD_VERSION="$${CURRENT_VERSION}"
+exec "$${CURRENT_LINK}/containerd-shim-space-v2" "$@"
+SHIMWRAPPER
+chmod +x "$${SHIM_WRAPPER_TMP}"
+mv -f "$${SHIM_WRAPPER_TMP}" /usr/local/bin/containerd-shim-space-v2
+
+# nodeadm config — registers the space containerd runtime alongside runc
+cat > /etc/eks/nodeadm.yaml <<'NODEADM'
+apiVersion: node.eks.aws/v1alpha1
+kind: NodeConfig
+spec:
+  cluster:
+    name: ${cluster_name}
+    apiServerEndpoint: ${cluster_endpoint}
+    certificateAuthority: ${cluster_ca_data}
+    cidr: ${cluster_service_cidr}
+  kubelet:
+    flags:
+      - --fail-swap-on=false
+    config:
+      # Disable kubelet's 5/s event rate limit. space-api consumes pod
+      # events for shim/scheduling failure detection; throttled events
+      # silently drop those signals. Events TTL ~1h so etcd stays bounded.
+      eventRecordQPS: 0
+  containerd:
+    config: |
+      [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.space]
+      runtime_type = "io.containerd.space.v2"
+      # Forward SPACE pod annotations into the OCI bundle so the shim can
+      # resolve the requested template/content hash instead of defaulting to seed.
+      pod_annotations = ["space.pplx.net/*"]
+      [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.space.options]
+        CniConfDir = "/etc/cni/net.d"
+NODEADM
+
+nodeadm init --config-source file:///etc/eks/nodeadm.yaml
+
+# No template is staged here, deliberately. A node acquires every template only
+# through template-manager's prefetch loop, which resolves the tags it tracks
+# (seed:latest among them) against ClusterApi and verifies what it pulls against
+# the registered release hash. Staging one here instead would mean hashing the
+# artifact a second time, independently of the builder that authored it, with
+# nothing enforcing that the two agree. The cost is a first-boot delay before
+# seed is resident.
+
+echo "=== SPACE worker bootstrap complete ==="

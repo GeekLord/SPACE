@@ -1,0 +1,105 @@
+syntax = "proto3";
+package space.node.runtime.v1;
+
+service RuntimeSupervisor {
+  // Every mutation requires explicit execution identity; no unfenced mode.
+  rpc BindExecution(BindExecutionRequest) returns (BindExecutionResponse);
+  rpc RetireExecution(RetireExecutionRequest) returns (RetireExecutionResponse);
+  rpc LaunchFirecracker(LaunchFirecrackerRequest) returns (LaunchFirecrackerResponse);
+  rpc LaunchSidecar(LaunchSidecarRequest) returns (LaunchSidecarResponse);
+  rpc StopProcess(StopProcessRequest) returns (StopProcessResponse);
+  rpc StopSandboxRuntime(StopSandboxRuntimeRequest) returns (StopSandboxRuntimeResponse);
+  rpc UpdateCgroup(UpdateCgroupRequest) returns (UpdateCgroupResponse);
+}
+
+message BindExecutionRequest {
+  string sandbox_id = 1;
+  string execution_id = 2;
+  optional string previous_id = 3;
+}
+message BindExecutionResponse {}
+message RetireExecutionRequest {
+  string sandbox_id = 1;
+  string execution_id = 2;
+}
+message RetireExecutionResponse {}
+
+message CgroupLimits {
+  optional uint32 vcpu_count = 1;
+  optional uint64 memory_mib = 2; // Host cgroup memory.max in MiB
+  optional uint32 pids_max = 3;
+}
+
+message LaunchFirecrackerRequest {
+  string sandbox_id = 1;
+  string jailer_bin = 2;
+  string firecracker_bin = 3;
+  string chroot_base_dir = 4;
+  string ns_path = 5;
+  uint32 uid = 6;
+  uint32 gid = 7;
+  string fc_config_path = 8;
+  string fc_log_path = 9;
+  string fc_console_path = 10;
+  CgroupLimits cgroup_limits = 11;
+  string execution_id = 12;
+}
+
+message LaunchFirecrackerResponse {
+  uint32 pid = 1;
+}
+
+message PreExecSocket {
+  string bind_addr = 1;
+  bool tcp = 2;
+  bool transparent = 3;
+  bool recvorigdstaddr = 4;
+  string fd_arg = 5;
+}
+
+message LaunchSidecarRequest {
+  string sandbox_id = 1;
+  string ns_path = 2;
+  string program = 3;
+  repeated string args = 4;
+  map<string, string> env = 5;
+  uint32 uid = 6;
+  uint32 gid = 7;
+  repeated PreExecSocket pre_exec_sockets = 8;
+  bool grant_cap_net_admin = 9;
+  string execution_id = 10;
+}
+
+message LaunchSidecarResponse {
+  uint32 pid = 1;
+}
+
+message StopProcessRequest {
+  string sandbox_id = 1;
+  uint32 pid = 2;
+  uint32 signal = 3;
+  string execution_id = 4;
+}
+
+message StopProcessResponse {
+  bool success = 1;
+}
+
+message StopSandboxRuntimeRequest {
+  string sandbox_id = 1;
+  bool immediate_kill = 2;
+  string execution_id = 4;
+  optional string previous_execution_id = 5;
+}
+
+message StopSandboxRuntimeResponse {
+  repeated string actions = 1;
+}
+
+message UpdateCgroupRequest {
+  string sandbox_id = 1;
+  CgroupLimits cgroup_limits = 2;
+  string execution_id = 3;
+}
+
+message UpdateCgroupResponse {}

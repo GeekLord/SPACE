@@ -1,0 +1,208 @@
+# Code runtime template recipe.
+#
+# Builds on the "seed" template — a minimal bootable Ubuntu rootfs with SSH
+# and networking, produced by rootfs-builder.sh.
+#
+# This recipe adds the SPACE code runtime: Python, Node.js, Jupyter, data
+# science tools, gh CLI, uv, dev tools, and user account setup.
+# Equivalent to E2B's code-interpreter-v1 base.
+#
+# Usage:
+#   space-admin-cli template build code-runtime
+
+[metadata]
+name = "code-runtime"
+description = "SPACE code runtime with Python, Node.js, Jupyter, data science, and dev tools"
+base = "seed"
+vcpu = 2
+memory_mib = 2048
+disk_size_mb = 4096
+
+# ── Step 1: Core system packages ─────────────────────────────────────────────
+
+[[steps]]
+name = "Install system packages"
+type = "apt-install"
+packages = [
+    "python3",
+    "python3-venv",
+    "python3-pip",
+    "python-is-python3",
+    "curl",
+    "ca-certificates",
+    "sudo",
+    "git",
+    "git-lfs",
+    "procps",
+    "jq",
+    "wget",
+    "lsof",
+    "sqlite3",
+    "iputils-ping",
+    "libcap2-bin",
+    "python3-dev",
+    "python3-setuptools",
+    # Provide ss/ip/tc for readiness checks even when the base seed
+    # predates their inclusion.
+    "iproute2",
+]
+
+# ── Step 2: Python symlinks ──────────────────────────────────────────────────
+
+[[steps]]
+name = "Validate Python runtime"
+type = "run"
+command = """
+python3 - <<'PY'
+import sys
+
+if sys.version_info < (3, 12):
+    raise SystemExit(f"Python {sys.version.split()[0]} is too old")
+PY
+if ! command -v python >/dev/null 2>&1; then
+  ln -sf "$(command -v python3)" /usr/local/bin/python
+fi
+python3 --version
+python --version
+"""
+user = "root"
+
+# ── Step 3: Node.js ──────────────────────────────────────────────────────────
+
+[[steps]]
+name = "Install Node.js v20"
+type = "run"
+command = """
+set -eu
+NODE_VERSION="v20.20.2"
+case "$(uname -m)" in
+  aarch64) NODE_ARCH="arm64"; NODE_SHA256="73093db209e4e9e09dd7d15a47aeaab1b74833830df03efa5f942a1122c5fa71" ;;
+  x86_64) NODE_ARCH="x64"; NODE_SHA256="df770b2a6f130ed8627c9782c988fda9669fa23898329a61a871e32f965e007d" ;;
+  *) echo "Unsupported Node.js architecture" >&2; exit 1 ;;
+esac
+curl -fsSL --retry 3 --retry-delay 5 --max-time 120 -o /tmp/node.tar.xz \
+  "https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz"
+printf '%s  %s\\n' "$NODE_SHA256" /tmp/node.tar.xz | sha256sum --check --strict -
+tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1
+rm -f /tmp/node.tar.xz
+"""
+user = "root"
+
+# ── Step 4: gh CLI ───────────────────────────────────────────────────────────
+
+[[steps]]
+name = "Install GitHub CLI"
+type = "run"
+command = """
+set -eu
+GH_VERSION="2.101.0"
+case "$(uname -m)" in
+  aarch64) GH_ARCH="arm64"; GH_SHA256="b57e8063f18862647c9d22727c32e9da1b963f8bf9db648fe123a6975695640f" ;;
+  x86_64) GH_ARCH="amd64"; GH_SHA256="9bca2d1c16825f109907a23307628a2f0698fbf99662b73a5cf0b020293072b8" ;;
+  *) echo "Unsupported GitHub CLI architecture" >&2; exit 1 ;;
+esac
+curl -fsSL --retry 3 --retry-delay 5 --max-time 120 -o /tmp/gh.tar.gz \
+  "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${GH_ARCH}.tar.gz"
+printf '%s  %s\\n' "$GH_SHA256" /tmp/gh.tar.gz | sha256sum --check --strict -
+tar -xzf /tmp/gh.tar.gz -C /usr/local/bin --strip-components=2 "gh_${GH_VERSION}_linux_${GH_ARCH}/bin/gh"
+rm -f /tmp/gh.tar.gz
+"""
+user = "root"
+
+# ── Step 5: uv (Python package manager) ──────────────────────────────────────
+
+[[steps]]
+name = "Install uv package manager"
+type = "run"
+command = """
+set -eu
+UV_VERSION="0.12.18"
+case "$(uname -m)" in
+  aarch64) UV_ARCH="aarch64"; UV_SHA256="afb6291f3f0a6b4521fc67b947822506c41dde5b60d2189dd8f3695b2ac8c9e7" ;;
+  x86_64) UV_ARCH="x86_64"; UV_SHA256="89eadd7c76fc063887959510d5ba0ab1264dfd5f1143b925ddb73021a40acf16" ;;
+  *) echo "Unsupported uv architecture" >&2; exit 1 ;;
+esac
+UV_PACKAGE="uv-${UV_ARCH}-unknown-linux-gnu"
+curl -fsSL --retry 3 --retry-delay 5 --max-time 120 -o /tmp/uv.tar.gz \
+  "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${UV_PACKAGE}.tar.gz"
+printf '%s  %s\\n' "$UV_SHA256" /tmp/uv.tar.gz | sha256sum --check --strict -
+tar -xzf /tmp/uv.tar.gz -C /usr/local/bin --strip-components=1 "${UV_PACKAGE}/uv" "${UV_PACKAGE}/uvx"
+rm -f /tmp/uv.tar.gz
+# Remove profile entries left by the former standalone installer.
+for profile in /root/.profile /root/.bashrc /root/.bash_profile /home/user/.profile /home/user/.bashrc /home/user/.bash_profile; do
+  if [ -f "$profile" ]; then
+    sed -i '/[.]local[/]bin[/]env/d' "$profile"
+  fi
+done
+"""
+user = "root"
+
+# ── Step 6: Code interpreter packages (matches E2B code-interpreter-v1) ───────
+
+[[steps]]
+name = "Install code interpreter packages (Jupyter, data science, NLP)"
+type = "pip-install"
+packages = [
+    # Jupyter
+    "jupyter",
+    "ipython",
+    "jupyterlab",
+    # Data visualization
+    "bokeh",
+    "kaleido",
+    # NLP
+    "nltk",
+    "spacy",
+    # JIT compiler
+    "numba",
+    # Data science
+    "numpy",
+    "pandas",
+    "scipy",
+    "pillow",
+    # Image I/O
+    "imageio",
+    # Utilities
+    "send2trash",
+    "pygments",
+    "jsonschema",
+]
+extra_args = ["--ignore-installed"]
+
+# ── Step 7: User account and workspace ────────────────────────────────────────
+
+[[steps]]
+name = "Configure user account"
+type = "run"
+command = """
+id -u user 2>/dev/null || useradd -m -s /bin/bash user
+echo 'user ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/user
+chmod 440 /etc/sudoers.d/user
+mkdir -p /home/user/.ssh /home/user/workspace
+chown -R user:user /home/user
+chmod 700 /home/user/.ssh
+"""
+user = "root"
+
+# ── Step 8: Fix capabilities lost during seed ext4 packing ────────────────────
+
+[[steps]]
+name = "Fix ping capabilities"
+type = "run"
+command = """
+if [ -f /usr/bin/ping ]; then
+  setcap cap_net_raw+ep /usr/bin/ping 2>/dev/null || chmod u+s /usr/bin/ping
+fi
+"""
+user = "root"
+
+# ── Step 9: Clean up ─────────────────────────────────────────────────────────
+
+[[steps]]
+name = "Clean up"
+type = "run"
+command = """
+apt-get clean
+rm -rf /tmp/* /var/tmp/*
+"""
+user = "root"

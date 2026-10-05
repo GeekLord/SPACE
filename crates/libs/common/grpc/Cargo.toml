@@ -1,0 +1,47 @@
+[package]
+name = "pplx-space-common-grpc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+internal-tls = ["tonic/tls-aws-lc", "tokio/fs", "dep:futures-util", "dep:rustls", "dep:tokio-rustls", "dep:tokio-util"]
+
+[dependencies]
+futures-util = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true, features = ["aws_lc_rs"] }
+tokio-rustls = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+http = { workspace = true }
+http-body = { workspace = true }
+bytes = { workspace = true }
+hyper-util = { workspace = true, features = ["tokio"] }
+rand = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt", "time", "sync"] }
+tonic = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true, features = ["metrics", "trace"] }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+
+# internal
+pplx-space-common-core = { workspace = true }
+pplx-space-metrics = { workspace = true }
+pplx-space-observability = { workspace = true }
+
+[dev-dependencies]
+rustls = { workspace = true, features = ["aws_lc_rs"] }
+rcgen = { workspace = true, features = ["aws_lc_rs", "pem"] }
+pplx-space-metrics = { workspace = true, features = ["test-capture"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tokio-stream = { workspace = true, features = ["net"] }
+tonic-health = { workspace = true }

@@ -1,0 +1,35 @@
+name = "Reserved DNS authorizes transport and question separately"
+
+[[steps]]
+policy = { default = "deny", allow = ["1.1.1.1", "8.8.8.8", "198.18.53.53", "allowed.test", "one.one.one.one"] }
+probes = [
+  { kind = "dns-udp", target = "1.1.1.1", host = "one.one.one.one", expect = "answer", addresses = ["1.0.0.1", "1.1.1.1"] },
+  { kind = "dns-tcp", target = "1.1.1.1", host = "one.one.one.one", expect = "answer", addresses = ["1.0.0.1", "1.1.1.1"] },
+  { kind = "dns-udp", target = "8.8.8.8", host = "one.one.one.one", expect = "answer", addresses = ["1.0.0.1", "1.1.1.1"] },
+  { kind = "dns-tcp", target = "8.8.8.8", host = "one.one.one.one", expect = "answer", addresses = ["1.0.0.1", "1.1.1.1"] },
+  { kind = "dns-udp", target = "1.1.1.1", host = "blocked.test", expect = "refused" },
+  # Google's direct DoT health query can time out before this policy probe runs.
+  { kind = "dns-tcp", target = "8.8.8.8", host = "blocked.test", expect = "refused", flaky = true },
+  { kind = "dns-udp", target = "198.18.53.53", host = "allowed.test", expect = "answer" },
+  # DNS attribution also requires protocol identity; opaque TCP/UDP fail closed.
+  { kind = "tcp", expect = "deny" },
+  { kind = "udp", expect = "deny" },
+  { kind = "udp", port = 443, expect = "deny" },
+  # A denied protocol name must not borrow another name's DNS attribution.
+  { kind = "http", host = "blocked.test", expect = "deny" },
+  { kind = "tls", host = "blocked.test", expect = "deny" },
+]
+
+[[steps]]
+policy = { default = "deny", allow = ["allowed.test"] }
+probes = [
+  { kind = "dns-udp", target = "1.1.1.1", host = "allowed.test", expect = "deny" },
+  { kind = "dns-tcp", target = "8.8.8.8", host = "allowed.test", expect = "deny", flaky = true },
+]
+
+[[steps]]
+policy = { default = "allow", deny = ["blocked.test"] }
+probes = [
+  { kind = "dns-udp", target = "1.1.1.1", host = "blocked.test", expect = "refused" },
+  { kind = "dns-tcp", target = "1.1.1.1", host = "blocked.test", expect = "refused" },
+]

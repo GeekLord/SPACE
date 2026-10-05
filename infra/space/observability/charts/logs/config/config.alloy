@@ -1,0 +1,112 @@
+logging {
+  level = "info"
+  format = "json"
+}
+{{ if .Values.collection.podTargets }}
+// Read only the configured SPACE pod logs; never collect Alloy's own output.
+local.file_match "pods" {
+  sync_period = "2s"
+  path_targets = [
+{{- range .Values.collection.podTargets }}
+    {__path__ = {{ .path | quote }}, namespace = {{ .namespace | quote }}},
+{{- end }}
+  ]
+}
+// Filter resolved source paths, including matches from overlapping globs.
+// Excluded containers never reach a file reader or diagnostic echo.
+discovery.relabel "eligible_pods" {
+  targets = local.file_match.pods.targets
+{{- range .Values.collection.excludedPodSources }}
+  rule {
+    source_labels = ["__path__"]
+    regex = {{ printf ".*/%s_%s[^/]*_[^/]+/%s/[^/]+" (regexQuoteMeta .namespace) (regexQuoteMeta .podNamePrefix) (regexQuoteMeta .container) | quote }}
+    action = "drop"
+  }
+{{- end }}
+}
+loki.source.file "pods" {
+  targets = discovery.relabel.eligible_pods.output
+  forward_to = [loki.process.cri.receiver]
+}
+loki.process "cri" {
+  stage.cri {}
+  stage.static_labels {
+    values = {source = "container", node = sys.env("NODE_NAME"), cluster = {{ .Values.clusterLabel | quote }}}
+  }
+  // Transport identity is searchable metadata, not an indexed stream label.
+  stage.structured_metadata {
+    values = {filename = "", stream = ""}
+  }
+  forward_to = [loki.process.space.receiver]
+}
+{{ end }}
+{{- if .Values.collection.journal.enabled }}
+loki.relabel "journal" {
+  forward_to = []
+  rule {
+    source_labels = ["__journal__systemd_unit", "__journal_syslog_identifier"]
+    regex = {{ .Values.collection.journal.keepRegex | quote }}
+    action = "keep"
+  }
+{{- with .Values.collection.journal.dropRegex }}
+  rule {
+    source_labels = ["__journal__systemd_unit", "__journal_syslog_identifier"]
+    regex = {{ . | quote }}
+    action = "drop"
+  }
+{{- end }}
+  rule {
+    source_labels = ["__journal_syslog_identifier"]
+    target_label = "service"
+  }
+  rule {
+    source_labels = ["__journal__systemd_unit"]
+    target_label = "unit"
+  }
+}
+loki.source.journal "host" {
+  path = {{ .Values.collection.journal.path | quote }}
+  max_age = {{ .Values.collection.journal.maxAge | quote }}
+  format_as_json = false
+  relabel_rules = loki.relabel.journal.rules
+  labels = {source = "journal", namespace = "host", node = sys.env("NODE_NAME"), cluster = {{ .Values.clusterLabel | quote }}}
+  forward_to = [loki.process.space.receiver]
+}
+{{- end }}
+
+loki.process "space" {
+  // Extraction changes labels only. Never rewrite/re-serialize the JSON line.
+  stage.json {
+    expressions = {service = "service", environment = "env", cluster = "cluster_id", event_time = "timestamp"}
+  }
+  stage.labels {
+    values = {service = "", environment = "", cluster = ""}
+  }
+  stage.timestamp {
+    source = "event_time"
+    format = "RFC3339Nano"
+    action_on_failure = "skip"
+  }
+  stage.structured_metadata {
+    values = {unit = ""}
+  }
+  // No pod IDs, sandbox/request IDs, versions, filenames or arbitrary JSON labels.
+  stage.label_keep {
+    values = ["service", "environment", "cluster", "namespace", "source", "node"]
+  }
+  forward_to = [loki.write.local.receiver{{ if .Values.validationEcho }}, loki.echo.validation.receiver{{ end }}]
+}
+{{ if .Values.validationEcho }}
+loki.echo "validation" {}
+{{ end }}
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+    batch_wait = "1s"
+    batch_size = "256KiB"
+    remote_timeout = "5s"
+    min_backoff_period = "500ms"
+    max_backoff_period = "5s"
+    max_backoff_retries = 5
+  }
+}

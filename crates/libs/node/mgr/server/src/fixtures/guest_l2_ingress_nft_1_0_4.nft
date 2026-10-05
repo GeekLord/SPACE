@@ -1,0 +1,7 @@
+table netdev sandbox_l2 {
+	chain ingress {
+		type filter hook ingress device "tap0" priority -500; policy accept;
+		meta protocol { 8021q, 8021ad } counter packets 0 bytes 0 drop comment "drop-guest-vlan"
+		ether type { 8021q, 8021ad } counter packets 0 bytes 0 drop comment "drop-guest-vlan"
+	}
+}

@@ -1,0 +1,23 @@
+name = "Policy refresh revokes cached DNS and active attributed TLS"
+
+[[steps]]
+policy = { default = "deny", allow = ["198.18.53.53", "refresh.test"] }
+probes = [
+  { kind = "dns-udp", target = "198.18.53.53", host = "refresh.test", expect = "answer" },
+  { kind = "tls-echo", host = "refresh.test", session = "attributed", connection = "new", expect = "allow" },
+]
+
+[[steps]]
+policy = { default = "deny", allow = ["1.1.1.1"] }
+probes = [
+  { kind = "tls-echo", host = "refresh.test", session = "attributed", connection = "existing", expect = "deny" },
+  { kind = "tls", host = "refresh.test", expect = "deny" },
+  { kind = "dns-udp", target = "1.1.1.1", host = "refresh.test", expect = "refused" },
+]
+
+[[steps]]
+policy = { default = "deny", allow = ["198.18.53.53", "refresh.test"] }
+probes = [
+  { kind = "dns-udp", target = "198.18.53.53", host = "refresh.test", expect = "answer" },
+  { kind = "tls", host = "refresh.test", expect = "allow" },
+]

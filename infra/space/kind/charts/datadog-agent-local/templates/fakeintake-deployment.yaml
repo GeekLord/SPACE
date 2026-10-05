@@ -1,0 +1,62 @@
+{{- if .Values.fakeintake.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: datadog-fakeintake
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "datadog-agent-local.fakeintakeLabels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: datadog-fakeintake
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        {{- include "datadog-agent-local.fakeintakeLabels" . | nindent 8 }}
+    spec:
+      nodeSelector:
+        {{- toYaml .Values.fakeintake.nodeSelector | nindent 8 }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: fakeintake
+          image: "{{ .Values.fakeintake.image.repository }}:{{ .Values.fakeintake.image.tag }}@{{ .Values.fakeintake.image.digest }}"
+          imagePullPolicy: {{ .Values.fakeintake.image.pullPolicy }}
+          args:
+            - --port=8080
+            - --retention-period={{ .Values.fakeintake.retentionPeriod }}
+            - --remoteconfig=false
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /fakeintake/health
+              port: http
+            initialDelaySeconds: 1
+            periodSeconds: 2
+            timeoutSeconds: 1
+          livenessProbe:
+            httpGet:
+              path: /fakeintake/health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+          resources:
+            {{- toYaml .Values.fakeintake.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+{{- end }}

@@ -1,0 +1,9 @@
+# These defaults document the shape; cycle-fleet.sh supplies real values per
+# node via a generated values file.
+name: netgtw-cycle
+namespace: default
+node: ""
+image: public.ecr.aws/docker/library/busybox:latest
+# Pass-through args appended to `space-sbxmgr cycle-net-gateway --execute`.
+cliArgs:
+  - --stale

@@ -1,0 +1,35 @@
+[package]
+name = "pplx-space-net-gateway-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+hyper-util = { workspace = true, features = ["tokio"] }
+prost = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+tower = { workspace = true }
+
+# internal
+pplx-space-common-core = { workspace = true }
+pplx-space-common-grpc = { workspace = true }
+pplx-space-net-common = { workspace = true, features = ["host-sockets"] }
+
+[build-dependencies]
+anyhow = { workspace = true }
+pplx-space-common-proto-build = { workspace = true }
+tonic-prost-build = { workspace = true }
+
+[dev-dependencies]
+nix = { workspace = true, features = ["user"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }

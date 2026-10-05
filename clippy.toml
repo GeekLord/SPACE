@@ -1,0 +1,17 @@
+disallowed-methods = [
+    { path = "uuid::Uuid::new_v4", reason = "Use UUIDv7 (`Uuid::now_v7`) for SPACE-owned durable identifiers. See AGENTS.md for justified UUIDv4 exceptions." },
+]
+
+disallowed-macros = [
+    { path = "log::info", reason = "Use the `tracing` crate (`tracing::info!`) instead of `log`. See CLAUDE.md." },
+    { path = "log::warn", reason = "Use the `tracing` crate (`tracing::warn!`) instead of `log`. See CLAUDE.md." },
+    { path = "log::error", reason = "Use the `tracing` crate (`tracing::error!`) instead of `log`. See CLAUDE.md." },
+    { path = "log::debug", reason = "Use the `tracing` crate (`tracing::debug!`) instead of `log`. See CLAUDE.md." },
+    { path = "log::trace", reason = "Use the `tracing` crate (`tracing::trace!`) instead of `log`. See CLAUDE.md." },
+]
+
+allow-indexing-slicing-in-tests = true
+allow-panic-in-tests = true
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-dbg-in-tests = true

@@ -1,0 +1,286 @@
+syntax = "proto3";
+package space.net.gateway.v1;
+
+option go_package = "github.com/perplexityai/SPACE/shim/proto/net/gateway/v1;gatewayv1";
+
+import "net/policy/v1/policy.proto";
+import "google/protobuf/empty.proto";
+
+service NetGatewayControl {
+  rpc Ping(GatewayPingRequest) returns (GatewayPingResponse);
+  rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
+  rpc GetNetworkState(GetNetworkStateRequest) returns (GetNetworkStateResponse);
+  rpc RefreshNetworkPolicy(RefreshNetworkPolicyRequest) returns (RefreshNetworkPolicyResponse);
+  rpc SetNoIdentity(SetNoIdentityRequest) returns (SetNoIdentityResponse);
+  rpc GetNetworkPolicy(GetNetworkPolicyRequest) returns (GetNetworkPolicyResponse);
+  // Enable or disable verbose, sandbox-scoped network-policy debug logging on
+  // this live gateway. The flag is a single in-memory boolean, so it clears on
+  // gateway restart and is never persisted. `space-sbxmgr network-debug` uses
+  // this to inspect one sandbox's egress decisions without turning on standing
+  // production logging.
+  rpc EnableDebug(EnableDebugRequest) returns (EnableDebugResponse);
+  // Public ServicePort ingress terminates at the per-sandbox net-gateway.
+  // sandbox-manager is the only allowed caller over the gateway's UDS control
+  // socket. The route token in gRPC metadata is verified before any bytes are
+  // forwarded to the verified guest service port.
+  rpc ServicePortIngress(stream ServicePortIngressFrame) returns (stream ServicePortIngressFrame);
+  // Refresh the route/execution identity that future ServicePortIngress tokens
+  // must match. sandbox-manager pushes this after launch, activation, and
+  // reconcile so already-running gateways observe identity changes without a
+  // sidecar restart.
+  rpc SetRouteIdentity(SetRouteIdentityRequest) returns (SetRouteIdentityResponse);
+  // Atomically replace the public Ed25519 verification-key set used for
+  // ServicePort route capabilities. The monotonic generation makes retries
+  // safe and prevents a delayed control message from reinstalling retired
+  // keys. This RPC never carries private signing material.
+  rpc SetRouteVerificationKeys(SetRouteVerificationKeysRequest) returns (SetRouteVerificationKeysResponse);
+}
+
+enum NetworkState {
+  NETWORK_STATE_UNSPECIFIED = 0;
+  NETWORK_STATE_NO_IDENTITY = 1;
+  // Awaiting policy hydration. New TCP connections are held for a bounded
+  // time and then denied; UDP datagrams are buffered and replayed once the
+  // policy installs, or dropped when the buffer expires or fills.
+  NETWORK_STATE_PENDING_POLICY = 2;
+  // Policy is hydrated and installed. This is the state sandbox-manager keys
+  // sandbox start on. It does NOT imply the TLS-interception dependencies
+  // (gateway CA, credential store) are usable; that is reported separately by
+  // `interception_readiness`, so a CA the node cannot issue fails closed per
+  // connection instead of failing the boot.
+  NETWORK_STATE_READY = 3;
+  NETWORK_STATE_POLICY_ERROR = 4;
+  NETWORK_STATE_DRAINING = 5;
+  NETWORK_STATE_STOPPED = 6;
+}
+
+// Readiness of the TLS-interception dependencies relative to the installed
+// policy. Orthogonal to NetworkState: a gateway can be READY with
+// DEPENDENCIES_NOT_READY, in which case it denies new traffic until the
+// gateway CA and credential store become usable. Never a start-gate input.
+enum InterceptionReadiness {
+  // Old gateway binary; the field is absent. Callers must not infer either
+  // readiness or unreadiness from this value.
+  INTERCEPTION_READINESS_UNSPECIFIED = 0;
+  // No policy installed, or the installed policy has TLS interception off.
+  INTERCEPTION_READINESS_NOT_REQUIRED = 1;
+  // TLS interception is on and every dependency is usable.
+  INTERCEPTION_READINESS_READY = 2;
+  // TLS interception is on and the gateway CA or credential store is not
+  // usable yet. Guest egress fails closed per connection.
+  INTERCEPTION_READINESS_DEPENDENCIES_NOT_READY = 3;
+}
+
+enum NetworkPolicyErrorKind {
+  NETWORK_POLICY_ERROR_KIND_NONE = 0;
+  NETWORK_POLICY_ERROR_KIND_LOADER_ERROR = 1;
+  NETWORK_POLICY_ERROR_KIND_TIMEOUT = 2;
+  NETWORK_POLICY_ERROR_KIND_POLICY_REF_MISMATCH = 3;
+  NETWORK_POLICY_ERROR_KIND_GATEWAY_STOPPING = 4;
+}
+
+message GatewayPingRequest {}
+
+message GatewayPingResponse {
+  string message = 1;
+}
+
+message GetStatsRequest {}
+
+message GetStatsResponse {
+  uint64 tcp_active_connections = 1;
+  uint64 tcp_total_connections = 2;
+  uint64 udp_active_mappings = 3;
+  uint64 bytes_forwarded = 4;
+  uint64 network_tx_bytes = 5; // guest -> network, lifetime counter
+  uint64 network_rx_bytes = 6; // network -> guest, lifetime counter
+  uint64 tcp_denied_connections = 7;
+  NetworkState network_state = 8;
+  string installed_policy_ref = 9;
+  string last_network_error = 10;
+  uint64 udp_pending_datagrams = 11;
+  uint64 udp_pending_bytes = 12;
+  uint64 tcp_pending_connections = 13;
+  uint64 last_transition_unix_ms = 14;
+  uint64 current_retry_backoff_ms = 15;
+  uint64 last_hydration_latency_ms = 16;
+  NetworkPolicyErrorKind last_network_error_kind = 17;
+  uint64 consecutive_hydration_failures = 18;
+  // TLS ClientHello SNI sniffing is always on; the per-sandbox toggle this
+  // reported has been removed.
+  reserved 19;
+  reserved "sni_sniffing_enabled";
+  bool debug_enabled = 20;
+  // Git sha baked into the running gateway binary at build time. sandbox-manager
+  // compares this against its own build sha to detect gateways still running a
+  // pre-deploy binary (sidecars keep their launch-time binary until cycled).
+  string build_git_sha = 21;
+  // Stable capability level for route identity/token behavior. Unlike the
+  // build sha, this changes only when the compatibility contract changes.
+  uint32 identity_profile_version = 22;
+  // Last verification-key generation atomically accepted by this gateway.
+  uint64 route_verification_key_generation = 23;
+  // Value in the currently installed network policy. This may be unspecified
+  // on old binaries or when no policy has been installed yet.
+  space.net.policy.v1.TlsInterception tls_interception_mode = 24;
+  // Live readiness of the TLS-interception dependencies. Unspecified on old
+  // binaries.
+  InterceptionReadiness interception_readiness = 25;
+}
+
+message GetNetworkStateRequest {}
+
+message GetNetworkStateResponse {
+  NetworkState state = 1;
+  string installed_policy_ref = 2;
+  string last_error = 3;
+  uint64 last_hydration_latency_ms = 4;
+  uint64 last_transition_unix_ms = 5;
+  uint64 pending_tcp_connections = 6;
+  uint64 pending_udp_datagrams = 7;
+  uint64 pending_udp_bytes = 8;
+  uint64 current_retry_backoff_ms = 9;
+  NetworkPolicyErrorKind last_error_kind = 10;
+  uint64 consecutive_hydration_failures = 11;
+  bool debug_enabled = 12;
+  // Retired fields; keep their wire numbers and names reserved.
+  reserved 13, 14, 15;
+  reserved "installed_compiled_policy_ref", "installed_compiled_policy_count", "runtime_policy_mode";
+  // Git sha baked into the running gateway binary at build time. Lets operators
+  // and sandbox-manager identify gateways running an older binary than the one
+  // currently deployed on the node (sidecars keep their launch-time binary
+  // until deliberately cycled).
+  string build_git_sha = 16;
+  // Retired boolean; readiness is split into `state` (policy lifecycle) and
+  // `interception_readiness` (TLS dependencies) instead.
+  reserved 17;
+  reserved "traffic_ready";
+  // Live readiness of the TLS-interception dependencies. Informational for
+  // sandbox-manager and operators; never an input to the sandbox start gate.
+  InterceptionReadiness interception_readiness = 18;
+}
+
+message RefreshNetworkPolicyRequest {
+  string expected_policy_ref = 1;
+  string reason = 2;
+  // Retired field; keep its wire number and name reserved.
+  reserved 3;
+  reserved "expected_compiled_policy_ref";
+}
+
+message RefreshNetworkPolicyResponse {
+  NetworkState state = 1;
+  string installed_policy_ref = 2;
+  string last_error = 3;
+  NetworkPolicyErrorKind last_error_kind = 4;
+  uint64 consecutive_hydration_failures = 5;
+  // Retired field; keep its wire number and name reserved.
+  reserved 6;
+  reserved "installed_compiled_policy_ref";
+  // Retired boolean; readiness is split into `state` (policy lifecycle) and
+  // `interception_readiness` (TLS dependencies) instead.
+  reserved 7;
+  reserved "traffic_ready";
+  // Live readiness of the TLS-interception dependencies at the time of the
+  // refresh. sandbox-manager logs/emits this when it is not ready but still
+  // treats READY + matching ref as start-gate success.
+  InterceptionReadiness interception_readiness = 8;
+}
+
+message SetNoIdentityRequest {
+  string reason = 1;
+}
+
+message SetNoIdentityResponse {
+  NetworkState state = 1;
+  string installed_policy_ref = 2;
+  string last_error = 3;
+  NetworkPolicyErrorKind last_error_kind = 4;
+  uint64 consecutive_hydration_failures = 5;
+}
+
+message GetNetworkPolicyRequest {}
+
+message GetNetworkPolicyResponse {
+  reserved 3, 4;
+  reserved "document", "identity";
+
+  space.net.policy.v1.NetworkPolicyV1 policy = 1;
+  string installed_policy_ref = 2;
+}
+
+message EnableDebugRequest {
+  // Keep verbose debug logging enabled until this wall-clock instant, in unix
+  // milliseconds. 0 (or any past instant) disables it. The gateway clamps the
+  // deadline to a bounded window so debug logging always self-expires.
+  uint64 debug_until_unix_ms = 1;
+}
+
+message EnableDebugResponse {
+  bool enabled = 1;
+  // The effective deadline the gateway stored after clamping (0 when disabled).
+  uint64 debug_until_unix_ms = 2;
+}
+
+message ServicePortIngressStart {
+  reserved 3;
+  reserved "guest_endpoint";
+
+  string sandbox_id = 1;
+  uint32 port = 2;
+}
+
+message ServicePortIngressFrame {
+  oneof message {
+    ServicePortIngressStart start = 1;
+    bytes data = 2;
+    // Half-close application bytes in this direction, retaining RPC control.
+    google.protobuf.Empty eof = 3;
+    // Data plane has finished downstream delivery. Terminal in both directions.
+    google.protobuf.Empty complete = 4;
+  }
+}
+
+message SpaceApiRouteIdentity {
+  optional uint64 route_generation = 1;
+  optional string current_node_id = 2;
+  optional int64 execution_generation = 3;
+  optional string pod_uid = 4;
+  optional string activation_attempt_id = 5;
+  SandboxSubstrateKind substrate_kind = 6;
+  // The gateway independently receives its immutable sandbox ID at launch.
+  // This field lets it reject a SetRouteIdentity message delivered to the
+  // wrong per-sandbox control socket.
+  optional string sandbox_id = 7;
+}
+
+message SetRouteIdentityRequest {
+  SpaceApiRouteIdentity identity = 1;
+}
+
+message SetRouteIdentityResponse {
+  uint32 identity_profile_version = 1;
+}
+
+enum SandboxSubstrateKind {
+  SANDBOX_SUBSTRATE_KIND_UNSPECIFIED = 0;
+  SANDBOX_SUBSTRATE_KIND_DIRECT = 1;
+  SANDBOX_SUBSTRATE_KIND_KUBERNETES = 2;
+}
+
+message RouteVerificationKey {
+  string key_id = 1;
+  bytes ed25519_public_key = 2;
+}
+
+message SetRouteVerificationKeysRequest {
+  uint64 generation = 1;
+  repeated RouteVerificationKey keys = 2;
+  string issuer = 3;
+  string cluster_id = 4;
+}
+
+message SetRouteVerificationKeysResponse {
+  uint64 generation = 1;
+  uint32 identity_profile_version = 2;
+}

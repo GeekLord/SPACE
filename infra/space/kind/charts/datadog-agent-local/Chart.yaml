@@ -1,0 +1,13 @@
+apiVersion: v2
+name: datadog-agent-local
+description: |
+  Datadog Agent DaemonSet for the local kind cluster. Wraps the official
+  helm.datadoghq.com/datadog chart with kind-only defaults and an optional
+  in-cluster Fake Intake backend for mechanical telemetry comparisons.
+type: application
+version: 0.3.0
+appVersion: "7.81.1"
+dependencies:
+  - name: datadog
+    version: 3.233.0
+    repository: https://helm.datadoghq.com

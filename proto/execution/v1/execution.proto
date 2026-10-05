@@ -1,0 +1,95 @@
+syntax = "proto3";
+
+package space.execution.v1;
+
+option go_package = "github.com/perplexityai/SPACE/shim/proto/execution/v1;executionv1";
+
+enum RuntimeKind {
+  RUNTIME_KIND_UNSPECIFIED = 0;
+  RUNTIME_KIND_FIRECRACKER = 1;
+  RUNTIME_KIND_CLOUD_HYPERVISOR = 2;
+  RUNTIME_KIND_GVISOR = 3;
+}
+
+enum GuestOperatingSystem {
+  GUEST_OPERATING_SYSTEM_UNSPECIFIED = 0;
+  GUEST_OPERATING_SYSTEM_LINUX = 1;
+  GUEST_OPERATING_SYSTEM_WINDOWS = 2;
+  GUEST_OPERATING_SYSTEM_MACOS = 3;
+}
+
+enum CpuArchitecture {
+  CPU_ARCHITECTURE_UNSPECIFIED = 0;
+  CPU_ARCHITECTURE_X86_64 = 1;
+  CPU_ARCHITECTURE_AARCH64 = 2;
+}
+
+enum ArtifactComponentKind {
+  ARTIFACT_COMPONENT_KIND_UNSPECIFIED = 0;
+  ARTIFACT_COMPONENT_KIND_KERNEL = 1;
+  ARTIFACT_COMPONENT_KIND_INITRD = 2;
+  ARTIFACT_COMPONENT_KIND_FIRMWARE = 3;
+  ARTIFACT_COMPONENT_KIND_ROOTFS = 4;
+  ARTIFACT_COMPONENT_KIND_BOOT_DISK = 5;
+  ARTIFACT_COMPONENT_KIND_GUEST_TOOLS = 6;
+}
+
+enum ExecutionSelectionMode {
+  EXECUTION_SELECTION_MODE_UNSPECIFIED = 0;
+  EXECUTION_SELECTION_MODE_NEW_COLD_BOOT = 1;
+  EXECUTION_SELECTION_MODE_EXISTING_COLD_BOOT = 2;
+  EXECUTION_SELECTION_MODE_PERSISTED_STATE_RESTORE = 3;
+}
+
+message RuntimeIdentity {
+  RuntimeKind kind = 1;
+  string version = 2;
+}
+
+message GuestPlatform {
+  GuestOperatingSystem os = 1;
+  CpuArchitecture architecture = 2;
+}
+
+message StateFormatIdentity {
+  string format = 1;
+  string version = 2;
+}
+
+message ArtifactComponent {
+  ArtifactComponentKind kind = 1;
+  optional string role = 2;
+  optional string version = 3;
+  optional string digest = 4;
+  optional string format = 5;
+}
+
+message ExecutionMetadata {
+  RuntimeIdentity runtime = 1;
+  GuestPlatform guest = 2;
+  optional StateFormatIdentity state_format = 3;
+  repeated ArtifactComponent components = 4;
+}
+
+message StateFormatCapability {
+  StateFormatIdentity identity = 1;
+  bool can_create = 2;
+  bool can_load = 3;
+}
+
+message RuntimeInstallation {
+  RuntimeIdentity runtime = 1;
+  repeated GuestPlatform supported_guests = 2;
+  repeated StateFormatCapability state_formats = 3;
+}
+
+message ArtifactComponentInstallation {
+  ArtifactComponent component = 1;
+  bool default_for_new = 2;
+  bool legacy_default = 3;
+}
+
+message NodeExecutionInventory {
+  repeated RuntimeInstallation runtimes = 1;
+  repeated ArtifactComponentInstallation components = 2;
+}

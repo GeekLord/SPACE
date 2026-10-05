@@ -1,0 +1,95 @@
+---
+name: space-data-store-development
+description: Develop, review, or diagnose SPACE PostgreSQL or SQLite storage code, queries, migrations, and database tests.
+---
+
+# Develop and inspect SPACE data stores
+
+Read `db/README.md` before adding a migration. For Rust query construction, also
+use `$space-rust-development`.
+
+## Storage layers
+
+Data operations go through the owning storage layer. Inline SQL at a call site
+means one of two things: that data needs a storage crate/module, or an existing
+one needs an API reused or extended. Prefer reuse; add a new API only when the
+question or the latency budget genuinely differs. Migrating the inline
+statements a PR touches onto the store is in scope for that PR.
+
+Exemplar: `crates/libs/sandbox/store` (`pplx-space-sandbox-store`, the
+`sandboxes` row — its crate docs carry the boundary rules). The shape it sets:
+
+- Named verbs with typed arguments and typed row structs; CRUD with filters
+  and limits is the default. No query builder and no `SELECT`-shaped
+  arguments — callers pick an API, never pass columns, predicates, or sort
+  orders.
+- Executor-generic free functions (`impl PgExecutor`) so an operation composes
+  into the caller's open transaction. A pool-owning store forces callers to
+  choose between committing early and bypassing the store.
+- `sql!` locators on every statement; small operation-specific `thiserror`
+  enums. A guarded write that matches zero rows is an outcome
+  (`Option`/`bool`), not an error — "another writer won" is a normal race
+  result.
+- Verbs and record columns are added with their first migrated caller, never
+  speculatively, and `SELECT` lists stay explicit.
+- Keep every SQL statement syntactically whole and reviewable at its query
+  site. Do not build a statement by factoring out or interpolating partial SQL
+  strings, including conditional predicates, joins, assignments, `ORDER BY`,
+  or comma-separated column/value lists. If a small fixed set of query shapes
+  is required, branch between complete statements and share only bound values
+  and result-processing code. Use a typed query builder only when the query
+  shape is genuinely open-ended; keep identifiers and operators allowlisted
+  and values bound as parameters.
+- A migration that changes a predicate's shape (`SELECT EXISTS(..)` to
+  `get(..).is_some_and(..)`, a hand-rolled probe onto a shared fragment) pins
+  the equivalence with a Postgres-backed test before it merges.
+
+Not store verbs — leave these where they are:
+
+- **Guarded state transitions**, where the `WHERE` re-checks a precondition
+  (a lifecycle CAS, a lease-token or generation guard). The guard is the
+  correctness mechanism; flattening one into a plain `update` re-opens the
+  drift class where a pooled wake resurrected torn-down sandboxes. Sandbox
+  placement transitions specifically belong to `pplx-space-placement`
+  (see `crates/libs/placement/machine/src/lib.rs`).
+- **`SELECT ... FOR UPDATE`**: a lock acquisition inside the caller's
+  transaction. Converting it to a store read silently drops the lock.
+- **Predicates evaluated against the database clock** (`NOW()`-relative
+  freshness checks). Moving the comparison client-side changes clock
+  authority.
+
+When a store change adds a workspace crate or dependency edge: regenerate
+`ci/rust-artifact-inputs.json` with
+`ci/scripts/run-space-bundle-builds.py --regenerate-rust-artifact-inputs`
+(a Python test pins the manifest to the workspace graph and fails CI on
+drift), and run a lib-only `cargo check -p <crate>` — `--all-targets` pulls
+dev-dependencies into feature unification and can mask a missing cargo
+feature on the crate itself.
+
+## PostgreSQL migrations
+
+- Squawk is a generic safety lint, not proof that a migration is safe for SPACE
+  production traffic.
+- `sandboxes` is hot. Do not place a whole-table `UPDATE`, `DELETE`, or
+  `INSERT ... SELECT` against it in a SQLx startup migration, and do not combine
+  DDL with a data backfill. Use a bounded job or maintenance runbook.
+- Ordinary SQLx migrations are transaction-wrapped. An index requiring
+  `CREATE INDEX CONCURRENTLY` must be a single-statement non-transactional
+  migration with the Squawk transaction override.
+- Do not add partial indexes in either up or down migrations. Use a non-partial
+  index or redesign the access path.
+- Prefer explicit statements and Rust-managed transactions over dense CTE
+  chains. Generate application-owned identifiers and labels in application code.
+- Use `space_uuid_v7()` for database-owned UUIDs. A UUIDv4 exception requires
+  `/* space-allow-uuid-v4: <reason> */` on the same line and must protect a real
+  privacy or protocol property.
+- New Postgres migration versions use a UTC `YYYYMMDDHHMMSS` prefix newer than
+  the base branch's maximum. Legacy sequential numbering ends at `093`.
+
+## Tests
+
+Use the shared database fixtures. Nextest uses one run-scoped Postgres and
+isolated clones; direct `cargo test` can use a process-local testcontainer.
+Unavailable Postgres or Redis must fail when `SPACE_CI_REQUIRE_TEST_DEPS=1`.
+Local skips are diagnostic only, not acceptable final validation when Docker can
+be started.

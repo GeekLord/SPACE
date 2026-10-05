@@ -1,0 +1,7 @@
+{
+  "api": "space/api",
+  "cluster-controller": "space/cluster-controller",
+  "data-plane": "space/data-plane",
+  "ui": "space/ui",
+  "worker": "space/worker"
+}

@@ -1,0 +1,52 @@
+experimental = ["setup-scripts"]
+
+[scripts.setup.postgres]
+command = "bash ci/scripts/setup-nextest-postgres.sh"
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+[scripts.setup.redis]
+command = "bash ci/scripts/setup-nextest-redis.sh"
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+[[profile.default.scripts]]
+# The migrator's bootstrap-role tests exercise cluster-global Postgres roles
+# (fixed names like space_migrator) and each needs a virgin server, so they
+# stay on their own bespoke per-test container rather than the shared one.
+# The migrator's collision-repair and lock-retry tests only touch database-local
+# state (migration history and probe tables), so they use the shared server
+# too, via the raw (unmigrated) database fixture rather than the migrated
+# template every other rdeps(pplx-space-db-test-fixtures) test clones from.
+# Its user_password tests are database-local as well and already clone the
+# migrated template through pg_test_db, so the package-wide exclusion above
+# only cost them their own container and their own copy of the template.
+# Spaced host tests use only local sockets; common-svc's dev dependency
+# otherwise pulls them into this transitive fixture selection.
+filter = '''
+(rdeps(pplx-space-db-test-fixtures)
+ and not package(pplx-space-db-migrate)
+ and not package(pplx-space-spaced-host-server))
+or test(postgres_collision_repair_tests)
+or test(postgres_lock_retry_tests)
+or (package(pplx-space-db-migrate) and test(user_password::))
+'''
+setup = "postgres"
+
+[[profile.default.scripts]]
+# Publishes SPACE_TEST_REDIS_URL, which client_concurrency's and
+# cluster_admission's Redis-backed tests already prefer over starting their
+# own per-test container (see try_redis_url in both modules). Scoped to the
+# api package only; nothing else in the workspace reads that env var.
+filter = "package(pplx-space-api)"
+setup = "redis"
+
+[[profile.default.overrides]]
+# nextest starts tests in binary order, and these binaries sort near the end,
+# so each started a two-to-three-second test in the last seconds of a run
+# whose slots were otherwise full, and the run waited on it. Starting them
+# first leaves short tests at the tail instead.
+filter = '''
+binary_id(pplx-space-spaced-guest-server::worker_telemetry)
+or binary_id(pplx-space-spaced-guest-server::it)
+or package(pplx-space-volmgr)
+'''
+priority = 10

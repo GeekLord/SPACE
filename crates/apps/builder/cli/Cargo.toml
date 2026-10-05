@@ -1,0 +1,28 @@
+[package]
+name = "pplx-space-build-mgr-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "space-buildmgr"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+
+# internal
+pplx-space-build-mgr = { workspace = true }
+pplx-space-build-mgr-client = { workspace = true }
+pplx-space-common-cli = { workspace = true }

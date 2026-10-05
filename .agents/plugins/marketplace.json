@@ -1,0 +1,20 @@
+{
+  "name": "pplx-space",
+  "interface": {
+    "displayName": "SPACE"
+  },
+  "plugins": [
+    {
+      "name": "pplx-space",
+      "source": {
+        "source": "local",
+        "path": "./.agents/plugins/pplx-space"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "DevOps"
+    }
+  ]
+}

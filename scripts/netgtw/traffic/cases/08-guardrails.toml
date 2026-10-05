@@ -1,0 +1,9 @@
+name = "Platform metadata guardrails cannot be overridden by allow rules"
+
+[[steps]]
+policy = { default = "allow", allow = ["169.254.169.254"] }
+probes = [
+  { kind = "tcp", target = "169.254.169.254", expect = "deny" },
+  { kind = "udp", target = "169.254.169.254", expect = "deny" },
+  { kind = "http", target = "169.254.169.254", host = "allowed.test", expect = "deny" },
+]

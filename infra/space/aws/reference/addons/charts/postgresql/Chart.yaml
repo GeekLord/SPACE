@@ -1,0 +1,5 @@
+apiVersion: v2
+name: space-reference-postgresql
+description: One PostgreSQL instance on an EBS volume, for the SPACE reference deployment.
+type: application
+version: 0.1.0

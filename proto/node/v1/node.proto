@@ -1,0 +1,1138 @@
+syntax = "proto3";
+package space.node.v1;
+
+import "execution/v1/execution.proto";
+
+service NodeManager {
+  // Publish the concrete runtime releases, state formats, and guest components
+  // installed on this node. Compatibility remains runtime-driver-owned.
+  rpc GetExecutionInventory(GetExecutionInventoryRequest)
+      returns (space.execution.v1.NodeExecutionInventory);
+
+  // Lease a preprovisioned network slot, or provision a pod-network allocation.
+  rpc Allocate(AllocateRequest) returns (AllocateResponse);
+
+  // Launch a process inside an allocated namespace.
+  // Runtime-supervisor enters the namespace, drops privileges, and execs.
+  // Returns the PID for sbx-manager to monitor.
+  rpc Launch(LaunchRequest) returns (LaunchResponse);
+
+  // Tear down namespace, veth, routes, iptables for a sandbox.
+  rpc Release(ReleaseRequest) returns (ReleaseResponse);
+
+  // Query node-owned resource admission signals from node-manager.
+  rpc GetNodeResourceStatus(NodeResourceStatusRequest)
+      returns (NodeResourceStatusResponse);
+
+  // Query cheap network-pool counts/config from node-manager state.
+  rpc GetNetworkPoolStatus(NetworkPoolStatusRequest) returns (NetworkPoolStatusResponse);
+
+  // Side-effect-free admission probe. True covers both prepared creation and
+  // identity-fenced disposal; callers must not allocate before checking it.
+  rpc GetCloneCapabilities(CloneCapabilitiesRequest) returns (CloneCapabilitiesResponse);
+
+  // List DB-backed network leases without probing host or namespace resources.
+  rpc ListNetworkLeases(ListNetworkLeasesRequest) returns (ListNetworkLeasesResponse);
+
+  // Enable or disable network-pool drain mode. Draining rejects new leases and
+  // stops background filling while allowing dirty/resetting slots to finish cleanup.
+  rpc SetNetworkPoolDrain(SetNetworkPoolDrainRequest) returns (SetNetworkPoolDrainResponse);
+
+  // Nudge pool repair: enqueue dirty-slot resets and optionally rebuild idle quarantined slots.
+  rpc RepairNetworkPool(RepairNetworkPoolRequest) returns (RepairNetworkPoolResponse);
+
+  // Update live network-pool sizing. Startup-only fields such as pod_netns_path
+  // are configured through /space/config/node.toml and require restart.
+  rpc SetNetworkPoolConfig(SetNetworkPoolConfigRequest) returns (SetNetworkPoolConfigResponse);
+
+  // Send a signal to the process associated with a sandbox.
+  // Validates the PID belongs to the sandbox before signaling.
+  rpc StopProcess(StopProcessRequest) returns (StopProcessResponse);
+
+  // Launch a sandbox using the specified runtime.
+  // fc: Firecracker via jailer (chroot, PID ns, mount ns, cgroup, privilege drop).
+  // Caller must have already called Allocate (for network) and PrepareSandbox (for filesystem).
+  rpc LaunchSandbox(LaunchSandboxRequest) returns (LaunchSandboxResponse);
+
+  // Prepare sandbox filesystem: create dirs, CoW clone rootfs, write config, chown to sandbox UID.
+  // Called by sbx-manager before LaunchSandbox. All filesystem ops run as root.
+  rpc PrepareSandbox(PrepareSandboxRequest) returns (PrepareSandboxResponse);
+
+  // Hold node disk admission while a privileged local builder materializes a
+  // sandbox rootfs outside PrepareSandbox. Completion records the handoff that
+  // makes PrepareSandbox validate and preserve that rootfs instead of cloning
+  // the template over it.
+  rpc ReservePreparedRootfs(ReservePreparedRootfsRequest)
+      returns (ReservePreparedRootfsResponse);
+  rpc CompletePreparedRootfs(CompletePreparedRootfsRequest)
+      returns (CompletePreparedRootfsResponse);
+
+  // Ensure the sandbox-local artifact directory exists and is writable by
+  // sandbox-manager. Used by lifecycle paths that publish artifacts for
+  // already-prepared sandboxes, including adopted warm-pool sandboxes.
+  rpc PrepareSandboxArtifactDir(PrepareSandboxArtifactDirRequest)
+      returns (PrepareSandboxArtifactDirResponse);
+
+  // Comprehensive cleanup: kill processes, remove cgroup, tear down network,
+  // remove nft rules, delete filesystem, release slot. Single call does everything.
+  // Disposable pool clones own no runtime. Never fall back to CleanupSandbox:
+  // it does not enforce the persisted directory identity.
+  rpc CleanupPreparedClone(CleanupPreparedCloneRequest) returns (CleanupSandboxResponse);
+  rpc CleanupSandbox(CleanupSandboxRequest) returns (CleanupSandboxResponse);
+
+  // Inspect all resources for one sandbox (processes, network, cgroup, filesystem, state).
+  rpc InspectSandbox(InspectSandboxRequest) returns (InspectSandboxResponse);
+
+  // Capture the privileged host process and vsock binding for the currently
+  // registered sandbox runtime. Sandbox-manager binds this evidence to its
+  // execution generation and activation attempt before persisting it.
+  rpc CaptureSandboxEndpointProof(CaptureSandboxEndpointProofRequest)
+      returns (SandboxEndpointProof);
+
+  // Compare activation-captured endpoint evidence with the live host runtime.
+  // Validation addresses exact descriptors and process identities and does not
+  // repeat descriptor discovery.
+  rpc ValidateSandboxEndpointProof(ValidateSandboxEndpointProofRequest)
+      returns (ValidateSandboxEndpointProofResponse);
+
+  // Validate root-owned original launch evidence for a gateway host-control peer.
+  rpc ValidateGatewayCaller(ValidateGatewayCallerRequest) returns (ValidateGatewayCallerResponse);
+
+  // Scan for orphaned resources not tracked by any service.
+  rpc ListOrphanCandidates(ListOrphanCandidatesRequest) returns (ListOrphanCandidatesResponse);
+
+  // Pause the VM (freeze vCPUs). Requires the FC API socket to be enabled.
+  rpc PauseSandbox(PauseSandboxRequest) returns (PauseSandboxResponse);
+  // Resume the VM (thaw vCPUs).
+  rpc ResumeSandbox(ResumeSandboxRequest) returns (ResumeSandboxResponse);
+  // Read the Firecracker VM state without granting the caller access to the
+  // privileged Firecracker API socket.
+  rpc GetFirecrackerVmState(GetFirecrackerVmStateRequest)
+      returns (GetFirecrackerVmStateResponse);
+  // Create a full snapshot. VM must be paused first.
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
+  // Load a snapshot into a fresh Firecracker instance.
+  rpc LoadSnapshot(LoadSnapshotRequest) returns (LoadSnapshotResponse);
+
+  // Create a read-only btrfs snapshot of a sandbox's instance subvolume.
+  rpc CreateBtrfsSnapshot(CreateBtrfsSnapshotRequest) returns (CreateBtrfsSnapshotResponse);
+  // Delete a btrfs snapshot.
+  rpc DeleteBtrfsSnapshot(DeleteBtrfsSnapshotRequest) returns (DeleteBtrfsSnapshotResponse);
+  // Delete a sandbox-cache artifact directory at the given path.
+  // Handles both btrfs subvolumes and plain directories, so callers
+  // (snapshot reaper, named-snapshot delete, future cache pruners)
+  // don't need CAP_SYS_ADMIN themselves to invoke
+  // `btrfs subvolume delete`. The path must be under /space/cache.
+  // Idempotent on a missing path (was_present = false, OK).
+  rpc DeleteCacheArtifact(DeleteCacheArtifactRequest) returns (DeleteCacheArtifactResponse);
+  // List btrfs snapshots for a sandbox.
+  rpc ListBtrfsSnapshots(ListBtrfsSnapshotsRequest) returns (ListBtrfsSnapshotsResponse);
+  // Roll back: replace instance subvolume with a writable copy of a snapshot, prune newer snapshots.
+  rpc RollbackBtrfsSnapshot(RollbackBtrfsSnapshotRequest) returns (RollbackBtrfsSnapshotResponse);
+  // Get exclusive disk usage for a batch of sandboxes.
+  rpc GetDiskUsage(GetDiskUsageRequest) returns (GetDiskUsageResponse);
+  // Flush host filesystem caches for the sandbox rootfs backing file.
+  rpc SyncGuest(SyncGuestRequest) returns (SyncGuestResponse);
+
+  // Update cgroup resource limits for a running sandbox.
+  rpc UpdateCgroup(UpdateCgroupRequest) returns (UpdateCgroupResponse);
+
+  // Clone only into a destination already prepared by sandbox-manager.
+  // Cleanup removes that destination under the same node operation gate, so
+  // a delayed request cannot recreate it.
+  rpc CloneSandboxIntoPreparedRoot(CloneSandboxRequest) returns (CloneSandboxResponse);
+
+  // Expose a port for inbound traffic: install DNAT rule in pod namespace.
+  rpc ExposePort(ExposePortRequest) returns (ExposePortResponse);
+  // Remove an exposed port's DNAT rule.
+  rpc UnexposePort(UnexposePortRequest) returns (UnexposePortResponse);
+
+  // Allow inbound traffic to a guest port (add to sandbox allowlist).
+  rpc AllowPort(AllowPortRequest) returns (AllowPortResponse);
+  // Deny inbound traffic to a guest port (remove from sandbox allowlist).
+  rpc DenyPort(DenyPortRequest) returns (DenyPortResponse);
+
+  // ─── Btrfs delegation ────────────────────────────────────────────────
+  //
+  // Privileged btrfs operations the suspend codec depends on. All run
+  // inside node-manager (the privileged service in K8s + the systemd
+  // direct-deploy unit), so the callers (template-manager,
+  // sandbox-manager) can stay non-root with no `capabilities.add` in
+  // production. Each RPC's request carries the domain identifiers
+  // (template name + content_hash, sandbox_id) the privileged side
+  // needs to derive canonical paths and the deterministic UUIDv5 — the
+  // calling service never passes arbitrary host paths to nodemgr.
+
+  // Create the canonical template digest dir as a btrfs subvolume at
+  // /space/cache/firecracker/templates/<name>/<content_hash>. Returned
+  // RW so callers can write files into it before finalizing. Errors:
+  // `AlreadyExists` if the path is already populated; `Internal` if
+  // the `btrfs subvolume create` ioctl fails for any other reason.
+  rpc BtrfsCreateTemplateSubvolume(BtrfsCreateTemplateSubvolumeRequest)
+      returns (BtrfsCreateTemplateSubvolumeResponse);
+
+  // Stamp the deterministic UUIDv5 `received_uuid` on the template
+  // subvolume and toggle it RO. UUIDv5 is computed inside nodemgr from
+  // `(template_name, content_hash)` — callers do not pass it — so the
+  // canonical wire UUID has a single source of truth. Idempotent:
+  // re-running on an already-stamped + RO subvolume is a no-op.
+  rpc BtrfsFinalizeTemplateSubvolume(BtrfsFinalizeTemplateSubvolumeRequest)
+      returns (BtrfsFinalizeTemplateSubvolumeResponse);
+
+  // Subvolume-aware delete for the canonical template digest dir.
+  // Clears RO if set, deletes the subvolume; falls through to
+  // `remove_dir_all` for plain dirs (non-btrfs hosts / legacy installs).
+  //
+  // Coarse primitive: does NOT check whether sandboxes are still
+  // referencing this template via `parent_uuid`. Current callers
+  // (tmplmgr's PullCleanupGuard, ImportStagingGuard, hash-mismatch
+  // cleanup) are all on partial / unpublished installs, where no
+  // sandbox can have snapshotted the template yet. A future
+  // operator-driven "delete published template" must add its own
+  // usage-checking layer on top before invoking this RPC.
+  rpc BtrfsDeleteTemplateSubvolume(BtrfsDeleteTemplateSubvolumeRequest)
+      returns (BtrfsDeleteTemplateSubvolumeResponse);
+
+  // Encode a sandbox's rootfs as a `btrfs send -p <template>
+  // <instance.ro>` stream. Validates preconditions (template is a
+  // subvolume with matching `received_uuid`, instance is a subvolume
+  // with `parent_uuid` pointing at the template's UUID), takes the
+  // RO snapshot in the requested snapshot destination, runs the send writing
+  // `rootfs.btrfs-send` there, removes the
+  // superseded `rootfs.ext4`, cleans up the RO snapshot. Errors:
+  // `FailedPrecondition` for any precondition mismatch (caller can
+  // retry with Full codec); `Internal` for codec failures mid-send.
+  rpc BtrfsEncodeRootfsSend(BtrfsEncodeRootfsSendRequest)
+      returns (BtrfsEncodeRootfsSendResponse);
+
+  // Encode one exact read-only named snapshot as a `btrfs send -p
+  // <template>` stream. Unlike BtrfsEncodeRootfsSend, this does not
+  // snapshot the current live instance again: the named snapshot is the
+  // immutable source, and the stream is written to a separate artifact
+  // directory under the same sandbox cache root.
+  rpc BtrfsEncodeSnapshotRootfsSend(BtrfsEncodeSnapshotRootfsSendRequest)
+      returns (BtrfsEncodeSnapshotRootfsSendResponse);
+
+  // Consume a `rootfs.btrfs-send` stream pulled to the sandbox's
+  // local snapshot dir and reconstruct the sandbox's `instance/`
+  // subvolume against the local template. Validates the local
+  // template carries the matching deterministic `received_uuid`,
+  // cleans up any stale `instance` / `instance.ro` left by a prior
+  // attempt, runs `btrfs receive`, renames the received subvolume to
+  // `instance/`, toggles RW so FC can write to it. The required target selects
+  // either a stopped canonical execution or a unique restore staging scope.
+  rpc BtrfsReceiveInstance(BtrfsReceiveInstanceRequest)
+      returns (BtrfsReceiveInstanceResponse);
+
+  // Subvolume-aware delete for a sandbox's `instance/` (and any stray
+  // `instance.ro` from a crashed prior btrfs-send encode). Used by
+  // cleanup paths in the suspend / restore handlers. The required target has
+  // the same authority rules as BtrfsReceiveInstance.
+  rpc BtrfsDeleteSandboxInstance(BtrfsDeleteSandboxInstanceRequest)
+      returns (BtrfsDeleteSandboxInstanceResponse);
+
+  // ─── BYOK encrypted-volume delegation ────────────────────────────────
+  //
+  // Privileged device-mapper operations (losetup / cryptsetup / dmsetup /
+  // mount) behind the per-sandbox encrypted rootfs and encrypted data
+  // volumes. They live in node-manager — the privileged daemon — so the
+  // unprivileged sandbox-manager can orchestrate BYOK sandboxes without
+  // root, and so volume-manager does not need a privileged deployment
+  // shape. Like the btrfs delegation above, requests carry domain
+  // identifiers (sandbox_id, volume_name) and node-manager derives the
+  // canonical paths itself; the few caller-supplied paths (restore
+  // sources, the suspend staging dir) are validated to live under the
+  // calling sandbox's cache dir. node-manager resolves the sandbox's
+  // volume DEK from credmgr by sandbox_id — callers never handle key
+  // material.
+
+  // Bring up (or re-open) the per-sandbox encrypted live rootfs: a
+  // dm-crypt COW over a dm-snapshot whose origin is the plaintext,
+  // reflink-shared template rootfs at
+  // `<cache>/<sandbox_id>/instance/rootfs.ext4`, with the COW at
+  // `<cache>/<sandbox_id>/instance/cow.luks`. Format-vs-open is decided
+  // from on-disk state (whether the COW is already a LUKS container).
+  // The returned `mapper_path` is the rootfs drive's Firecracker
+  // `path_on_host`. Idempotent on the sandbox. Teardown has no RPC: the
+  // device stack is released by node-manager's own sandbox cleanup.
+  rpc PrepareEncryptedRootfs(PrepareEncryptedRootfsRequest)
+      returns (PrepareEncryptedRootfsResponse);
+
+  // Format (fresh) or open+mount an encrypted per-sandbox data volume:
+  // btrfs(compress-force=zstd) over dm-crypt, backed by
+  // `<cache>/<sandbox_id>/instance/<volume_name>.luks` and mounted at
+  // `<cache>/<sandbox_id>/<volume_name>-vol`. Today's only consumer is
+  // the suspend snapshot capture (`volume_name="snapshot"`). Idempotent.
+  rpc PrepareEncryptedVolume(PrepareEncryptedVolumeRequest)
+      returns (PrepareEncryptedVolumeResponse);
+
+  // Unmount and close an encrypted data volume, sealing its LUKS2
+  // backing file, optionally staging sealed (ciphertext) artifacts out
+  // of the sandbox-private `instance/` dir for the caller. Idempotent.
+  rpc ReleaseEncryptedVolume(ReleaseEncryptedVolumeRequest)
+      returns (ReleaseEncryptedVolumeResponse);
+
+  // Bring up the same dm-snapshot composite as PrepareEncryptedRootfs but
+  // with a PLAINTEXT COW: the shape a warm-pool member boots on before it
+  // has an owner. No org exists at fill time, so no DEK can be issued and
+  // no LUKS container can be formatted; the composite still routes every
+  // guest write to the COW, which is what lets the COW be re-homed onto an
+  // encrypted one at claim without touching the booted guest's rootfs.
+  //
+  // Idempotent: a live composite is handed back as-is, and a stop→start
+  // re-opens the persisted COW (detected by its dm-snapshot store header)
+  // rather than re-initializing it. Any mid-build failure unwinds the
+  // devices it created; `cow.plain` survives on disk only once its store
+  // has been activated, so its presence means "this member has committed
+  // COW state".
+  //
+  // A member that is claimed by a non-BYOK org keeps this COW — and until
+  // the claim path collapses or re-homes it, such a sandbox cannot
+  // suspend or snapshot: the plaintext artifact set captures only the
+  // origin file, so capturing a composite-backed sandbox would silently
+  // drop every write in the COW. sbx-mgr enforces that as a
+  // FAILED_PRECONDITION veto keyed on `cow.plain`'s presence.
+  rpc PrepareSnapshotRootfs(PrepareSnapshotRootfsRequest)
+      returns (PrepareSnapshotRootfsResponse);
+
+}
+
+message GetExecutionInventoryRequest {}
+
+enum NetworkProtocol {
+  NETWORK_PROTOCOL_UNSPECIFIED = 0;
+  NETWORK_PROTOCOL_TCP = 1;
+  NETWORK_PROTOCOL_UDP = 2;
+}
+
+enum NetworkSlotState {
+  NETWORK_SLOT_STATE_UNSPECIFIED = 0;
+  NETWORK_SLOT_STATE_MISSING = 1;
+  NETWORK_SLOT_STATE_CREATING = 2;
+  NETWORK_SLOT_STATE_READY = 3;
+  NETWORK_SLOT_STATE_LEASING = 4;
+  NETWORK_SLOT_STATE_LEASED = 5;
+  NETWORK_SLOT_STATE_DIRTY = 6;
+  NETWORK_SLOT_STATE_RESETTING = 7;
+  NETWORK_SLOT_STATE_QUARANTINED = 8;
+  NETWORK_SLOT_STATE_DESTROYING = 9;
+}
+
+enum NetworkSlotHealth {
+  NETWORK_SLOT_HEALTH_UNSPECIFIED = 0;
+  NETWORK_SLOT_HEALTH_UNKNOWN = 1;
+  NETWORK_SLOT_HEALTH_HEALTHY = 2;
+  NETWORK_SLOT_HEALTH_DEGRADED = 3;
+  NETWORK_SLOT_HEALTH_INVALID = 4;
+}
+
+enum NetworkPoolStatus {
+  NETWORK_POOL_STATUS_UNSPECIFIED = 0;
+  NETWORK_POOL_STATUS_HEALTHY = 1;
+  NETWORK_POOL_STATUS_DEGRADED = 2;
+  NETWORK_POOL_STATUS_EMPTY = 3;
+  NETWORK_POOL_STATUS_DRAINING = 4;
+  NETWORK_POOL_STATUS_WARMING = 5;
+}
+
+// Persisted by the lifecycle owner before dispatch, independently of slot leases.
+// Required on every execution-mutating request that carries this field.
+// Missing identity is rejected even when no execution is currently bound.
+// previous_id is only authority to recover an allocation whose reply was lost;
+// it never authorizes Prepare or Launch against that previous execution.
+message ExecutionFence {
+  string execution_id = 1;
+  optional string previous_id = 2;
+}
+
+message AllocateRequest {
+  string sandbox_id = 1;
+  // Optional: the pod's network namespace path (from CNI). When set,
+  // node-manager creates the sandbox namespace as a child and bridges
+  // it to the pod namespace via a veth pair + MASQUERADE.
+  optional string netns_path = 2;
+  // Effective Firecracker host cgroup memory.max needed for this new VM,
+  // clamped to the node-manager's configured sandbox cgroup memory limit.
+  // Required (non-zero) when the request creates a new lease.
+  uint64 sandbox_cgroup_memory_mib = 3;
+  ExecutionFence execution_fence = 4;
+}
+
+message AllocateResponse {
+  uint32 slot = 1;
+  string namespace = 2;
+  string namespace_path = 3;
+  string guest_ip = 4;
+  string guest_gateway = 5;
+  string guest_mac = 6;
+  string tap_device = 7;
+  uint64 slot_generation = 8;
+  string slot_label = 9;
+  // Slot-derived UID that owns lease-scoped host resources.
+  uint32 sandbox_uid = 10;
+}
+
+message LaunchRequest {
+  string sandbox_id = 1;
+  string program = 2;
+  repeated string args = 3;
+  uint32 uid = 4;
+  uint32 gid = 5;
+  map<string, string> env = 6;
+  ExecutionFence execution_fence = 7;
+}
+
+message LaunchResponse {
+  uint32 pid = 1;
+}
+
+message ReleaseRequest {
+  string sandbox_id = 1;
+  bool force = 2;
+  ExecutionFence execution_fence = 3;
+}
+
+message ReleaseResponse {}
+
+message NodeResourceStatusRequest {}
+
+enum CacheDiskAdmissionState {
+  CACHE_DISK_ADMISSION_STATE_UNSPECIFIED = 0;
+  CACHE_DISK_ADMISSION_STATE_READY = 1;
+  CACHE_DISK_ADMISSION_STATE_WARNING = 2;
+  CACHE_DISK_ADMISSION_STATE_FULL = 3;
+  CACHE_DISK_ADMISSION_STATE_UNAVAILABLE = 4;
+}
+
+message CacheDiskStatus {
+  // `statvfs.f_blocks * f_frsize` for `/space/cache`. This is filesystem
+  // capacity, not the sum of logical bytes referenced by btrfs subvolumes.
+  uint64 statvfs_total_bytes = 1;
+  // `statvfs.f_bfree * f_frsize`; diagnostic only. Admission uses
+  // `statvfs_available_bytes`, not `total - logical referenced bytes`.
+  uint64 statvfs_free_bytes = 2;
+  // `statvfs.f_bavail * f_frsize`; the conservative physical headroom signal
+  // used by node-local admission before btrfs pressure checks.
+  uint64 statvfs_available_bytes = 3;
+  double statvfs_available_fraction = 4;
+  uint64 effective_statvfs_available_bytes = 5;
+  uint64 pending_reservation_bytes = 6;
+  CacheDiskAdmissionState admission_state = 7;
+  string admission_reason = 8;
+  string admission_detail = 9;
+  // Absent when `/space/cache` is not btrfs or the btrfs CLI is unavailable.
+  optional uint64 btrfs_metadata_available_bytes = 10;
+  // Absent when `/space/cache` is not btrfs or the btrfs CLI is unavailable.
+  optional uint64 btrfs_device_unallocated_bytes = 11;
+}
+
+message NodeResourceStatusResponse {
+  // Node-manager-owned resource domains live here as siblings. Add CPU,
+  // memory, GPU, or future node-wide admission signals here instead of
+  // attaching them to network-pool or live network diagnostic responses.
+  CacheDiskStatus cache_disk = 1;
+}
+
+message NetworkPoolStatusRequest {}
+
+message CloneCapabilitiesRequest {}
+message CloneCapabilitiesResponse {
+  bool prepared_clone_disposal = 1;
+}
+
+message NetworkPoolStatusResponse {
+  NetworkPoolStatus network_pool_status = 1;
+  uint32 network_pool_target = 2;
+  uint32 network_pool_min_ready = 3;
+  uint32 network_slots_total = 4;
+  uint32 network_slots_ready = 5;
+  uint32 network_slots_leased = 6;
+  uint32 network_slots_dirty = 7;
+  uint32 network_slots_resetting = 8;
+  uint32 network_slots_creating = 9;
+  uint32 network_slots_quarantined = 10;
+  uint32 network_slots_degraded = 11;
+  uint32 network_pool_schema_version = 12;
+  uint32 network_pool_max_slots = 13;
+  optional string network_pool_pod_netns_path = 14;
+  uint32 network_pool_retained_ready = 15;
+  uint64 sandbox_cgroup_memory_mib = 16;
+  uint64 sandbox_guest_memory_max_mib = 17;
+  uint64 sandbox_memory_headroom_mib = 18;
+  uint64 sandbox_cgroup_total_memory_mib = 19;
+}
+
+message ListNetworkLeasesRequest {}
+
+message NetworkLease {
+  string sandbox_id = 1;
+  uint32 slot = 2;
+  string namespace = 3;
+  string sveth = 4;
+  string vpeer = 5;
+  string slot_label = 6;
+  uint64 slot_generation = 7;
+  NetworkSlotState slot_state = 8;
+  NetworkSlotHealth slot_health = 9;
+  optional string last_error = 10;
+  optional uint32 sandbox_uid = 11;
+  optional string pod_netns_path = 12;
+  optional uint32 pid = 13;
+}
+
+message ListNetworkLeasesResponse {
+  repeated NetworkLease leases = 1;
+}
+
+
+message SetNetworkPoolDrainRequest {
+  bool draining = 1;
+}
+
+message SetNetworkPoolDrainResponse {
+  bool draining = 1;
+}
+
+message RepairNetworkPoolRequest {
+  bool rebuild_quarantined = 1;
+}
+
+message RepairNetworkPoolResponse {
+  uint32 reset_enqueued = 1;
+  bool topup_requested = 2;
+}
+
+message NetworkPoolConfigInfo {
+  uint32 max_slots = 1;
+  uint32 target_ready_slots = 2;
+  uint32 min_ready_slots = 3;
+  optional string pod_netns_path = 4;
+  uint32 retained_ready_slots = 5;
+}
+
+message SetNetworkPoolConfigRequest {
+  optional uint32 max_slots = 1;
+  optional uint32 target_ready_slots = 2;
+  optional uint32 min_ready_slots = 3;
+  optional uint32 retained_ready_slots = 4;
+}
+
+message SetNetworkPoolConfigResponse {
+  NetworkPoolConfigInfo config = 1;
+}
+
+message StopProcessRequest {
+  string sandbox_id = 1;
+  uint32 signal = 2;  // e.g. 15 = SIGTERM, 9 = SIGKILL
+  // Exact process to signal. When absent, falls back to the sandbox's
+  // last-launched process pid tracked by node-manager. Callers targeting a
+  // specific sidecar (e.g. cycling the net-gateway) must set this, because the
+  // tracked pid is whichever sidecar launched most recently. The
+  // runtime-supervisor independently verifies the pid belongs to this
+  // sandbox's cgroup before signaling.
+  optional uint32 pid = 3;
+  ExecutionFence execution_fence = 4;
+}
+
+message StopProcessResponse {
+  bool success = 1;
+}
+
+message LaunchSandboxRequest {
+  string sandbox_id = 1;
+  uint32 uid = 2;
+  uint32 gid = 3;
+  // Optional cgroup overrides.
+  optional uint32 vcpu_count = 4; // Number of vCPUs
+  optional uint64 memory_mib = 5; // Host cgroup memory.max in MiB
+  optional uint32 pids_max = 6;   // Max PIDs
+  string runtime = 7;       // Required: "fc", "gvisor", or "ch"
+  bool snapshot_restore = 8; // If true, FC starts idle (no config boot) for snapshot load
+  optional space.execution.v1.ExecutionMetadata requested_execution = 9;
+  space.execution.v1.ExecutionSelectionMode execution_selection_mode = 10;
+  // BYOK encrypted rootfs: when set, this host block device (a
+  // /dev/mapper/<id> dm-crypt-over-dm-snapshot composite from vol-mgr) is
+  // bind-mounted into the jail as the rootfs drive instead of the cloned
+  // instance/rootfs.ext4 file. Absent (the default, and the only shape
+  // non-BYOK sandboxes ever send) = unchanged behavior. The instance file
+  // still exists as the dm-snapshot origin behind the mapper.
+  optional string rootfs_block_device_path = 11;
+  ExecutionFence execution_fence = 12;
+}
+
+message LaunchSandboxResponse {
+  uint32 pid = 1;              // Sandbox PID (observed from host)
+  string api_socket_path = 2; // Host path to Firecracker API socket: {JAIL_DIR}/firecracker/{id}/root/firecracker.sock
+  space.execution.v1.ExecutionMetadata resolved_execution = 3;
+}
+
+message PrepareSandboxRequest {
+  string sandbox_id = 1;
+  optional string template = 2;   // template name (e.g. "seed", "base")
+  uint32 uid = 3;                // sandbox UID to chown to
+  optional string vm_config_json = 4; // VM config JSON to write (format depends on runtime)
+  string metadata_json = 5;      // sandbox metadata.json contents to write
+  string runtime = 6;            // Required: "fc", "gvisor", or "ch"
+  optional string template_dir = 7;       // resolved content-addressed build dir
+  optional string snapshot_dir = 8;       // resolved snapshot dir
+  optional uint32 rootfs_size_mb = 9;     // explicit sandbox rootfs size override
+  optional space.execution.v1.ExecutionMetadata requested_execution = 10;
+  space.execution.v1.ExecutionSelectionMode execution_selection_mode = 11;
+  optional string artifact_template = 12;
+  optional string content_hash = 13;
+  ExecutionFence execution_fence = 14;
+}
+
+message PrepareSandboxResponse {
+  string cache_dir = 1;          // /space/cache/firecracker/sandboxes/{id}/instance
+  string run_dir = 2;            // /space/run/firecracker/sandboxes/{id}
+  string rootfs_path = 3;        // full path to CoW rootfs
+  string config_path = 4;        // full path to vm-config.json
+  string log_path = 5;           // full path to fc.log
+  space.execution.v1.ExecutionMetadata resolved_execution = 6;
+}
+
+message ReservePreparedRootfsRequest {
+  string sandbox_id = 1;
+  uint32 rootfs_size_mb = 2;
+}
+
+message ReservePreparedRootfsResponse {
+  string rootfs_path = 1;
+}
+
+enum PreparedRootfsDisposition {
+  PREPARED_ROOTFS_DISPOSITION_UNSPECIFIED = 0;
+  PREPARED_ROOTFS_DISPOSITION_COMMIT = 1;
+  PREPARED_ROOTFS_DISPOSITION_ABORT = 2;
+}
+
+message CompletePreparedRootfsRequest {
+  string sandbox_id = 1;
+  PreparedRootfsDisposition disposition = 2;
+}
+
+message CompletePreparedRootfsResponse {}
+
+message PrepareSandboxArtifactDirRequest {
+  string sandbox_id = 1;
+}
+
+message PrepareSandboxArtifactDirResponse {}
+
+message CleanupPreparedCloneRequest {
+  string sandbox_id = 1;
+  // Absent means preparation did not durably bind a tree: only absence is safe.
+  CloneDirectoryIdentity prepared_destination = 2;
+}
+
+message CleanupSandboxRequest {
+  string sandbox_id = 1;
+  bool force = 2;            // kill processes even if running
+  bool keep_filesystem = 3;
+  // If true and keep_filesystem=true, return after runtime teardown and slot
+  // release. Node-manager continues retained-cache neutralization and slot
+  // recycling asynchronously; the old slot is not reusable until that finishes.
+  bool return_after_slot_release = 5;
+  // If true, skip the Firecracker SIGTERM grace period and send SIGKILL
+  // immediately. Used after suspend snapshots are durable, where graceful guest
+  // shutdown is not part of the lifecycle contract.
+  bool immediate_kill = 6;
+  ExecutionFence execution_fence = 7;
+}
+
+message CleanupSandboxResponse {
+  repeated string actions = 1;  // human-readable log of what was cleaned
+  // A retained filesystem keeps its identity after lease release. The owner
+  // persists this acknowledgement before completing its cleanup episode.
+  optional string retained_execution_id = 2;
+}
+
+message InspectSandboxRequest {
+  string sandbox_id = 1;
+  string uuid8 = 2;
+  optional uint32 uid = 3;
+  optional uint32 slot = 4;
+  optional string template = 5;
+  // Read durable authority without host probes; works after lease release too.
+  bool execution_only = 6;
+}
+
+message InspectSandboxResponse {
+  string sandbox_id = 1;
+  optional uint32 slot = 2;
+  optional uint32 uid = 3;
+
+  // Processes
+  optional uint32 fc_pid = 10;
+  bool fc_alive = 11;
+  optional uint32 spaced_host_pid = 12;
+  bool spaced_host_alive = 13;
+  optional uint32 netgtw_pid = 14;
+  bool netgtw_alive = 15;
+
+  // Network
+  bool namespace_exists = 20;
+  bool sveth_exists = 21;
+  bool vpeer_exists = 22;
+  bool tap_exists = 23;
+  bool host_route_exists = 24;
+  bool nft_forward_exists = 25;
+  bool nft_ns_snat_exists = 26;
+  bool nft_ns_dnat_exists = 27;
+  bool ns_ip_forward = 28;
+  bool ns_rp_filter_off = 29;
+
+  // Cgroup
+  bool cgroup_exists = 30;
+  string cgroup_cpu_max = 31;
+  string cgroup_memory_max = 32;
+  string cgroup_memory_current = 33;
+  string cgroup_pids_max = 34;
+  string cgroup_pids_current = 35;
+
+  // Filesystem
+  bool cache_dir_exists = 40;
+  bool run_dir_exists = 41;
+  bool jailer_chroot_exists = 42;
+  bool vm_config_exists = 43;
+  bool fc_log_exists = 45;
+  bool vsock_sock_exists = 46;
+  bool spaced_sock_exists = 47;
+  bool rootfs_exists = 48;          // cache_dir/instance/rootfs.ext4
+  bool fc_pid_symlink_exists = 49;  // run_dir/fc.pid -> /proc/{pid}
+  bool spaced_host_pid_symlink_exists = 55; // run_dir/space-spaced-host-svc.pid
+  bool firecracker_pidfile_exists = 56;     // jail_root/firecracker.pid
+  bool netgtw_pid_symlink_exists = 57;      // run_dir/space-netgtw-svc.pid
+  bool nft_ns_redirect_exists = 58;         // nftables REDIRECT on tap0 in namespace
+  bool nft_ns_forward_drop_exists = 59;     // nftables forward DROP on tap0 in namespace
+
+  // State
+  bool slot_allocated = 50;
+  optional string template = 51;
+  ExecutionFence execution_fence = 60;
+}
+
+message CaptureSandboxEndpointProofRequest {
+  string sandbox_id = 1;
+}
+
+message ProcessEndpointIdentity {
+  uint32 pid = 1;
+  uint64 start_time_ticks = 2;
+  uint64 executable_device = 3;
+  uint64 executable_inode = 4;
+}
+
+message VsockEndpointIdentity {
+  string path = 1;
+  uint64 device = 2;
+  uint64 inode = 3;
+  uint32 owner_uid = 4;
+  uint32 owner_gid = 5;
+  uint32 guest_cid = 6;
+  // The descriptor by which the active Firecracker process owns this transport.
+  uint32 runtime_fd = 7;
+  uint64 runtime_socket_inode = 8;
+}
+
+message SandboxEndpointProof {
+  string sandbox_id = 1;
+  ProcessEndpointIdentity spaced_host = 2;
+  ProcessEndpointIdentity runtime_process = 3;
+  VsockEndpointIdentity vsock = 4;
+}
+
+message ValidateSandboxEndpointProofRequest {
+  SandboxEndpointProof proof = 1;
+}
+
+message ValidateSandboxEndpointProofResponse {}
+
+message ValidateGatewayCallerRequest {
+  string sandbox_id = 1;
+  uint32 pid = 2;
+  uint32 uid = 3;
+  // Opaque per-launch authority, never log or echo.
+  bytes launch_capability = 4;
+}
+
+message ValidateGatewayCallerResponse {}
+
+message ListOrphanCandidatesRequest {
+  // Opaque, single-use cursor. Restart the scan on Aborted (expiry/restart).
+  string page_token = 2;
+}
+
+message ListOrphanCandidatesResponse {
+  repeated string orphaned_namespaces = 1;
+  repeated string orphaned_cgroups = 2;
+  repeated string orphaned_run_dirs = 3;
+  repeated string orphaned_cache_dirs = 4;
+  repeated string orphaned_nft_rules = 5; // Root network namespace only.
+  repeated string orphaned_processes = 6; // "PID:sandbox_id" for untracked firecracker/jailer processes
+  string next_page_token = 7;
+  // True only on the last page of a scan with no missing/error evidence.
+  // This is a live walk, NOT an atomic snapshot or permission to delete.
+  bool complete = 8;
+  int64 scan_started_at_unix_ms = 9;
+  int64 observed_at_unix_ms = 10;
+  repeated string warnings = 11;
+}
+
+message PauseSandboxRequest {
+  string sandbox_id = 1;
+  ExecutionFence execution_fence = 2;
+}
+message PauseSandboxResponse {}
+
+message ResumeSandboxRequest {
+  string sandbox_id = 1;
+  ExecutionFence execution_fence = 2;
+}
+message ResumeSandboxResponse {}
+
+message GetFirecrackerVmStateRequest {
+  string sandbox_id = 1;
+}
+
+enum FirecrackerVmState {
+  FIRECRACKER_VM_STATE_UNSPECIFIED = 0;
+  FIRECRACKER_VM_STATE_NOT_STARTED = 1;
+  FIRECRACKER_VM_STATE_RUNNING = 2;
+  FIRECRACKER_VM_STATE_PAUSED = 3;
+}
+
+message GetFirecrackerVmStateResponse {
+  FirecrackerVmState state = 1;
+}
+
+message CreateSnapshotRequest {
+  string sandbox_id = 1;
+  string snapshot_path = 2;  // chroot-relative path for vmstate
+  string mem_file_path = 3;  // chroot-relative path for memory
+  optional string dest_dir = 4; // host-absolute dir to copy snapshot files to after creation
+  // BYOK encrypted snapshot: host-absolute mount point of an already-mounted
+  // encrypted btrfs(compress-force=zstd)-over-dm-crypt volume. When set, the
+  // jailed Firecracker writes vmstate+memory directly into this volume (bind-
+  // mounted into the jail), so they land compressed+encrypted from t0 — no
+  // plaintext copy and `dest_dir` is ignored.
+  optional string snapshot_volume_mount_dir = 5;
+  ExecutionFence execution_fence = 6;
+}
+message CreateSnapshotResponse {}
+
+message LoadSnapshotRequest {
+  string sandbox_id = 1;
+  string snapshot_path = 2;  // chroot-relative path for vmstate
+  string mem_file_path = 3;  // chroot-relative path for memory
+  optional string source_dir = 4; // host-absolute dir to copy snapshot files from into jail
+  // BYOK encrypted snapshot: host-absolute mount point of the already-mounted,
+  // decrypted encrypted snapshot volume holding vmstate+memory. When set, FC
+  // loads directly from this volume (bind-mounted into the jail) and
+  // `source_dir` is ignored.
+  optional string snapshot_volume_mount_dir = 7;
+  ExecutionFence execution_fence = 8;
+}
+message LoadSnapshotResponse {}
+
+message CreateBtrfsSnapshotRequest {
+  string sandbox_id = 1;
+  string snapshot_name = 2;  // e.g. "1m-20260331T140000Z"
+  bool writable = 3;         // true = writable snapshot (for full checkpoints that need vmstate written into them)
+  ExecutionFence execution_fence = 4;
+}
+message CreateBtrfsSnapshotResponse {}
+
+message DeleteBtrfsSnapshotRequest {
+  string sandbox_id = 1;
+  string snapshot_name = 2;
+}
+message DeleteBtrfsSnapshotResponse {}
+
+message DeleteCacheArtifactRequest {
+  // Absolute on-disk path of the artifact directory to delete.
+  // Must be under /space/cache; node-mgr rejects any other prefix
+  // or paths containing `..` components.
+  string local_path = 1;
+}
+message DeleteCacheArtifactResponse {
+  // True when the path existed and was successfully deleted.
+  // False when the path did not exist at request time
+  // (idempotent — callers commonly invoke this after their own
+  // best-effort cleanup and don't care which call won).
+  bool was_present = 1;
+}
+
+message ListBtrfsSnapshotsRequest {
+  string sandbox_id = 1;
+  // Retention/delete/rollback need identities, not expensive extent accounting.
+  bool skip_size_measurement = 2;
+  // Empty starts a scan; continue until next_page_token is empty.
+  string page_token = 4;
+}
+message ListBtrfsSnapshotsResponse {
+  repeated BtrfsSnapshotInfo snapshots = 1;
+  string next_page_token = 2;
+}
+message BtrfsSnapshotInfo {
+  string name = 1;        // e.g. "1m-20260331T140000Z"
+  string tier = 2;        // "1m", "10m", "1h"
+  string timestamp = 3;   // RFC3339
+  optional uint64 exclusive_bytes = 4;  // absent when skipped/unavailable, not zero
+  optional uint64 referenced_bytes = 5; // absent when skipped/unavailable
+}
+
+message RollbackBtrfsSnapshotRequest {
+  string sandbox_id = 1;
+  string snapshot_name = 2;  // snapshot to roll back to
+  ExecutionFence execution_fence = 3;
+}
+message RollbackBtrfsSnapshotResponse {
+  repeated string pruned_snapshots = 1;  // snapshots newer than target that were deleted
+}
+
+message GetDiskUsageRequest {
+  repeated string sandbox_ids = 1;
+}
+enum MissingDiskUsageReason {
+  MISSING_DISK_USAGE_REASON_UNSPECIFIED = 0;
+  MISSING_DISK_USAGE_REASON_INSTANCE_PATH_MISSING = 1;
+}
+message MissingDiskUsageId {
+  string id = 1;
+  MissingDiskUsageReason reason = 2;
+}
+message GetDiskUsageResponse {
+  map<string, uint64> usage_bytes = 1;  // sandbox_id -> instance referenced bytes
+  repeated MissingDiskUsageId missing_ids = 2;
+}
+
+message SyncGuestRequest {
+  string sandbox_id = 1;
+}
+message SyncGuestResponse {}
+
+message UpdateCgroupRequest {
+  string sandbox_id = 1;
+  optional uint32 vcpu_count = 2;
+  optional uint32 memory_mib = 3; // Host cgroup memory.max in MiB
+  optional uint32 pids_max = 4;
+  ExecutionFence execution_fence = 5;
+}
+message UpdateCgroupResponse {}
+
+message CloneSandboxRequest {
+  string donor_sandbox_id = 1;  // source sandbox to clone from
+  string new_sandbox_id = 2;    // target sandbox ID
+  string template = 3;          // template name (for kernel path)
+  CloneDirectoryIdentity prepared_destination = 4;
+}
+
+// Identity of an already-open destination directory. Prepared-root cloning
+// requires this witness and never recreates a missing directory.
+message CloneDirectoryIdentity {
+  uint64 device = 1;
+  uint64 inode = 2;
+}
+
+message CloneSandboxResponse {}
+
+message ExposePortRequest {
+  string sandbox_id = 1;
+  uint32 port = 2;           // Host port (1-65535)
+  NetworkProtocol protocol = 3;
+  optional uint32 guest_port = 4; // Guest port
+}
+message ExposePortResponse {}
+
+message UnexposePortRequest {
+  string sandbox_id = 1;
+  optional uint32 port = 2; // Host port to unexpose; absent removes all ports for this sandbox
+  NetworkProtocol protocol = 3;
+}
+message UnexposePortResponse {}
+
+message AllowPortRequest {
+  string sandbox_id = 1;
+  uint32 port = 2;       // Guest port to allow (1-65535)
+  NetworkProtocol protocol = 3;
+}
+message AllowPortResponse {}
+
+message DenyPortRequest {
+  string sandbox_id = 1;
+  optional uint32 port = 2; // Guest port to deny; absent resets to closed
+  NetworkProtocol protocol = 3;
+}
+message DenyPortResponse {}
+
+// ─── Btrfs delegation messages ─────────────────────────────────────────
+
+message BtrfsCreateTemplateSubvolumeRequest {
+  // Template identifiers — nodemgr derives the canonical digest dir
+  // path from these. Callers do NOT pass arbitrary paths.
+  string template_name = 1;
+  string content_hash = 2;  // "sha256:..."
+}
+message BtrfsCreateTemplateSubvolumeResponse {
+  // The path nodemgr created, returned for logging / sanity-checking
+  // by the caller. Always derived from the request fields, never
+  // attacker-controlled.
+  string digest_dir = 1;
+}
+
+message BtrfsFinalizeTemplateSubvolumeRequest {
+  string template_name = 1;
+  string content_hash = 2;
+}
+message BtrfsFinalizeTemplateSubvolumeResponse {
+  // The UUIDv5 nodemgr stamped, returned so the caller can log it
+  // and/or correlate against the codec's restore-side check. Derived
+  // canonically from (template_name, content_hash); callers can
+  // recompute independently for verification.
+  string received_uuid = 1;
+}
+
+message BtrfsDeleteTemplateSubvolumeRequest {
+  string template_name = 1;
+  string content_hash = 2;
+}
+message BtrfsDeleteTemplateSubvolumeResponse {}
+
+message BtrfsEncodeRootfsSendRequest {
+  // Sandbox + template identity. nodemgr derives the canonical
+  // instance/, template, and snapshot dir paths from these. The
+  // template_name + content_hash are also used to verify the
+  // sandbox instance's lineage (parent_uuid -> template.uuid) and
+  // the template's received_uuid (deterministic UUIDv5) before
+  // running `btrfs send -p`.
+  string sandbox_id = 1;
+  string template_name = 2;
+  string content_hash = 3;
+  // Optional host-absolute artifact destination. Restricted to this
+  // sandbox's snapshot roots; absent uses the canonical local restore dir.
+  optional string dest_dir = 4;
+  ExecutionFence execution_fence = 5;
+}
+message BtrfsEncodeRootfsSendResponse {
+  // Size of the produced rootfs.btrfs-send stream, returned so the
+  // caller can record / log it without having to stat the file.
+  uint64 stream_bytes = 1;
+}
+
+message BtrfsEncodeSnapshotRootfsSendRequest {
+  string sandbox_id = 1;
+  string template_name = 2;
+  string content_hash = 3;
+  // Node-manager derives the source path under this sandbox's named-snapshot
+  // root. Callers cannot supply an arbitrary source path.
+  string snapshot_name = 4;
+  // Host-absolute artifact destination. Restricted to this sandbox's
+  // snapshot roots and required to be separate from the read-only source.
+  string dest_dir = 5;
+}
+message BtrfsEncodeSnapshotRootfsSendResponse {
+  uint64 stream_bytes = 1;
+}
+
+// A canonical instance belongs to an execution; restore staging belongs to a
+// unique transfer scope. Missing targets are rejected, never defaulted.
+message InstanceTarget {
+  oneof target {
+    ExecutionFence execution = 1;
+    string restore_scope_id = 2;
+  }
+}
+
+message BtrfsReceiveInstanceRequest {
+  string sandbox_id = 1;
+  string template_name = 2;
+  string content_hash = 3;
+  InstanceTarget target = 4;
+}
+message BtrfsReceiveInstanceResponse {}
+
+message PrepareEncryptedRootfsRequest {
+  string sandbox_id = 1;
+  // Snapshot-restore path: the downloaded `cow.luks` (the suspended guest's
+  // encrypted rootfs delta), staged by the restore pull into the sandbox's
+  // snapshot dir. When set, node-manager reflink-copies it to the canonical
+  // COW path before opening, so the reconstructed rootfs carries the
+  // suspended writes. Must live under the sandbox's cache dir. Absent on a
+  // fresh create and on a same-node restore (the COW was kept in place).
+  optional string restore_cow_source = 2;
+  ExecutionFence execution_fence = 3;
+}
+
+message PrepareEncryptedRootfsResponse {
+  // /dev/mapper/<composite> for Firecracker path_on_host.
+  string mapper_path = 1;
+}
+
+message PrepareSnapshotRootfsRequest {
+  string sandbox_id = 1;
+  ExecutionFence execution_fence = 2;
+}
+
+message PrepareSnapshotRootfsResponse {
+  // /dev/mapper/<composite> for Firecracker path_on_host — the same shape
+  // PrepareEncryptedRootfs returns, so the caller's boot path is identical.
+  string mapper_path = 1;
+}
+
+message PrepareEncryptedVolumeRequest {
+  string sandbox_id = 1;
+  // Logical volume name, unique per sandbox (e.g. "snapshot"). Names the
+  // dm-crypt mapper and the derived backing/mount paths.
+  string volume_name = 2;
+  // Logical size in bytes the volume should hold. The backing file is
+  // sparse, so this is a ceiling, not an allocation.
+  uint64 size_bytes = 3;
+  // true: fresh (recreate backing + LUKS-format + empty btrfs). false: open
+  // and mount an already-formatted backing file.
+  bool fresh = 4;
+  // Restore path: the downloaded `<volume_name>.luks`, staged by the restore
+  // pull into the sandbox's snapshot dir. When set, node-manager copies it
+  // to the canonical `instance/<volume_name>.luks` backing before opening —
+  // mirroring `restore_cow_source` on the rootfs — so a later re-suspend
+  // seals and stages the canonical path even when the restore landed on a
+  // different node than the suspend. Must live under the sandbox's cache
+  // dir; only valid with `fresh = false`. Absent opens the canonical
+  // backing in place (same-node restore, kept by the suspend).
+  optional string restore_backing_source = 6;
+  ExecutionFence execution_fence = 7;
+}
+
+message PrepareEncryptedVolumeResponse {
+  // Directory the decrypted btrfs filesystem is mounted at.
+  string mount_dir = 1;
+}
+
+// One sealed (ciphertext) artifact to copy out of the sandbox-private
+// `instance/` dir. `src_path` must live under the sandbox's cache dir;
+// `dst_name` is a bare file name inside `stage_dir`.
+message EncryptedVolumeStagedArtifact {
+  string src_path = 1;
+  string dst_name = 2;
+}
+
+message ReleaseEncryptedVolumeRequest {
+  string sandbox_id = 1;
+  string volume_name = 2;
+  // Optional: after sealing, reflink-copy each artifact into `stage_dir`
+  // (the suspend publication staging dir, under the sandbox's cache dir).
+  // The artifacts are LUKS2 containers, so only ciphertext is exposed.
+  // Empty `stage_dir` skips staging.
+  string stage_dir = 3;
+  repeated EncryptedVolumeStagedArtifact stage_artifacts = 4;
+  ExecutionFence execution_fence = 5;
+}
+
+message ReleaseEncryptedVolumeResponse {}
+
+message BtrfsDeleteSandboxInstanceRequest {
+  string sandbox_id = 1;
+  InstanceTarget target = 2;
+}
+message BtrfsDeleteSandboxInstanceResponse {}

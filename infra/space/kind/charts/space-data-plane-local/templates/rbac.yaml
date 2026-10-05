@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-data-plane
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-data-plane
+    app.kubernetes.io/instance: {{ .Release.Name }}
+{{- if eq .Values.grpcClient.endpointDiscovery "kubernetes" }}
+---
+{{- /*
+This RoleBinding is the shared home for local cluster-api endpoint-discovery
+clients. Add future client ServiceAccounts to its subjects as their Kind
+rollouts are enabled; data-plane is the only reader today.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-cluster-api-endpoint-reader
+  namespace: {{ .Release.Namespace }}
+rules:
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-cluster-api-endpoint-readers
+  namespace: {{ .Release.Namespace }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-data-plane
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-cluster-api-endpoint-reader
+{{- end }}

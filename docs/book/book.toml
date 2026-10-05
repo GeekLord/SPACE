@@ -1,0 +1,22 @@
+[book]
+title = "SPACE Guide"
+language = "en"
+src = "src"
+
+[build]
+create-missing = false
+# Do not expand include/playground directives into files outside the chapters.
+use-default-preprocessors = false
+
+[output.html]
+no-section-label = true
+additional-css = ["navigation.css"]
+additional-js = ["page-toc.js", "mermaid-init.js"]
+# Keep the generated 404 page's base URL relative, too.
+site-url = "./"
+
+[output.html.search]
+enable = true
+
+[output.html.playground]
+runnable = false

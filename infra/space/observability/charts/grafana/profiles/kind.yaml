@@ -1,0 +1,14 @@
+profile: kind
+auth:
+  anonymous: true
+networkPolicy:
+  enabled: false
+persistence:
+  enabled: false
+datasources:
+  prometheus:
+    url: http://prometheus.space-metrics.svc.cluster.local:9090
+  loki:
+    url: http://loki.space-logs.svc.cluster.local:3100
+  tempo:
+    url: http://tempo.space-traces.svc.cluster.local:3200

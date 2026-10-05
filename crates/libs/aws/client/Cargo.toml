@@ -1,0 +1,25 @@
+[package]
+name = "pplx-space-aws-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aws-credential-types = { workspace = true }
+aws-sigv4 = { workspace = true, features = ["http1", "sign-http"] }
+aws-smithy-runtime-api = { workspace = true, features = ["client"] }
+aws-smithy-xml = { workspace = true }
+aws-types = { workspace = true }
+form_urlencoded = { workspace = true }
+http = { workspace = true }
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }

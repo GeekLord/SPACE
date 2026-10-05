@@ -1,0 +1,685 @@
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
+
+use bytes::Bytes;
+use pplx_space_common_core::host::linux::paths::template_build_dir;
+use pplx_space_common_core::types::{
+    AuthIdParseError, ContentHash, OrgId, RUNTIME_FIRECRACKER_ALIAS, StorageUri,
+    TEMPLATE_ROOTFS_ZSTD_CODEC, TEMPLATE_ROOTFS_ZSTD_FILE, TEMPLATE_ROOTFS_ZSTD_LEVEL,
+    TemplateArtifact, TemplateName, template_object_key, template_object_prefix,
+};
+use pplx_space_common_svc::page_cache;
+use pplx_space_node_api_client::cluster::{
+    AuthenticatedClusterApiClient, ConnectClusterApiError,
+    connect_from_env as connect_cluster_api_from_env,
+};
+use pplx_space_node_api_client::proto::{
+    FacetRef, MarkFacetDirtyRequest, ReconcileFacet, RegisterTemplateReleaseRequest,
+    RegisterTemplateRequest, facet_ref,
+};
+use pplx_space_object_store::{
+    ObjectCredentials, ObjectStore, ObjectStoreError, ObjectTarget, S3ObjectStore,
+};
+use serde::{Deserialize, Serialize};
+use tonic::Code;
+
+use crate::object_store::{
+    CredentialExchangeError, ObjectStoreConfig, ObjectStoreConfigError, StorageAccess,
+    object_store_credentials,
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemplateOrg {
+    org_id: OrgId,
+}
+
+impl TemplateOrg {
+    pub const fn new(org_id: OrgId) -> Self {
+        Self { org_id }
+    }
+
+    pub fn parse(org_id: &str) -> Result<Self, AuthIdParseError> {
+        Ok(Self {
+            org_id: org_id.parse()?,
+        })
+    }
+
+    pub const fn org_id(self) -> OrgId {
+        self.org_id
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PublishError {
+    #[error(transparent)]
+    InvalidTemplateName(#[from] pplx_space_common_core::types::TemplateParseError),
+    #[error(transparent)]
+    InvalidContentHash(#[from] pplx_space_common_core::types::DigestParseError),
+    #[error(transparent)]
+    ObjectStoreConfig(#[from] ObjectStoreConfigError),
+    #[error("required build artifact is missing: {path}")]
+    MissingArtifact { path: PathBuf },
+    #[error("compressed template rootfs was not ready after {}s: {path}", timeout.as_secs())]
+    CompressedRootfsNotReady { path: PathBuf, timeout: Duration },
+    #[error("failed to read {path}: {source}")]
+    ReadArtifact {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("invalid artifact {path}: {source}")]
+    InvalidArtifact {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("manifest {path} does not vouch for execution metadata: {source}")]
+    ManifestExecutionMetadata {
+        path: PathBuf,
+        #[source]
+        source: pplx_space_common_core::types::TemplateManifestSchemaError,
+    },
+    #[error(
+        "manifest {path} carries no execution metadata; registering would create a \
+         permanently metadata-less release"
+    )]
+    MissingExecutionMetadata { path: PathBuf },
+    #[error(transparent)]
+    CredentialExchange(#[from] CredentialExchangeError),
+    #[error("object store upload failed for {artifact}: {source}")]
+    ObjectStore {
+        artifact: String,
+        #[source]
+        source: ObjectStoreError,
+    },
+    #[error("cluster api connect failed: {0}")]
+    ClusterApiConnect(#[from] pplx_space_node_api_client::cluster::ConnectClusterApiError),
+    #[error("register template failed: {0}")]
+    RegisterTemplate(#[source] tonic::Status),
+    #[error("register template release failed: {0}")]
+    RegisterTemplateRelease(#[source] tonic::Status),
+}
+
+pub async fn register_build_template(
+    template_id: &str,
+    template_org: Option<TemplateOrg>,
+) -> Result<(), PublishError> {
+    let template = TemplateName::parse(template_id.to_string())?;
+    let mut cluster_api = match connect_cluster_api_from_env().await {
+        Ok(client) => client,
+        Err(ConnectClusterApiError::MissingEndpoint | ConnectClusterApiError::MissingToken(_)) => {
+            tracing::info!(
+                template_name_length = template.as_str().len(),
+                "ClusterApi is not configured; leaving build local-only"
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(PublishError::ClusterApiConnect(error)),
+    };
+    ensure_cluster_template(&mut cluster_api, &template, template_org).await
+}
+
+pub async fn publish_build(
+    template_id: &str,
+    content_hash: &str,
+    publish_tags: &[String],
+    template_org: Option<TemplateOrg>,
+) -> Result<(), PublishError> {
+    let template = TemplateName::parse(template_id.to_string())?;
+    let content_hash = content_hash.parse::<ContentHash>()?;
+    let build_dir = PathBuf::from(template_build_dir(
+        template.as_str(),
+        &content_hash.to_string(),
+    ));
+    let release_tags = release_tags(content_hash, publish_tags);
+    let mut cluster_api = match connect_cluster_api_from_env().await {
+        Ok(client) => client,
+        Err(ConnectClusterApiError::MissingEndpoint | ConnectClusterApiError::MissingToken(_)) => {
+            tracing::info!(
+                template_name_length = template.as_str().len(),
+                hash = %content_hash,
+                "ClusterApi is not configured; leaving build local-only"
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(PublishError::ClusterApiConnect(error)),
+    };
+
+    let execution = Some(load_build_execution_metadata(&build_dir).await?);
+
+    let Some(object_store) = ObjectStoreConfig::from_env_optional()? else {
+        ensure_cluster_template(&mut cluster_api, &template, template_org).await?;
+        register_cluster_release(
+            &mut cluster_api,
+            &template,
+            content_hash,
+            &release_tags,
+            Vec::new(),
+            template_org,
+            execution,
+        )
+        .await?;
+        tracing::info!(
+            template = template.as_str(),
+            hash = %content_hash,
+            "cold store is not configured; registered release without storage location"
+        );
+        mark_local_template_inventory_dirty(&template).await;
+        return Ok(());
+    };
+    let storage_uri = build_storage_uri(&object_store, &template, content_hash);
+    // Register the template identity before asking Credential Manager to
+    // authorize publication. A failed upload may leave a template with no
+    // release, but never a release that points at partial objects.
+    ensure_cluster_template(&mut cluster_api, &template, template_org).await?;
+    let publication_prefix =
+        template_object_prefix(&object_store.key_prefix, &template, content_hash);
+    let creds = acquire_after_artifacts_ready(&build_dir, || {
+        object_store_credentials(
+            &object_store.bucket,
+            &publication_prefix,
+            true,
+            crate::object_store::CredentialSubject::Template(&template),
+            StorageAccess::Write,
+        )
+    })
+    .await?;
+    let store = S3ObjectStore::new();
+
+    upload_build_artifacts(
+        &store,
+        &creds,
+        &object_store,
+        &template,
+        content_hash,
+        &build_dir,
+    )
+    .await?;
+
+    register_cluster_release(
+        &mut cluster_api,
+        &template,
+        content_hash,
+        &release_tags,
+        vec![storage_uri],
+        template_org,
+        execution,
+    )
+    .await?;
+    mark_local_template_inventory_dirty(&template).await;
+
+    Ok(())
+}
+
+async fn mark_local_template_inventory_dirty(template: &TemplateName) {
+    let request = MarkFacetDirtyRequest {
+        refs: vec![FacetRef {
+            facet: ReconcileFacet::TemplateInventory as i32,
+            element: Some(facet_ref::Element::Template(template.as_str().to_string())),
+        }],
+    };
+    match pplx_space_node_api_client::connect_node_ctl().await {
+        Ok(mut client) => {
+            if let Err(error) = client.mark_facet_dirty(request).await {
+                tracing::warn!(
+                    template = template.as_str(),
+                    %error,
+                    "failed to mark local template inventory dirty after build publish"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::debug!(
+                template = template.as_str(),
+                %error,
+                "node-ctl unavailable; local template inventory will publish on the next periodic tick"
+            );
+        }
+    }
+}
+
+/// Backoff schedule for transient cluster-api registration failures. The
+/// total span covers several kubelet volume-sync periods so a stale projected
+/// token gets a real chance to rotate before the build is declared failed.
+/// Latency contract: a persistently failing registration spends at most the
+/// sum of this schedule sleeping (~3.5 minutes) plus one 30-second client RPC
+/// timeout per attempt — well inside the 6-hour build job timeout, and the
+/// worker keeps heartbeating the job lease throughout.
+const REGISTER_RETRY_BACKOFF: [Duration; 4] = [
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(120),
+];
+
+/// Retry pacing for one cluster-api registration call: walks
+/// [`REGISTER_RETRY_BACKOFF`] once, yielding a delay for each failure that
+/// [`RegisterRequest::retry_is_safe`] classifies as replayable.
+struct RegisterRetrySchedule {
+    backoff: std::slice::Iter<'static, Duration>,
+}
+
+impl RegisterRetrySchedule {
+    fn new() -> Self {
+        Self {
+            backoff: REGISTER_RETRY_BACKOFF.iter(),
+        }
+    }
+
+    /// Delay to sleep before the next attempt, or `None` when the failure is
+    /// permanent or the schedule is exhausted and the status should surface.
+    fn next_delay(
+        &mut self,
+        request: &RegisterRequest,
+        status: &tonic::Status,
+    ) -> Option<Duration> {
+        if !request.retry_is_safe(status) {
+            return None;
+        }
+        self.backoff.next().copied()
+    }
+}
+
+/// One cluster-api registration RPC, dispatched by request type so the retry
+/// loop below stays a single plain `async fn` (an `AsyncFnMut`-based helper
+/// trips rustc's "`Send` is not general enough" false positive under the
+/// callers' `async_trait` bounds).
+enum RegisterRequest {
+    Template(RegisterTemplateRequest),
+    Release(RegisterTemplateReleaseRequest),
+}
+
+impl RegisterRequest {
+    const fn operation(&self) -> &'static str {
+        match self {
+            Self::Template(_) => "RegisterTemplate",
+            Self::Release(_) => "RegisterTemplateRelease",
+        }
+    }
+
+    /// Whether replaying this request after the given failure cannot change
+    /// the outcome the cluster already committed.
+    ///
+    /// Only `UNAUTHENTICATED` qualifies: it is produced by the server's auth
+    /// layer before the handler runs, so nothing was mutated and replay is
+    /// always safe — and worth doing, because the builder's credential is a
+    /// short-TTL kubelet-projected token whose expiry heals on kubelet's next
+    /// volume sync (the bearer interceptor re-reads the token file on every
+    /// RPC).
+    ///
+    /// `UNAVAILABLE` is never replayed, even though the server maps
+    /// pre-handler TokenReview outages there: a transport-level failure can
+    /// also surface as `UNAVAILABLE` *after* the server committed, and
+    /// release registration is not idempotent in its tag side effects.
+    /// `RegisterTemplateRelease` tag writes are last-writer-wins, so a replay
+    /// can move a mutable tag (e.g. `latest`) back to this build after a
+    /// concurrent build on another node advanced it. `RegisterTemplate`
+    /// rechecks ownership and lifecycle and only fills a missing description;
+    /// it does not revive deleted templates. Both calls conservatively retry
+    /// only known pre-handler authentication failures. Retrying release
+    /// registration after an ambiguous commit requires server-side tag fencing.
+    fn retry_is_safe(&self, status: &tonic::Status) -> bool {
+        match self {
+            Self::Template(_) | Self::Release(_) => status.code() == Code::Unauthenticated,
+        }
+    }
+}
+
+async fn register_with_transient_retry(
+    cluster_api: &mut AuthenticatedClusterApiClient,
+    template: &TemplateName,
+    request: RegisterRequest,
+) -> Result<(), tonic::Status> {
+    let mut schedule = RegisterRetrySchedule::new();
+    loop {
+        let result = match &request {
+            RegisterRequest::Template(inner) => cluster_api
+                .register_template(inner.clone())
+                .await
+                .map(|_| ()),
+            RegisterRequest::Release(inner) => cluster_api
+                .register_template_release(inner.clone())
+                .await
+                .map(|_| ()),
+        };
+        let status = match result {
+            Ok(()) => return Ok(()),
+            Err(status) => status,
+        };
+        let Some(delay) = schedule.next_delay(&request, &status) else {
+            return Err(status);
+        };
+        tracing::warn!(
+            template = template.as_str(),
+            operation = request.operation(),
+            delay_secs = delay.as_secs(),
+            error = %status,
+            "transient cluster-api registration failure; retrying"
+        );
+        tokio::time::sleep(delay).await;
+    }
+}
+
+async fn ensure_cluster_template(
+    cluster_api: &mut AuthenticatedClusterApiClient,
+    template: &TemplateName,
+    template_org: Option<TemplateOrg>,
+) -> Result<(), PublishError> {
+    let request = RegisterRequest::Template(template_registration_request(template, template_org));
+    match register_with_transient_retry(cluster_api, template, request).await {
+        Ok(()) => Ok(()),
+        Err(status) if status.code() == Code::AlreadyExists => Ok(()),
+        Err(status) => Err(PublishError::RegisterTemplate(status)),
+    }
+}
+
+fn template_registration_request(
+    template: &TemplateName,
+    template_org: Option<TemplateOrg>,
+) -> RegisterTemplateRequest {
+    RegisterTemplateRequest {
+        name: template.as_str().to_string(),
+        description: None,
+        org_id: template_org.map(|owner| owner.org_id().to_string()),
+    }
+}
+
+async fn register_cluster_release(
+    cluster_api: &mut AuthenticatedClusterApiClient,
+    template: &TemplateName,
+    content_hash: ContentHash,
+    tags: &[String],
+    storage_connection_strings: Vec<String>,
+    template_org: Option<TemplateOrg>,
+    execution: Option<pplx_space_execution_common::proto::ExecutionMetadata>,
+) -> Result<(), PublishError> {
+    let request = RegisterRequest::Release(RegisterTemplateReleaseRequest {
+        template_name: template.as_str().to_string(),
+        runtime: RUNTIME_FIRECRACKER_ALIAS.to_string(),
+        hash: content_hash.to_string(),
+        tags: tags.to_vec(),
+        storage_connection_strings,
+        org_id: template_org.map(|owner| owner.org_id().to_string()),
+        execution,
+    });
+    register_with_transient_retry(cluster_api, template, request)
+        .await
+        .map_err(PublishError::RegisterTemplateRelease)
+}
+
+/// Loads the build's execution metadata for attachment to the release
+/// registration, from the digest-stable `manifest.json` — not `metadata.json`.
+/// A same-rootfs rebuild can refresh `metadata.json` while template-manager
+/// retains the hash-addressed manifest, and registration is first-write-wins,
+/// so the value frozen here must be the one the manifest (and therefore the
+/// node inventory publish) carries. The schema-aware accessor rejects legacy
+/// and unsupported manifest shapes instead of trusting a field the schema
+/// does not vouch for.
+///
+/// An unusable manifest fails the publish: registration is the only writer
+/// of release execution metadata (node publication does not backfill it), so
+/// registering without it would create a permanently metadata-less release.
+/// The strictness is consistent with the upload path, which already fails on
+/// an unreadable manifest, and with the grpcurl registrants, whose shared
+/// converter refuses the same shapes.
+async fn load_build_execution_metadata(
+    build_dir: &Path,
+) -> Result<pplx_space_execution_common::proto::ExecutionMetadata, PublishError> {
+    let manifest_path = build_dir.join(TemplateArtifact::Manifest.file_name());
+    let bytes =
+        tokio::fs::read(&manifest_path)
+            .await
+            .map_err(|source| PublishError::ReadArtifact {
+                path: manifest_path.clone(),
+                source,
+            })?;
+    let manifest = serde_json::from_slice::<pplx_space_common_core::types::TemplateManifest>(
+        &bytes,
+    )
+    .map_err(|source| PublishError::InvalidArtifact {
+        path: manifest_path.clone(),
+        source,
+    })?;
+    let execution = manifest.execution_metadata().map_err(|source| {
+        PublishError::ManifestExecutionMetadata {
+            path: manifest_path.clone(),
+            source,
+        }
+    })?;
+    let execution = execution.ok_or(PublishError::MissingExecutionMetadata {
+        path: manifest_path,
+    })?;
+    Ok(pplx_space_execution_common::proto::ExecutionMetadata::from(
+        execution,
+    ))
+}
+
+async fn upload_build_artifacts(
+    store: &impl ObjectStore,
+    creds: &ObjectCredentials,
+    object_store: &ObjectStoreConfig,
+    template: &TemplateName,
+    content_hash: ContentHash,
+    build_dir: &Path,
+) -> Result<(), PublishError> {
+    let metadata_path = artifact_path(build_dir, TemplateArtifact::Metadata)?;
+    let manifest_path = artifact_path(build_dir, TemplateArtifact::Manifest)?;
+    let compressed_rootfs_path = artifact_path(build_dir, TemplateArtifact::RootfsZstd)?;
+
+    let metadata_key = template_object_key(
+        &object_store.key_prefix,
+        template,
+        content_hash,
+        TemplateArtifact::Metadata,
+    );
+    let manifest_key = template_object_key(
+        &object_store.key_prefix,
+        template,
+        content_hash,
+        TemplateArtifact::Manifest,
+    );
+
+    let metadata_bytes =
+        tokio::fs::read(&metadata_path)
+            .await
+            .map_err(|source| PublishError::ReadArtifact {
+                path: metadata_path.clone(),
+                source,
+            })?;
+    store
+        .put_bytes(
+            creds,
+            ObjectTarget {
+                bucket: &object_store.bucket,
+                key: &metadata_key,
+                region: &object_store.region,
+                endpoint: object_store.endpoint.as_deref(),
+                path_style: object_store.path_style,
+            },
+            Bytes::from(metadata_bytes),
+        )
+        .await
+        .map_err(|source| PublishError::ObjectStore {
+            artifact: TemplateArtifact::Metadata.file_name().to_string(),
+            source,
+        })?;
+
+    let manifest_bytes =
+        tokio::fs::read(&manifest_path)
+            .await
+            .map_err(|source| PublishError::ReadArtifact {
+                path: manifest_path.clone(),
+                source,
+            })?;
+    store
+        .put_bytes(
+            creds,
+            ObjectTarget {
+                bucket: &object_store.bucket,
+                key: &manifest_key,
+                region: &object_store.region,
+                endpoint: object_store.endpoint.as_deref(),
+                path_style: object_store.path_style,
+            },
+            Bytes::from(manifest_bytes),
+        )
+        .await
+        .map_err(|source| PublishError::ObjectStore {
+            artifact: TemplateArtifact::Manifest.file_name().to_string(),
+            source,
+        })?;
+
+    let compressed_rootfs_key = template_object_key(
+        &object_store.key_prefix,
+        template,
+        content_hash,
+        TemplateArtifact::RootfsZstd,
+    );
+    store
+        .put_file(
+            creds,
+            ObjectTarget {
+                bucket: &object_store.bucket,
+                key: &compressed_rootfs_key,
+                region: &object_store.region,
+                endpoint: object_store.endpoint.as_deref(),
+                path_style: object_store.path_style,
+            },
+            &compressed_rootfs_path,
+        )
+        .await
+        .map_err(|source| PublishError::ObjectStore {
+            artifact: TemplateArtifact::RootfsZstd.file_name().to_string(),
+            source,
+        })?;
+    page_cache::advise_path_dontneed(
+        &compressed_rootfs_path,
+        "publish compressed template rootfs input",
+    );
+
+    Ok(())
+}
+
+const COMPRESSED_ROOTFS_READY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const COMPRESSED_ROOTFS_READY_POLL: Duration = Duration::from_secs(1);
+
+/// Compression can legitimately consume much of a scoped credential's
+/// lifetime. Centralizing the ordering makes it impossible for the publish
+/// path to acquire a lease before the readiness wait by accident.
+async fn acquire_after_artifacts_ready<T, Acquire, AcquireFuture>(
+    build_dir: &Path,
+    acquire: Acquire,
+) -> Result<T, PublishError>
+where
+    Acquire: FnOnce() -> AcquireFuture,
+    AcquireFuture: std::future::Future<Output = Result<T, CredentialExchangeError>>,
+{
+    wait_for_compressed_rootfs_ready(build_dir).await?;
+    acquire().await.map_err(PublishError::from)
+}
+
+async fn wait_for_compressed_rootfs_ready(build_dir: &Path) -> Result<(), PublishError> {
+    let started = Instant::now();
+    let compressed_rootfs_path = build_dir.join(TemplateArtifact::RootfsZstd.file_name());
+    loop {
+        if compressed_rootfs_ready(build_dir).await? {
+            return Ok(());
+        }
+        if started.elapsed() >= COMPRESSED_ROOTFS_READY_TIMEOUT {
+            return Err(PublishError::CompressedRootfsNotReady {
+                path: compressed_rootfs_path,
+                timeout: COMPRESSED_ROOTFS_READY_TIMEOUT,
+            });
+        }
+        tokio::time::sleep(COMPRESSED_ROOTFS_READY_POLL).await;
+    }
+}
+
+async fn compressed_rootfs_ready(build_dir: &Path) -> Result<bool, PublishError> {
+    let compressed_rootfs_path = build_dir.join(TemplateArtifact::RootfsZstd.file_name());
+    if !compressed_rootfs_path.is_file() {
+        return Ok(false);
+    }
+
+    let manifest_path = build_dir.join(TemplateArtifact::Manifest.file_name());
+    let manifest_bytes =
+        tokio::fs::read(&manifest_path)
+            .await
+            .map_err(|source| PublishError::ReadArtifact {
+                path: manifest_path.clone(),
+                source,
+            })?;
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&manifest_bytes).map_err(|source| {
+            PublishError::InvalidArtifact {
+                path: manifest_path.clone(),
+                source,
+            }
+        })?;
+    let Some(entry) = manifest
+        .get("files")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|files| files.get(TEMPLATE_ROOTFS_ZSTD_FILE))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(false);
+    };
+
+    Ok(entry
+        .get("digest")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|digest| !digest.is_empty())
+        && entry
+            .get("size")
+            .and_then(serde_json::Value::as_u64)
+            .is_some()
+        && entry
+            .get("compression")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|compression| {
+                compression.get("codec").and_then(serde_json::Value::as_str)
+                    == Some(TEMPLATE_ROOTFS_ZSTD_CODEC)
+                    && compression.get("level").and_then(serde_json::Value::as_i64)
+                        == Some(i64::from(TEMPLATE_ROOTFS_ZSTD_LEVEL))
+            }))
+}
+
+fn artifact_path(build_dir: &Path, artifact: TemplateArtifact) -> Result<PathBuf, PublishError> {
+    let path = build_dir.join(artifact.file_name());
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(PublishError::MissingArtifact { path })
+    }
+}
+
+fn build_storage_uri(
+    object_store: &ObjectStoreConfig,
+    template: &TemplateName,
+    content_hash: ContentHash,
+) -> String {
+    StorageUri {
+        bucket: object_store.bucket.clone(),
+        key_prefix: template_object_prefix(&object_store.key_prefix, template, content_hash),
+        region: object_store.region.clone(),
+        endpoint: object_store.endpoint.clone(),
+        path_style: object_store.path_style,
+    }
+    .to_string()
+}
+
+fn release_tags(content_hash: ContentHash, publish_tags: &[String]) -> Vec<String> {
+    let mut tags = vec![content_hash.to_string()];
+    for tag in publish_tags {
+        let trimmed = tag.trim();
+        if !trimmed.is_empty() && !tags.iter().any(|existing| existing == trimmed) {
+            tags.push(trimmed.to_string());
+        }
+    }
+    tags
+}
+
+#[cfg(test)]
+mod tests;

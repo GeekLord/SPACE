@@ -1,0 +1,2353 @@
+package main
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"reflect"
+	"strings"
+	"sync"
+	"syscall"
+	"testing"
+	"time"
+
+	taskAPI "github.com/containerd/containerd/api/runtime/task/v3"
+	tasktypes "github.com/containerd/containerd/api/types/task"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+
+	gatewaypb "github.com/perplexityai/SPACE/shim/proto/net/gateway/v1"
+	netpb "github.com/perplexityai/SPACE/shim/proto/net/policy/v1"
+	pb "github.com/perplexityai/SPACE/shim/proto/sandbox/manager/v1"
+	operationspb "github.com/perplexityai/SPACE/shim/proto/spaced/operations/v1"
+)
+
+type fakeConn struct{}
+
+func (fakeConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (fakeConn) Write(b []byte) (int, error)      { return len(b), nil }
+func (fakeConn) Close() error                     { return nil }
+func (fakeConn) LocalAddr() net.Addr              { return nil }
+func (fakeConn) RemoteAddr() net.Addr             { return nil }
+func (fakeConn) SetDeadline(time.Time) error      { return nil }
+func (fakeConn) SetReadDeadline(time.Time) error  { return nil }
+func (fakeConn) SetWriteDeadline(time.Time) error { return nil }
+
+// Contract test: the SPACE API matches on "[space-err=<Code>]" in the shim's
+// error message to detect permanent sandbox creation failures. The gRPC
+// status code itself is lost at the containerd CRI boundary (see
+// annotateStatus comment in space.go), so the namespaced marker is the
+// contract surface.
+func TestAnnotateStatusSbxManagerContract(t *testing.T) {
+	tests := []struct {
+		name string
+		code codes.Code
+	}{
+		{"NotFound", codes.NotFound},
+		{"Unavailable", codes.Unavailable},
+		{"ResourceExhausted", codes.ResourceExhausted},
+		{"Internal", codes.Internal},
+		// sbx-manager answers these three when the node it landed on cannot
+		// execute the sandbox at all (a missing guest kernel, an incomplete
+		// runtime installation, a rejected request shape, a path it refuses on
+		// principle). They are the codes that distinguish "fail this create"
+		// from "retry it", so the marker has to carry them intact.
+		{"FailedPrecondition", codes.FailedPrecondition},
+		{"InvalidArgument", codes.InvalidArgument},
+		{"PermissionDenied", codes.PermissionDenied},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			grpcErr := status.Errorf(tt.code, "some sbx-manager error")
+			shimErr := annotateStatus("sbx-manager Create", grpcErr)
+			msg := shimErr.Error()
+
+			wantTag := fmt.Sprintf("[space-err=%s]", tt.code.String())
+			if !strings.Contains(msg, wantTag) {
+				t.Fatalf("expected %q in message, got %q", wantTag, msg)
+			}
+
+			st, ok := status.FromError(shimErr)
+			if !ok {
+				t.Fatalf("expected gRPC status, got %T", shimErr)
+			}
+			if st.Code() != tt.code {
+				t.Fatalf("expected code %v, got %v", tt.code, st.Code())
+			}
+		})
+	}
+}
+
+func TestCurrentNodeIDNormalizesKubernetesNodeName(t *testing.T) {
+	t.Setenv("SPACE_NODE_ID", "ip-10-0-0-1.ec2.internal")
+
+	got := currentNodeID()
+	if got == nil {
+		t.Fatal("currentNodeID returned nil")
+	}
+	if *got != "cf764732-f94b-5b17-a7c2-8aba4d40e511" {
+		t.Fatalf("currentNodeID = %q, want deterministic worker node UUID", *got)
+	}
+}
+
+func TestRouteIdentityDeclaresKubernetesSubstrate(t *testing.T) {
+	generation := int64(1)
+
+	identity := routeIdentity(nil, nil, &generation, nil, nil)
+
+	if got, want := identity.GetSubstrateKind(), gatewaypb.SandboxSubstrateKind_SANDBOX_SUBSTRATE_KIND_KUBERNETES; got != want {
+		t.Fatalf("substrate kind = %v, want %v", got, want)
+	}
+}
+
+func TestCurrentNodeIDPreservesUuid(t *testing.T) {
+	t.Setenv("SPACE_NODE_ID", "019f8000-0000-7000-8000-0000000000aa")
+
+	got := currentNodeID()
+	if got == nil {
+		t.Fatal("currentNodeID returned nil")
+	}
+	if *got != "019f8000-0000-7000-8000-0000000000aa" {
+		t.Fatalf("currentNodeID = %q, want original UUID", *got)
+	}
+}
+
+func TestDialWithConnectRetryRetriesSocketConnectErrors(t *testing.T) {
+	policy := connectRetryPolicy{
+		budget:        time.Second,
+		initialDelay:  0,
+		maxDelay:      0,
+		jitterPercent: 0,
+	}
+	attempts := 0
+	sleeps := 0
+
+	conn, err := dialWithConnectRetry(
+		context.Background(),
+		"sandbox-manager",
+		sbxMgrSocket,
+		policy,
+		func(context.Context) (net.Conn, error) {
+			attempts++
+			if attempts == 1 {
+				return nil, os.ErrNotExist
+			}
+			if attempts == 2 {
+				return nil, syscall.ECONNREFUSED
+			}
+			return fakeConn{}, nil
+		},
+		func(context.Context, time.Duration) error {
+			sleeps++
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("dialWithConnectRetry returned error: %v", err)
+	}
+	_ = conn.Close()
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", attempts)
+	}
+	if sleeps != 2 {
+		t.Fatalf("sleeps = %d, want 2", sleeps)
+	}
+}
+
+func TestDialWithConnectRetryDoesNotRetryNonConnectError(t *testing.T) {
+	boom := errors.New("permission denied")
+	attempts := 0
+
+	_, err := dialWithConnectRetry(
+		context.Background(),
+		"sandbox-manager",
+		sbxMgrSocket,
+		defaultConnectRetryPolicy,
+		func(context.Context) (net.Conn, error) {
+			attempts++
+			return nil, boom
+		},
+		func(context.Context, time.Duration) error {
+			t.Fatal("sleep should not be called for non-retryable errors")
+			return nil
+		},
+	)
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want %v", err, boom)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+}
+
+func TestDialWithConnectRetryExhaustsBudget(t *testing.T) {
+	policy := connectRetryPolicy{
+		budget:        time.Nanosecond,
+		initialDelay:  time.Millisecond,
+		maxDelay:      time.Millisecond,
+		jitterPercent: 0,
+	}
+	attempts := 0
+
+	_, err := dialWithConnectRetry(
+		context.Background(),
+		"sandbox-manager",
+		sbxMgrSocket,
+		policy,
+		func(context.Context) (net.Conn, error) {
+			attempts++
+			return nil, syscall.ECONNREFUSED
+		},
+		func(context.Context, time.Duration) error {
+			t.Fatal("sleep should not be called after budget exhaustion")
+			return nil
+		},
+	)
+	if err == nil {
+		t.Fatal("expected retry exhaustion error")
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+}
+
+func TestRequestedSandboxID(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		want        string
+	}{
+		{
+			name: "annotation takes precedence",
+			annotations: map[string]string{
+				sandboxIDAnnotation:              "019ddc5a-0ab7-7722-85ab-aa26ccd74259",
+				"io.kubernetes.cri.sandbox-name": "space-sbx-00000000000000000000000000000000",
+			},
+			want: "019ddc5a-0ab7-7722-85ab-aa26ccd74259",
+		},
+		{
+			name: "generation pod name fallback",
+			annotations: map[string]string{
+				"io.kubernetes.cri.sandbox-name": "space-sbx-019ddc5a0ab7772285abaa26ccd74259-g1",
+			},
+			want: "019ddc5a-0ab7-7722-85ab-aa26ccd74259",
+		},
+		{
+			name: "legacy pod name fallback",
+			annotations: map[string]string{
+				"io.kubernetes.cri.sandbox-name": "space-sbx-019ddc5a0ab7772285abaa26ccd74259",
+			},
+			want: "019ddc5a-0ab7-7722-85ab-aa26ccd74259",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := &ociSpec{Annotations: tt.annotations}
+			got := spec.requestedSandboxID()
+			if got == nil {
+				t.Fatalf("requestedSandboxID() = nil, want %s", tt.want)
+			}
+			if got.String() != tt.want {
+				t.Fatalf("requestedSandboxID() = %s, want %s", got.String(), tt.want)
+			}
+		})
+	}
+}
+
+func TestSandboxEnv(t *testing.T) {
+	tests := []struct {
+		name string
+		env  []string
+		want map[string]string
+	}{
+		{name: "nil process", want: nil},
+		{
+			name: "parses process env",
+			env: []string{
+				"PATH=/usr/bin",
+				"SPACE_TOKEN=kept",
+				"MALFORMED",
+				"=empty-key",
+				"VALUE_WITH_EQUALS=a=b=c",
+				"PATH=/bin",
+			},
+			want: map[string]string{
+				"PATH":              "/bin",
+				"SPACE_TOKEN":       "kept",
+				"VALUE_WITH_EQUALS": "a=b=c",
+			},
+		},
+		{
+			name: "ignores entries without keys",
+			env:  []string{"MALFORMED", "=empty-key"},
+			want: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := &ociSpec{}
+			if tt.env != nil {
+				spec.Process = &ociProcess{Env: tt.env}
+			}
+			if got := spec.sandboxEnv(); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("sandboxEnv() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSpacedProcessExitCode(t *testing.T) {
+	signal := int32(9)
+	tests := []struct {
+		name string
+		exit *operationspb.ProcessExit
+		want uint32
+	}{
+		{
+			name: "exited",
+			exit: &operationspb.ProcessExit{Outcome: &operationspb.ProcessExit_Exited{
+				Exited: &operationspb.ProcessExited{ExitCode: 17},
+			}},
+			want: 17,
+		},
+		{
+			name: "signaled",
+			exit: &operationspb.ProcessExit{Outcome: &operationspb.ProcessExit_Signaled{
+				Signaled: &operationspb.ProcessSignaled{Signal: &signal},
+			}},
+			want: 137,
+		},
+		{
+			name: "timed out without signal",
+			exit: &operationspb.ProcessExit{Outcome: &operationspb.ProcessExit_TimedOut{
+				TimedOut: &operationspb.ProcessTimedOut{},
+			}},
+			want: 124,
+		},
+		{
+			name: "unknown",
+			exit: &operationspb.ProcessExit{Outcome: &operationspb.ProcessExit_Unknown{
+				Unknown: &operationspb.ProcessUnknown{},
+			}},
+			want: 255,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := spacedProcessExitCode(tt.exit); got != tt.want {
+				t.Fatalf("spacedProcessExitCode() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSandboxCheckpoint(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		want        *string
+	}{
+		{
+			name:        "missing",
+			annotations: map[string]string{},
+		},
+		{
+			name: "empty",
+			annotations: map[string]string{
+				sandboxCheckpointAnnotation: " ",
+			},
+		},
+		{
+			name: "trims suspend checkpoint",
+			annotations: map[string]string{
+				sandboxCheckpointAnnotation: " suspend ",
+			},
+			want: ptr("suspend"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := &ociSpec{Annotations: tt.annotations}
+			got := spec.sandboxCheckpoint()
+			if tt.want == nil {
+				if got != nil {
+					t.Fatalf("sandboxCheckpoint() = %q, want nil", *got)
+				}
+				return
+			}
+			if got == nil || *got != *tt.want {
+				t.Fatalf("sandboxCheckpoint() = %v, want %q", got, *tt.want)
+			}
+		})
+	}
+}
+
+func TestSandboxResourceAnnotationsOverrideOCIResources(t *testing.T) {
+	cpuQuota := int64(100000)
+	cpuPeriod := uint64(100000)
+	memoryLimit := int64(1024 * 1024 * 1024)
+	spec := &ociSpec{
+		Annotations: map[string]string{
+			sandboxVCPUAnnotation:      "2",
+			sandboxMemoryMiBAnnotation: "8192",
+		},
+		Linux: &ociLinux{Resources: &ociLinuxResources{
+			CPU:    &ociLinuxCPU{Quota: &cpuQuota, Period: &cpuPeriod},
+			Memory: &ociLinuxMemory{Limit: &memoryLimit},
+		}},
+	}
+
+	vcpu, err := spec.sandboxVCPU()
+	if err != nil {
+		t.Fatalf("sandboxVCPU() error = %v", err)
+	}
+	memoryMiB, err := spec.sandboxMemoryMiB()
+	if err != nil {
+		t.Fatalf("sandboxMemoryMiB() error = %v", err)
+	}
+
+	if vcpu != 2 {
+		t.Fatalf("sandboxVCPU() = %d, want 2", vcpu)
+	}
+	if memoryMiB != 8192 {
+		t.Fatalf("sandboxMemoryMiB() = %d, want 8192", memoryMiB)
+	}
+}
+
+func TestSandboxResourceAnnotationsRejectInvalidValues(t *testing.T) {
+	tests := []struct {
+		name       string
+		annotation string
+		parse      func(*ociSpec) (uint32, error)
+	}{
+		{
+			name:       "vcpu",
+			annotation: sandboxVCPUAnnotation,
+			parse:      func(spec *ociSpec) (uint32, error) { return spec.sandboxVCPU() },
+		},
+		{
+			name:       "memory",
+			annotation: sandboxMemoryMiBAnnotation,
+			parse:      func(spec *ociSpec) (uint32, error) { return spec.sandboxMemoryMiB() },
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			spec := &ociSpec{Annotations: map[string]string{test.annotation: "0"}}
+
+			_, err := test.parse(spec)
+
+			if err == nil {
+				t.Fatal("expected zero annotation value to be rejected")
+			}
+		})
+	}
+}
+
+func TestPositiveUint64Annotation(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		want        *uint64
+		wantErr     bool
+	}{
+		{name: "missing", annotations: map[string]string{}},
+		{name: "valid", annotations: map[string]string{sandboxDiskIOMaxOperationsPerSecAnnotation: "5000"}, want: ptr(uint64(5000))},
+		{name: "zero", annotations: map[string]string{sandboxDiskIOMaxOperationsPerSecAnnotation: "0"}, wantErr: true},
+		{name: "negative", annotations: map[string]string{sandboxDiskIOMaxOperationsPerSecAnnotation: "-1"}, wantErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := (&ociSpec{Annotations: test.annotations}).positiveUint64Annotation(sandboxDiskIOMaxOperationsPerSecAnnotation)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("positiveUint64Annotation() error = %v, wantErr %t", err, test.wantErr)
+			}
+			if test.want == nil {
+				if got != nil {
+					t.Fatalf("positiveUint64Annotation() = %d, want nil", *got)
+				}
+				return
+			}
+			if got == nil || *got != *test.want {
+				t.Fatalf("positiveUint64Annotation() = %v, want %d", got, *test.want)
+			}
+		})
+	}
+}
+
+func TestSandboxSuspendRestoreStorageURI(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		want        *string
+	}{
+		{
+			name:        "missing",
+			annotations: map[string]string{},
+		},
+		{
+			name: "empty",
+			annotations: map[string]string{
+				sandboxSuspendRestoreStorageURIAnnotation: " ",
+			},
+		},
+		{
+			name: "trims URI",
+			annotations: map[string]string{
+				sandboxSuspendRestoreStorageURIAnnotation: " s3://space/snapshot?region=us-east-1 ",
+			},
+			want: ptr("s3://space/snapshot?region=us-east-1"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := &ociSpec{Annotations: tt.annotations}
+			got := spec.sandboxSuspendRestoreStorageURI()
+			if tt.want == nil {
+				if got != nil {
+					t.Fatalf("sandboxSuspendRestoreStorageURI() = %q, want nil", *got)
+				}
+				return
+			}
+			if got == nil || *got != *tt.want {
+				t.Fatalf("sandboxSuspendRestoreStorageURI() = %v, want %q", got, *tt.want)
+			}
+		})
+	}
+}
+
+func TestSandboxArtifactRestoreAsNew(t *testing.T) {
+	const valid = `{"sourceSandboxId":"019f8000-0000-7000-8000-000000000002","artifactSnapshotId":"019f8000-0000-7000-8000-000000000003","targetOwner":"user:019f8000-0000-7000-8000-000000000004"}`
+	// Keep this literal aligned with the annotation emitted by the Rust pod builder.
+	spec := &ociSpec{Annotations: map[string]string{"space.pplx.net/fork-disk-restore": valid}}
+
+	context, err := spec.sandboxArtifactRestoreAsNew()
+	if err != nil {
+		t.Fatalf("sandboxArtifactRestoreAsNew() error = %v", err)
+	}
+	if context == nil ||
+		context.SourceSandboxId != "019f8000-0000-7000-8000-000000000002" ||
+		context.ArtifactSnapshotId != "019f8000-0000-7000-8000-000000000003" ||
+		context.ArtifactKind != pb.ArtifactKind_ARTIFACT_KIND_DISK {
+		t.Fatalf("sandboxArtifactRestoreAsNew() = %#v", context)
+	}
+
+	spec.Annotations[sandboxArtifactRestoreAsNewAnnotation] = `{"artifactSnapshotId":"019f8000-0000-7000-8000-000000000003","targetOwner":"user:019f8000-0000-7000-8000-000000000004"}`
+	if _, err := spec.sandboxArtifactRestoreAsNew(); err == nil {
+		t.Fatal("sandboxArtifactRestoreAsNew() accepted an invalid context")
+	}
+}
+
+func TestArtifactRestoreAsNewUsesColdStartRPC(t *testing.T) {
+	const valid = `{"sourceSandboxId":"019f8000-0000-7000-8000-000000000002","artifactSnapshotId":"019f8000-0000-7000-8000-000000000003","targetOwner":"user:019f8000-0000-7000-8000-000000000004"}`
+	spec := &ociSpec{Annotations: map[string]string{sandboxArtifactRestoreAsNewAnnotation: valid}}
+
+	checkpoint, artifactRestoreAsNew, useStartRPC, err := spec.sandboxStartIntent()
+	if err != nil {
+		t.Fatalf("sandboxStartIntent() error = %v", err)
+	}
+	if checkpoint != nil {
+		t.Fatalf("artifact restore-as-new checkpoint = %q, want nil", *checkpoint)
+	}
+	if artifactRestoreAsNew == nil {
+		t.Fatal("artifact restore-as-new context is nil")
+	}
+	if !useStartRPC {
+		t.Fatal("artifact restore-as-new would bypass Start and lose its restore context")
+	}
+	if got := sandboxRestoreModeForLog(checkpoint, artifactRestoreAsNew); got != "artifact_disk" {
+		t.Fatalf("artifact restore-as-new log mode = %q, want artifact_disk", got)
+	}
+}
+
+func TestSandboxSuspendRestoreSourceNode(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		want        *string
+	}{
+		{name: "missing", annotations: map[string]string{}, want: nil},
+		{
+			name: "empty",
+			annotations: map[string]string{
+				sandboxSuspendRestoreSourceNodeAnnotation: " ",
+			},
+			want: nil,
+		},
+		{
+			name: "trims node name",
+			annotations: map[string]string{
+				sandboxSuspendRestoreSourceNodeAnnotation: " space-worker-a ",
+			},
+			want: ptr("space-worker-a"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := &ociSpec{Annotations: tt.annotations}
+			got := spec.sandboxSuspendRestoreSourceNode()
+			if tt.want == nil {
+				if got != nil {
+					t.Fatalf("sandboxSuspendRestoreSourceNode() = %q, want nil", *got)
+				}
+				return
+			}
+			if got == nil || *got != *tt.want {
+				t.Fatalf("sandboxSuspendRestoreSourceNode() = %v, want %q", got, *tt.want)
+			}
+		})
+	}
+}
+
+func TestSandboxExecutionGeneration(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		want        *int64
+		wantErr     bool
+	}{
+		{name: "missing", annotations: map[string]string{}, want: nil},
+		{
+			name: "empty",
+			annotations: map[string]string{
+				sandboxExecutionGenerationAnnotation: " ",
+			},
+			want: nil,
+		},
+		{
+			name: "valid",
+			annotations: map[string]string{
+				sandboxExecutionGenerationAnnotation: "2",
+			},
+			want: ptr(int64(2)),
+		},
+		{
+			name: "invalid",
+			annotations: map[string]string{
+				sandboxExecutionGenerationAnnotation: "g2",
+			},
+			wantErr: true,
+		},
+		{
+			name: "non-positive",
+			annotations: map[string]string{
+				sandboxExecutionGenerationAnnotation: "0",
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := &ociSpec{Annotations: tt.annotations}
+			got, err := spec.sandboxExecutionGeneration()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("sandboxExecutionGeneration() error = nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("sandboxExecutionGeneration() error = %v", err)
+			}
+			if tt.want == nil {
+				if got != nil {
+					t.Fatalf("sandboxExecutionGeneration() = %d, want nil", *got)
+				}
+				return
+			}
+			if got == nil || *got != *tt.want {
+				t.Fatalf("sandboxExecutionGeneration() = %v, want %d", got, *tt.want)
+			}
+		})
+	}
+}
+
+func TestSandboxOwner(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		want        string
+		wantErr     string
+	}{
+		{
+			name: "valid",
+			annotations: map[string]string{
+				sandboxOwnerAnnotation: "user:019de674-63d7-7ef0-a588-8e106a878093",
+			},
+			want: "user:019de674-63d7-7ef0-a588-8e106a878093",
+		},
+		{
+			name: "trims whitespace",
+			annotations: map[string]string{
+				sandboxOwnerAnnotation: " root@local ",
+			},
+			want: "root@local",
+		},
+		{
+			name: "falls back to legacy sandbox user annotation",
+			annotations: map[string]string{
+				sandboxUserAnnotation: " deploy@local ",
+			},
+			want: "deploy@local",
+		},
+		{
+			name: "prefers sandbox owner annotation",
+			annotations: map[string]string{
+				sandboxOwnerAnnotation: "user:019de674-63d7-7ef0-a588-8e106a878093",
+				sandboxUserAnnotation:  "deploy@local",
+			},
+			want: "user:019de674-63d7-7ef0-a588-8e106a878093",
+		},
+		{
+			name:        "missing",
+			annotations: map[string]string{},
+			wantErr:     sandboxUserAnnotation,
+		},
+		{
+			name: "empty",
+			annotations: map[string]string{
+				sandboxOwnerAnnotation: " ",
+			},
+			wantErr: sandboxOwnerAnnotation,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := &ociSpec{Annotations: tt.annotations}
+			got, err := spec.sandboxOwner()
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("sandboxOwner() error = nil, want %q", tt.wantErr)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("sandboxOwner() error = %q, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("sandboxOwner() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("sandboxOwner() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSandboxVolumeEncryption(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		want        bool
+		wantErr     string
+	}{
+		{
+			name:        "absent means plaintext",
+			annotations: map[string]string{},
+			want:        false,
+		},
+		{
+			name: "empty means plaintext",
+			annotations: map[string]string{
+				sandboxVolumeEncryptionAnnotation: "  ",
+			},
+			want: false,
+		},
+		{
+			name: "explicit false",
+			annotations: map[string]string{
+				sandboxVolumeEncryptionAnnotation: "false",
+			},
+			want: false,
+		},
+		{
+			name: "true",
+			annotations: map[string]string{
+				sandboxVolumeEncryptionAnnotation: "true",
+			},
+			want: true,
+		},
+		{
+			name: "trims whitespace",
+			annotations: map[string]string{
+				sandboxVolumeEncryptionAnnotation: " true ",
+			},
+			want: true,
+		},
+		{
+			// A malformed value must fail the create rather than silently
+			// downgrade a BYOK-mandated sandbox to plaintext.
+			name: "malformed value is rejected",
+			annotations: map[string]string{
+				sandboxVolumeEncryptionAnnotation: "yes",
+			},
+			wantErr: sandboxVolumeEncryptionAnnotation,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := &ociSpec{Annotations: tt.annotations}
+			got, err := spec.sandboxVolumeEncryption()
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("sandboxVolumeEncryption() error = nil, want %q", tt.wantErr)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("sandboxVolumeEncryption() error = %q, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("sandboxVolumeEncryption() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("sandboxVolumeEncryption() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSandboxRootfsSizeMb(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		want        *uint32
+		wantErr     string
+	}{
+		{
+			name:        "missing",
+			annotations: map[string]string{},
+		},
+		{
+			name: "empty",
+			annotations: map[string]string{
+				sandboxDiskMibAnnotation: "",
+			},
+		},
+		{
+			name: "valid",
+			annotations: map[string]string{
+				sandboxDiskMibAnnotation: "8192",
+			},
+			want: ptr(uint32(8192)),
+		},
+		{
+			name: "zero",
+			annotations: map[string]string{
+				sandboxDiskMibAnnotation: "0",
+			},
+			wantErr: "must be positive",
+		},
+		{
+			name: "invalid",
+			annotations: map[string]string{
+				sandboxDiskMibAnnotation: "large",
+			},
+			wantErr: "must be a positive uint32",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := &ociSpec{Annotations: tt.annotations}
+			got, err := spec.sandboxRootfsSizeMb()
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("sandboxRootfsSizeMb() error = nil, want %q", tt.wantErr)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("sandboxRootfsSizeMb() error = %q, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("sandboxRootfsSizeMb() error = %v", err)
+			}
+			if tt.want == nil {
+				if got != nil {
+					t.Fatalf("sandboxRootfsSizeMb() = %v, want nil", *got)
+				}
+				return
+			}
+			if got == nil || *got != *tt.want {
+				t.Fatalf("sandboxRootfsSizeMb() = %v, want %v", got, *tt.want)
+			}
+		})
+	}
+}
+
+func TestSandboxCreateBootMode(t *testing.T) {
+	if got := sandboxCreateBootMode(nil); got != pb.BootMode_BOOT_MODE_UNSPECIFIED {
+		t.Fatalf("sandboxCreateBootMode(nil) = %v, want unspecified", got)
+	}
+	diskMib := uint32(32768)
+	if got := sandboxCreateBootMode(&diskMib); got != pb.BootMode_BOOT_MODE_COLD {
+		t.Fatalf("sandboxCreateBootMode(disk) = %v, want cold", got)
+	}
+}
+
+func TestSandboxAutoLifecycleUsesConditionSetIDs(t *testing.T) {
+	spec := &ociSpec{
+		Annotations: map[string]string{
+			sandboxAutoLifecycleAnnotation: `{
+				"wake": {"on": ["access", "command"]},
+				"condition_sets": {
+					"access_idle": {
+						"kind": "inactivity",
+						"activity_source": "access"
+					},
+					"command_idle": {
+						"kind": "inactivity",
+						"activity_source": "command",
+						"max_guest_idle_extension": "5m"
+					},
+					"guest_activity": {
+						"kind": "guest_activity"
+					}
+				},
+				"stages": [
+					{"condition_set": "access_idle", "at": "30s", "action": "pause"},
+					{"condition_set": "command_idle", "at": "1m", "action": "stop"}
+				]
+			}`,
+		},
+	}
+
+	policy, err := spec.sandboxAutoLifecycle()
+	if err != nil {
+		t.Fatalf("sandboxAutoLifecycle() error = %v", err)
+	}
+
+	conditionSets := map[pb.AutoLifecycleConditionSetId]*pb.AutoLifecycleConditionSet{}
+	for _, conditionSet := range policy.GetConditionSets() {
+		conditionSets[conditionSet.GetId()] = conditionSet
+	}
+
+	accessIdle := conditionSets[pb.AutoLifecycleConditionSetId_AUTO_LIFECYCLE_CONDITION_SET_ID_ACCESS_IDLE]
+	if accessIdle == nil {
+		t.Fatalf("missing access_idle condition set")
+	}
+	if got, want := accessIdle.GetActivitySource(), pb.AutoLifecycleActivitySource_AUTO_LIFECYCLE_ACTIVITY_SOURCE_ACCESS; got != want {
+		t.Fatalf("access_idle activity source = %v, want %v", got, want)
+	}
+
+	commandIdle := conditionSets[pb.AutoLifecycleConditionSetId_AUTO_LIFECYCLE_CONDITION_SET_ID_COMMAND_IDLE]
+	if commandIdle == nil {
+		t.Fatalf("missing command_idle condition set")
+	}
+	if got, want := commandIdle.GetMaxGuestIdleExtension().AsDuration(), 5*time.Minute; got != want {
+		t.Fatalf("command_idle max guest idle extension = %v, want %v", got, want)
+	}
+
+	if got, want := policy.GetStages()[0].GetConditionSet(), pb.AutoLifecycleConditionSetId_AUTO_LIFECYCLE_CONDITION_SET_ID_ACCESS_IDLE; got != want {
+		t.Fatalf("first stage condition_set = %v, want %v", got, want)
+	}
+	if got, want := policy.GetStages()[0].GetAt().AsDuration(), 30*time.Second; got != want {
+		t.Fatalf("first stage at = %v, want %v", got, want)
+	}
+	if got, want := policy.GetStages()[1].GetConditionSet(), pb.AutoLifecycleConditionSetId_AUTO_LIFECYCLE_CONDITION_SET_ID_COMMAND_IDLE; got != want {
+		t.Fatalf("second stage condition_set = %v, want %v", got, want)
+	}
+}
+
+func TestSandboxAutoLifecycleRejectsUnknownConditionSet(t *testing.T) {
+	spec := &ociSpec{
+		Annotations: map[string]string{
+			sandboxAutoLifecycleAnnotation: `{
+				"condition_sets": {
+					"legacy_string_name": {"kind": "inactivity"}
+				}
+			}`,
+		},
+	}
+
+	_, err := spec.sandboxAutoLifecycle()
+	if err == nil {
+		t.Fatalf("sandboxAutoLifecycle() error = nil, want unsupported condition set")
+	}
+	if !strings.Contains(err.Error(), "unsupported auto lifecycle condition set") {
+		t.Fatalf("sandboxAutoLifecycle() error = %q, want unsupported condition set", err)
+	}
+}
+
+func TestSandboxNetworkPolicyFromAnnotations(t *testing.T) {
+	spec := &ociSpec{
+		Annotations: map[string]string{
+			sandboxNetworkPolicyAnnotation: `{
+				"version": "v1",
+				"egress": {
+					"default_action": "deny",
+					"allow": [
+						{"domain": "example.com"},
+						{"cidr": "10.0.0.0/8"}
+					]
+				}
+			}`,
+			sandboxNetworkPolicyGenerationAnnotation: "42",
+		},
+	}
+
+	config, err := spec.sandboxNetworkPolicy()
+	if err != nil {
+		t.Fatalf("sandboxNetworkPolicy() error = %v", err)
+	}
+	if config.Generation != 42 {
+		t.Fatalf("generation = %d, want 42", config.Generation)
+	}
+	if config.Authority != netpb.PolicyAuthority_POLICY_AUTHORITY_CLUSTER {
+		t.Fatalf("authority = %v, want cluster", config.Authority)
+	}
+	if config.Policy.GetEgressDefaultAction() != netpb.EgressDefaultAction_EGRESS_DEFAULT_ACTION_DENY {
+		t.Fatalf("default action = %v, want deny", config.Policy.GetEgressDefaultAction())
+	}
+	if got := config.Policy.GetAllow()[0].GetDomain(); got != "example.com" {
+		t.Fatalf("allow[0].domain = %q, want example.com", got)
+	}
+	if got := config.Policy.GetAllow()[1].GetCidr(); got != "10.0.0.0/8" {
+		t.Fatalf("allow[1].cidr = %q, want 10.0.0.0/8", got)
+	}
+}
+
+func TestSandboxNetworkPolicyTLSInterception(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		field    string
+		wantWire string
+	}{
+		// Off retains the pre-field protobuf bytes, including when explicit.
+		{"missing", "", "08011001"},
+		{"off", `,"tls_interception":"off"`, "08011001"},
+		{"on", `,"tls_interception":"on"`, "080110012802"},
+		{"unknown", `,"tls_interception":"enforce"`, ""},
+		{"empty", `,"tls_interception":""`, ""},
+		{"null", `,"tls_interception":null`, ""},
+		{"boolean", `,"tls_interception":true`, ""},
+		{"uppercase", `,"tls_interception":"ON"`, ""},
+		{"whitespace", `,"tls_interception":" on "`, ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			spec := &ociSpec{Annotations: map[string]string{
+				sandboxNetworkPolicyAnnotation:           `{"version":"v1","egress":{"default_action":"allow"}` + test.field + `}`,
+				sandboxNetworkPolicyGenerationAnnotation: "1",
+			}}
+			config, err := spec.sandboxNetworkPolicy()
+			if test.wantWire == "" {
+				if err == nil || !strings.Contains(err.Error(), "tls_interception") {
+					t.Fatalf("error = %v, want invalid tls_interception", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			wire, err := proto.Marshal(config.Policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := fmt.Sprintf("%x", wire); got != test.wantWire {
+				t.Fatalf("policy protobuf = %s, want %s", got, test.wantWire)
+			}
+		})
+	}
+}
+
+func TestSandboxNetworkPolicyRequiresGeneration(t *testing.T) {
+	spec := &ociSpec{
+		Annotations: map[string]string{
+			sandboxNetworkPolicyAnnotation: `{
+				"version": "v1",
+				"egress": {"default_action": "allow"}
+			}`,
+		},
+	}
+
+	_, err := spec.sandboxNetworkPolicy()
+	if err == nil {
+		t.Fatalf("sandboxNetworkPolicy() error = nil, want missing generation")
+	}
+	if !strings.Contains(err.Error(), sandboxNetworkPolicyGenerationAnnotation) {
+		t.Fatalf("sandboxNetworkPolicy() error = %q, want generation annotation", err)
+	}
+}
+
+func TestSandboxNetworkPolicyDefaultsMissingVersionToV1(t *testing.T) {
+	spec := &ociSpec{
+		Annotations: map[string]string{
+			sandboxNetworkPolicyAnnotation:           `{"egress":{"default_action":"allow"}}`,
+			sandboxNetworkPolicyGenerationAnnotation: "7",
+		},
+	}
+	config, err := spec.sandboxNetworkPolicy()
+	if err != nil {
+		t.Fatalf("sandboxNetworkPolicy() error = %v", err)
+	}
+	if config.Policy.GetVersion() != netpb.NetworkPolicyVersion_NETWORK_POLICY_VERSION_V1 {
+		t.Fatalf("version = %v, want v1", config.Policy.GetVersion())
+	}
+}
+
+func TestSandboxNetworkPolicyRejectsV2FromAnnotations(t *testing.T) {
+	spec := &ociSpec{
+		Annotations: map[string]string{
+			sandboxNetworkPolicyAnnotation: `{
+				"version": "v2",
+				"egress": {
+					"deny": [{"wildcard_domain": "*.evil.example"}],
+					"allow": [{"cidr": "0.0.0.0/0"}, {"domain": "example.com"}]
+				}
+			}`,
+			sandboxNetworkPolicyGenerationAnnotation: "9",
+		},
+	}
+
+	_, err := spec.sandboxNetworkPolicy()
+	if err == nil {
+		t.Fatal("sandboxNetworkPolicy() error = nil, want unsupported V2")
+	}
+	if !strings.Contains(err.Error(), `unsupported network policy version "v2"`) {
+		t.Fatalf("sandboxNetworkPolicy() error = %q, want unsupported V2", err)
+	}
+}
+
+func TestSandboxNetworkPolicyRejectsInvalidAnnotations(t *testing.T) {
+	tests := []struct {
+		name        string
+		policy      string
+		authority   string
+		wantMessage string
+	}{
+		{
+			name:        "unknown version",
+			policy:      `{"version":"v3","egress":{"default_action":"allow"}}`,
+			wantMessage: "unsupported network policy version",
+		},
+		{
+			name:        "empty version",
+			policy:      `{"version":"","egress":{"default_action":"allow"}}`,
+			wantMessage: "unsupported network policy version",
+		},
+		{
+			name:        "multi destination",
+			policy:      `{"version":"v1","egress":{"default_action":"allow","allow":[{"ip":"1.1.1.1","domain":"example.com"}]}}`,
+			wantMessage: "exactly one of ip, cidr, domain, wildcard_domain is required",
+		},
+		{
+			name:        "bad default action",
+			policy:      `{"version":"v1","egress":{"default_action":"sometimes"}}`,
+			wantMessage: "unsupported network policy egress default_action",
+		},
+		{
+			name:        "bad authority",
+			policy:      `{"version":"v1","egress":{"default_action":"allow"}}`,
+			authority:   "global",
+			wantMessage: sandboxNetworkPolicyAuthorityAnnotation,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			annotations := map[string]string{
+				sandboxNetworkPolicyAnnotation:           test.policy,
+				sandboxNetworkPolicyGenerationAnnotation: "1",
+			}
+			if test.authority != "" {
+				annotations[sandboxNetworkPolicyAuthorityAnnotation] = test.authority
+			}
+			spec := &ociSpec{Annotations: annotations}
+			_, err := spec.sandboxNetworkPolicy()
+			if err == nil {
+				t.Fatalf("sandboxNetworkPolicy() error = nil, want %q", test.wantMessage)
+			}
+			if !strings.Contains(err.Error(), test.wantMessage) {
+				t.Fatalf("sandboxNetworkPolicy() error = %q, want %q", err, test.wantMessage)
+			}
+		})
+	}
+}
+
+func TestTeardownWaitsForSandboxDurability(t *testing.T) {
+	identity := taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 7}
+	client := &fakeSandboxManagerClient{
+		teardownResults: []teardownSuspendResult{
+			{outcome: pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_PENDING},
+			{outcome: pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_PENDING},
+			{outcome: pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_DURABLE},
+		},
+	}
+
+	startedAt := time.Now()
+	if err := releaseTaskAfterGenerationTeardown(context.Background(), client, identity); err != nil {
+		t.Fatalf("releaseTaskAfterGenerationTeardown() error = %v", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed < 2*teardownSuspendPoll {
+		t.Fatalf("teardown wait elapsed = %v, want at least two %v poll delays", elapsed, teardownSuspendPoll)
+	}
+	assertTeardownRequests(t, client.teardownRequests, "sbx", 7)
+	if client.stopCalls != 0 || client.deleteCalls != 0 {
+		t.Fatalf("destructive RPC calls = stop:%d delete:%d, want zero", client.stopCalls, client.deleteCalls)
+	}
+}
+
+func TestTeardownAcceptsLegacySupersededOutcome(t *testing.T) {
+	identity := taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 7}
+	client := &fakeSandboxManagerClient{
+		teardownResults: []teardownSuspendResult{
+			{outcome: pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_SUPERSEDED},
+		},
+	}
+
+	if err := releaseTaskAfterGenerationTeardown(context.Background(), client, identity); err != nil {
+		t.Fatalf("releaseTaskAfterGenerationTeardown() error = %v", err)
+	}
+	assertTeardownRequests(t, client.teardownRequests, "sbx", 7)
+	if client.stopCalls != 0 || client.deleteCalls != 0 {
+		t.Fatalf("destructive RPC calls = stop:%d delete:%d, want zero", client.stopCalls, client.deleteCalls)
+	}
+
+	replacementActiveClient := &fakeSandboxManagerClient{}
+	identity.sandboxDetached = true
+	if err := releaseTaskAfterGenerationTeardown(context.Background(), replacementActiveClient, identity); err != nil {
+		t.Fatalf("released releaseTaskAfterGenerationTeardown() error = %v", err)
+	}
+	if len(replacementActiveClient.teardownRequests) != 0 || replacementActiveClient.stopCalls != 0 || replacementActiveClient.deleteCalls != 0 {
+		t.Fatal("a released old task attempted to mutate a replacement execution")
+	}
+}
+
+func TestLaterExecutionUsesDurableSuspendWithoutOptIn(t *testing.T) {
+	podTask := &task{
+		id:                  "task",
+		sandboxID:           "sbx",
+		executionGeneration: 2,
+		generationTeardown:  requiresGenerationTeardown(2, ""),
+	}
+	service := &spaceTaskService{tasks: map[string]*task{"task": podTask}}
+	client := &fakeSandboxManagerClient{
+		teardownResults: []teardownSuspendResult{
+			{outcome: pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_DURABLE},
+		},
+	}
+
+	detached, err := service.waitForTaskTeardownRelease(context.Background(), client, "delete", "task", podTask)
+
+	if err != nil {
+		t.Fatalf("waitForTaskTeardownRelease() error = %v", err)
+	}
+	if !detached {
+		t.Fatal("later execution was not detached after durable suspend")
+	}
+	assertTeardownRequests(t, client.teardownRequests, "sbx", 2)
+	if client.calls != 0 || client.stopCalls != 0 || client.deleteCalls != 0 {
+		t.Fatalf("legacy teardown calls = state:%d stop:%d delete:%d, want zero", client.calls, client.stopCalls, client.deleteCalls)
+	}
+}
+
+func TestRequiresGenerationTeardown(t *testing.T) {
+	tests := []struct {
+		name                string
+		executionGeneration int64
+		teardownProtocol    string
+		want                bool
+	}{
+		{name: "first generation without annotation", executionGeneration: 1},
+		{
+			name:                "first generation with annotation",
+			executionGeneration: 1,
+			teardownProtocol:    sandboxTeardownProtocolDurableSuspend,
+			want:                true,
+		},
+		{name: "later generation without annotation", executionGeneration: 2, want: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := requiresGenerationTeardown(test.executionGeneration, test.teardownProtocol); got != test.want {
+				t.Fatalf("requiresGenerationTeardown() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestAutoSuspendPodTeardownWaitsForDurablePublication(t *testing.T) {
+	pendingObserved := make(chan struct{})
+	durablePollStarted := make(chan struct{})
+	publishDurable := make(chan struct{})
+	var releaseDurable sync.Once
+	t.Cleanup(func() {
+		releaseDurable.Do(func() { close(publishDurable) })
+	})
+	teardownCalls := 0
+	scenario := newTeardownScenario(t, func(scenario *teardownScenario) {
+		scenario.client.teardownResults = []teardownSuspendResult{
+			{outcome: pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_PENDING},
+			{outcome: pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_DURABLE},
+		}
+		scenario.client.onTeardownCall = func() {
+			teardownCalls++
+			switch teardownCalls {
+			case 1:
+				close(pendingObserved)
+			case 2:
+				close(durablePollStarted)
+				<-publishDurable
+			}
+		}
+	})
+
+	killDone := make(chan error, 1)
+	go func() {
+		_, err := scenario.service.Kill(context.Background(), &taskAPI.KillRequest{ID: "task"})
+		killDone <- err
+	}()
+
+	select {
+	case <-pendingObserved:
+	case err := <-killDone:
+		t.Fatalf("Kill completed before suspend was durable: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("Kill did not request durable suspend")
+	}
+	select {
+	case err := <-killDone:
+		t.Fatalf("Kill completed while suspend was pending: %v", err)
+	default:
+	}
+	scenario.service.mu.Lock()
+	statusWhilePending := scenario.task.status
+	detachedWhilePending := scenario.task.sandboxDetached
+	scenario.service.mu.Unlock()
+	if statusWhilePending != tasktypes.Status_RUNNING || detachedWhilePending {
+		t.Fatalf("task released while suspend was pending: status=%s detached=%t", statusWhilePending, detachedWhilePending)
+	}
+
+	select {
+	case <-durablePollStarted:
+	case err := <-killDone:
+		t.Fatalf("Kill completed before durable publication: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("Kill did not continue polling for durability")
+	}
+	releaseDurable.Do(func() { close(publishDurable) })
+	select {
+	case err := <-killDone:
+		if err != nil {
+			t.Fatalf("Kill() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Kill did not complete after suspend became durable")
+	}
+
+	if scenario.task.status != tasktypes.Status_STOPPED || !scenario.task.sandboxDetached {
+		t.Fatalf("task was not detached after durable suspend: %+v", scenario.task)
+	}
+	assertTeardownRequests(t, scenario.client.teardownRequests, "sbx", 2)
+	if scenario.client.calls != 0 || scenario.client.stopCalls != 0 || scenario.client.deleteCalls != 0 {
+		t.Fatalf("legacy teardown calls = state:%d stop:%d delete:%d, want zero", scenario.client.calls, scenario.client.stopCalls, scenario.client.deleteCalls)
+	}
+}
+
+func TestConcurrentKillAndDeleteWaitForOneDurableTeardown(t *testing.T) {
+	pendingObserved := make(chan struct{})
+	durablePollStarted := make(chan struct{})
+	publishDurable := make(chan struct{})
+	var releaseDurable sync.Once
+	t.Cleanup(func() {
+		releaseDurable.Do(func() { close(publishDurable) })
+	})
+	teardownCalls := 0
+	scenario := newTeardownScenario(t, func(scenario *teardownScenario) {
+		scenario.client.teardownResults = []teardownSuspendResult{
+			{outcome: pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_PENDING},
+			{outcome: pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_DURABLE},
+		}
+		scenario.client.onTeardownCall = func() {
+			teardownCalls++
+			switch teardownCalls {
+			case 1:
+				close(pendingObserved)
+			case 2:
+				close(durablePollStarted)
+				<-publishDurable
+			}
+		}
+	})
+
+	killDone := make(chan error, 1)
+	go func() {
+		_, err := scenario.service.Kill(context.Background(), &taskAPI.KillRequest{ID: "task"})
+		killDone <- err
+	}()
+	select {
+	case <-pendingObserved:
+	case <-time.After(time.Second):
+		t.Fatal("Kill did not reach pending teardown")
+	}
+	deleteDone := make(chan error, 1)
+	go func() {
+		_, err := scenario.service.Delete(context.Background(), &taskAPI.DeleteRequest{ID: "task"})
+		deleteDone <- err
+	}()
+
+	select {
+	case err := <-deleteDone:
+		t.Fatalf("Delete completed while teardown was pending: %v", err)
+	default:
+	}
+	select {
+	case <-durablePollStarted:
+	case <-time.After(time.Second):
+		t.Fatal("Kill did not poll for durable teardown")
+	}
+	releaseDurable.Do(func() { close(publishDurable) })
+	for operation, done := range map[string]<-chan error{"Kill": killDone, "Delete": deleteDone} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("%s() error = %v", operation, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s did not complete after durable teardown", operation)
+		}
+	}
+
+	if _, ok := scenario.service.tasks["task"]; ok {
+		t.Fatal("concurrent Kill and Delete left the released task in the task map")
+	}
+	assertTeardownRequests(t, scenario.client.teardownRequests, "sbx", 2)
+	if scenario.client.stopCalls != 0 || scenario.client.deleteCalls != 0 {
+		t.Fatalf("destructive RPC calls = stop:%d delete:%d, want zero", scenario.client.stopCalls, scenario.client.deleteCalls)
+	}
+}
+
+func TestFirecrackerExitDeleteFailsClosedWithoutDurablePublication(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	scenario := newTeardownScenario(t, func(scenario *teardownScenario) {
+		scenario.task.pid = 999_999_999
+		scenario.client.teardownResults = []teardownSuspendResult{
+			{outcome: pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_PENDING},
+		}
+		scenario.client.onTeardownCall = cancel
+	})
+
+	_, err := scenario.service.Wait(context.Background(), &taskAPI.WaitRequest{ID: "task"})
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if scenario.task.status != tasktypes.Status_STOPPED || scenario.task.sandboxDetached {
+		t.Fatalf("unexpected task state after runtime exit: %+v", scenario.task)
+	}
+	_, err = scenario.service.Delete(ctx, &taskAPI.DeleteRequest{ID: "task"})
+
+	if status.Code(err) != codes.Canceled {
+		t.Fatalf("Delete() code = %v, want Canceled (error: %v)", status.Code(err), err)
+	}
+	if scenario.service.tasks["task"] != scenario.task || scenario.task.sandboxDetached {
+		t.Fatal("Delete released the task without durable publication")
+	}
+	if len(scenario.client.teardownRequests) != 1 || scenario.client.calls != 0 || scenario.client.stopCalls != 0 || scenario.client.deleteCalls != 0 {
+		t.Fatalf("teardown calls = prepare:%d state:%d stop:%d delete:%d", len(scenario.client.teardownRequests), scenario.client.calls, scenario.client.stopCalls, scenario.client.deleteCalls)
+	}
+}
+
+func TestLaterExecutionReleasesAfterGenerationFencedDelete(t *testing.T) {
+	podTask := &task{id: "task", sandboxID: "sbx", executionGeneration: 2, generationTeardown: true}
+	service := &spaceTaskService{tasks: map[string]*task{"task": podTask}}
+	client := &fakeSandboxManagerClient{
+		teardownResults: []teardownSuspendResult{
+			{outcome: pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_DELETED},
+		},
+	}
+
+	detached, err := service.waitForTaskTeardownRelease(context.Background(), client, "delete", "task", podTask)
+
+	if err != nil {
+		t.Fatalf("waitForTaskTeardownRelease() error = %v", err)
+	}
+	if !detached {
+		t.Fatal("deleted sandbox task was not detached")
+	}
+	if len(client.teardownRequests) != 1 || client.calls != 0 {
+		t.Fatalf("teardown calls = prepare:%d state:%d, want prepare:1 state:0", len(client.teardownRequests), client.calls)
+	}
+	if client.stopCalls != 0 || client.deleteCalls != 0 {
+		t.Fatalf("destructive RPC calls = stop:%d delete:%d, want zero", client.stopCalls, client.deleteCalls)
+	}
+}
+
+func TestTeardownDoesNotTreatMissingLocalRowAsDeleteProof(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	client := &fakeSandboxManagerClient{
+		teardownResults: []teardownSuspendResult{
+			{outcome: pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_PENDING},
+		},
+		results: []sandboxStateResult{
+			{resp: &pb.StateResponse{MissingIds: []string{"sbx"}}},
+		},
+		onTeardownCall: cancel,
+	}
+
+	err := releaseTaskAfterGenerationTeardown(ctx, client, taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 2})
+
+	if status.Code(err) != codes.Canceled {
+		t.Fatalf("releaseTaskAfterGenerationTeardown() code = %v, want Canceled (error: %v)", status.Code(err), err)
+	}
+	if client.calls != 0 {
+		t.Fatalf("State() calls = %d, want zero", client.calls)
+	}
+}
+
+func TestFirstExecutionWithoutOptInKeepsLegacyTeardown(t *testing.T) {
+	podTask := &task{
+		id:                  "task",
+		sandboxID:           "sbx",
+		executionGeneration: 1,
+		generationTeardown:  requiresGenerationTeardown(1, ""),
+	}
+	service := &spaceTaskService{tasks: map[string]*task{"task": podTask}}
+	client := &fakeSandboxManagerClient{
+		results: []sandboxStateResult{
+			{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED.Enum()}}}},
+		},
+	}
+
+	detached, err := service.waitForTaskTeardownRelease(context.Background(), client, "delete", "task", podTask)
+
+	if err != nil {
+		t.Fatalf("waitForTaskTeardownRelease() error = %v", err)
+	}
+	if detached {
+		t.Fatal("first execution was unexpectedly detached")
+	}
+	if client.calls != 1 || client.stopCalls != 0 || client.deleteCalls != 1 {
+		t.Fatalf("legacy teardown calls = state:%d stop:%d delete:%d, want state:1 stop:0 delete:1", client.calls, client.stopCalls, client.deleteCalls)
+	}
+	if len(client.teardownRequests) != 0 {
+		t.Fatal("first execution without opt-in invoked durable suspend")
+	}
+}
+
+func TestDetachedTaskKillAndDeleteDoNotCallSandboxManager(t *testing.T) {
+	for _, operation := range []string{"kill", "delete"} {
+		t.Run(operation, func(t *testing.T) {
+			podTask := &task{
+				id:                  "task",
+				sandboxID:           "sbx",
+				executionGeneration: 7,
+				status:              tasktypes.Status_RUNNING,
+				sandboxDetached:     true,
+			}
+			client := &fakeSandboxManagerClient{
+				teardownResults: []teardownSuspendResult{
+					{outcome: pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_DURABLE},
+				},
+			}
+			managerCalls := 0
+			service := &spaceTaskService{
+				tasks: map[string]*task{"task": podTask},
+				sandboxManagerClientFactory: func() (pb.SandboxManagerClient, io.Closer, error) {
+					managerCalls++
+					return client, fakeConn{}, nil
+				},
+			}
+
+			var err error
+			if operation == "kill" {
+				_, err = service.Kill(context.Background(), &taskAPI.KillRequest{ID: "task"})
+			} else {
+				_, err = service.Delete(context.Background(), &taskAPI.DeleteRequest{ID: "task"})
+			}
+			if err != nil {
+				t.Fatalf("%s() error = %v", operation, err)
+			}
+			if managerCalls != 0 || len(client.teardownRequests) != 0 {
+				t.Fatalf("%s contacted sbx-manager for an already-detached task", operation)
+			}
+		})
+	}
+}
+
+func TestWaitForTaskTeardownReleaseDoesNotHoldServiceLockWhilePolling(t *testing.T) {
+	podTask := &task{id: "task", sandboxID: "sbx", executionGeneration: 7, generationTeardown: true}
+	service := &spaceTaskService{tasks: map[string]*task{"task": podTask}}
+	pollStarted := make(chan struct{})
+	releasePoll := make(chan struct{})
+	client := &fakeSandboxManagerClient{
+		teardownResults: []teardownSuspendResult{
+			{outcome: pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_DURABLE},
+		},
+		onTeardownCall: func() {
+			close(pollStarted)
+			<-releasePoll
+		},
+	}
+
+	waitDone := make(chan error, 1)
+	go func() {
+		_, err := service.waitForTaskTeardownRelease(context.Background(), client, "delete", "task", podTask)
+		waitDone <- err
+	}()
+	<-pollStarted
+
+	stateDone := make(chan error, 1)
+	go func() {
+		_, err := service.State(context.Background(), &taskAPI.StateRequest{ID: "task"})
+		stateDone <- err
+	}()
+	select {
+	case err := <-stateDone:
+		if err != nil {
+			t.Fatalf("State() while teardown polls returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		close(releasePoll)
+		<-waitDone
+		t.Fatal("task service lock was held while teardown polled sbx-manager")
+	}
+
+	close(releasePoll)
+	if err := <-waitDone; err != nil {
+		t.Fatalf("waitForTaskTeardownRelease() error = %v", err)
+	}
+}
+
+func TestTaskTeardownAbortsWhenTaskIsReplacedDuringManagerPoll(t *testing.T) {
+	for _, operation := range []string{"kill", "delete"} {
+		t.Run(operation, func(t *testing.T) {
+			original := &task{
+				id:                  "task",
+				sandboxID:           "sbx",
+				executionGeneration: 7,
+				generationTeardown:  true,
+				status:              tasktypes.Status_RUNNING,
+			}
+			replacement := &task{
+				id:                  "task",
+				sandboxID:           "sbx",
+				executionGeneration: 8,
+				generationTeardown:  true,
+				status:              tasktypes.Status_RUNNING,
+			}
+			pollStarted := make(chan struct{})
+			releasePoll := make(chan struct{})
+			client := &fakeSandboxManagerClient{
+				teardownResults: []teardownSuspendResult{
+					{outcome: pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_DURABLE},
+				},
+				onTeardownCall: func() {
+					close(pollStarted)
+					<-releasePoll
+				},
+			}
+			service := &spaceTaskService{
+				tasks: map[string]*task{"task": original},
+				sandboxManagerClientFactory: func() (pb.SandboxManagerClient, io.Closer, error) {
+					return client, fakeConn{}, nil
+				},
+			}
+
+			callDone := make(chan error, 1)
+			go func() {
+				if operation == "kill" {
+					_, err := service.Kill(context.Background(), &taskAPI.KillRequest{ID: "task"})
+					callDone <- err
+					return
+				}
+				_, err := service.Delete(context.Background(), &taskAPI.DeleteRequest{ID: "task"})
+				callDone <- err
+			}()
+
+			<-pollStarted
+			service.mu.Lock()
+			service.tasks["task"] = replacement
+			service.mu.Unlock()
+			close(releasePoll)
+
+			if err := <-callDone; status.Code(err) != codes.Aborted {
+				t.Fatalf("%s code = %v, want Aborted (error: %v)", operation, status.Code(err), err)
+			}
+			service.mu.Lock()
+			current := service.tasks["task"]
+			service.mu.Unlock()
+			if current != replacement {
+				t.Fatalf("%s changed the replacement task entry", operation)
+			}
+			if replacement.status != tasktypes.Status_RUNNING || replacement.sandboxDetached {
+				t.Fatalf("%s mutated replacement task: %+v", operation, replacement)
+			}
+			if original.status != tasktypes.Status_RUNNING || original.sandboxDetached {
+				t.Fatalf("%s mutated stale task: %+v", operation, original)
+			}
+		})
+	}
+}
+
+func TestKillAndDeleteReleaseRetiredExecution(t *testing.T) {
+	for _, outcome := range []pb.TeardownSuspendOutcome{
+		pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_DURABLE,
+		pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_SUPERSEDED,
+		pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_DELETED,
+	} {
+		for _, operation := range []string{"kill", "delete"} {
+			t.Run(outcome.String()+"/"+operation, func(t *testing.T) {
+				scenario := newTeardownScenario(t, func(scenario *teardownScenario) {
+					scenario.client.teardownResults = []teardownSuspendResult{{outcome: outcome}}
+				})
+				var err error
+				if operation == "kill" {
+					_, err = scenario.service.Kill(context.Background(), &taskAPI.KillRequest{ID: "task"})
+					if scenario.task.status != tasktypes.Status_STOPPED || !scenario.task.sandboxDetached {
+						t.Fatalf("Kill left the retired task attached: %+v", scenario.task)
+					}
+				} else {
+					_, err = scenario.service.Delete(context.Background(), &taskAPI.DeleteRequest{ID: "task"})
+					if _, exists := scenario.service.tasks["task"]; exists {
+						t.Fatal("Delete left the retired task in the task map")
+					}
+				}
+				if err != nil {
+					t.Fatalf("%s() error = %v", operation, err)
+				}
+				assertTeardownRequests(t, scenario.client.teardownRequests, "sbx", 2)
+				if scenario.client.stopCalls != 0 || scenario.client.deleteCalls != 0 {
+					t.Fatalf("release mutated sandbox: Stop=%d Delete=%d", scenario.client.stopCalls, scenario.client.deleteCalls)
+				}
+			})
+		}
+	}
+}
+
+func TestDeleteRemovesCurrentTaskAfterDurableTeardownProof(t *testing.T) {
+	commands := withFakeCommands(t, func(_ string, args []string) ([]byte, error) {
+		command := strings.Join(args, " ")
+		switch {
+		case strings.Contains(command, "-a list chain ip space_dataplane prerouting"):
+			return []byte("comment \"space-sbx-sbx\" # handle 7\n"), nil
+		case strings.Contains(command, "-a list chain ip space_dataplane postrouting"):
+			return []byte("comment \"space-sbx-sbx\" # handle 8\n"), nil
+		default:
+			return nil, nil
+		}
+	})
+	stdout, err := os.CreateTemp(t.TempDir(), "stdout")
+	if err != nil {
+		t.Fatalf("create stdout: %v", err)
+	}
+	stderr, err := os.CreateTemp(t.TempDir(), "stderr")
+	if err != nil {
+		t.Fatalf("create stderr: %v", err)
+	}
+	podTask := &task{
+		id:                  "task",
+		sandboxID:           "sbx",
+		executionGeneration: 7,
+		generationTeardown:  true,
+		status:              tasktypes.Status_RUNNING,
+		netnsPath:           "/var/run/netns/cni-test",
+		stdout:              stdout,
+		stderr:              stderr,
+	}
+	client := &fakeSandboxManagerClient{
+		teardownResults: []teardownSuspendResult{
+			{outcome: pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_DURABLE},
+		},
+	}
+	service := &spaceTaskService{
+		tasks: map[string]*task{"task": podTask},
+		sandboxManagerClientFactory: func() (pb.SandboxManagerClient, io.Closer, error) {
+			return client, fakeConn{}, nil
+		},
+	}
+
+	if _, err := service.Delete(context.Background(), &taskAPI.DeleteRequest{ID: "task"}); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+	if _, ok := service.tasks["task"]; ok {
+		t.Fatal("Delete() left the released task in the task map")
+	}
+	if podTask.stdout != nil || podTask.stderr != nil {
+		t.Fatalf("Delete() left task FIFOs open: stdout=%v stderr=%v", podTask.stdout, podTask.stderr)
+	}
+	assertCommand(t, *commands, "ip netns exec cni-test nft delete rule ip space_dataplane prerouting handle 7")
+	assertCommand(t, *commands, "ip netns exec cni-test nft delete rule ip space_dataplane postrouting handle 8")
+}
+
+func TestTeardownSuspendBudget(t *testing.T) {
+	tests := []struct {
+		name        string
+		remaining   time.Duration
+		hasDeadline bool
+		want        time.Duration
+	}{
+		{name: "no caller deadline", want: teardownSuspendNoDeadlineWait},
+		{name: "short caller deadline", remaining: 2 * time.Second, hasDeadline: true, want: 2 * time.Second},
+		{name: "long caller deadline", remaining: time.Minute, hasDeadline: true, want: teardownSuspendMaxWait},
+		{name: "expired caller deadline", remaining: -time.Second, hasDeadline: true, want: time.Nanosecond},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := teardownSuspendBudget(tt.remaining, tt.hasDeadline); got != tt.want {
+				t.Fatalf("teardownSuspendBudget() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTeardownFailsClosed(t *testing.T) {
+	tests := []struct {
+		name       string
+		identity   taskTeardownIdentity
+		result     teardownSuspendResult
+		wantCode   codes.Code
+		wantCalls  int
+		cancelCall bool
+	}{
+		{
+			name:      "missing execution generation fails before the RPC",
+			identity:  taskTeardownIdentity{sandboxID: "sbx"},
+			result:    teardownSuspendResult{outcome: pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_DURABLE},
+			wantCode:  codes.FailedPrecondition,
+			wantCalls: 0,
+		},
+		{
+			name:      "sandbox manager unavailable",
+			identity:  taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 8},
+			result:    teardownSuspendResult{err: status.Error(codes.Unavailable, "unavailable")},
+			wantCode:  codes.Unavailable,
+			wantCalls: 1,
+		},
+		{
+			name:       "still pending at cancellation",
+			identity:   taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 8},
+			result:     teardownSuspendResult{outcome: pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_PENDING},
+			wantCode:   codes.Canceled,
+			wantCalls:  1,
+			cancelCall: true,
+		},
+		{
+			name:      "unspecified outcome",
+			identity:  taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 8},
+			result:    teardownSuspendResult{},
+			wantCode:  codes.Internal,
+			wantCalls: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			client := &fakeSandboxManagerClient{teardownResults: []teardownSuspendResult{tt.result}}
+			if tt.cancelCall {
+				client.onTeardownCall = cancel
+			}
+
+			err := releaseTaskAfterGenerationTeardown(ctx, client, tt.identity)
+			if status.Code(err) != tt.wantCode {
+				t.Fatalf("releaseTaskAfterGenerationTeardown() code = %v, want %v (error: %v)", status.Code(err), tt.wantCode, err)
+			}
+			if len(client.teardownRequests) != tt.wantCalls {
+				t.Fatalf("PrepareTeardownSuspend() calls = %d, want %d", len(client.teardownRequests), tt.wantCalls)
+			}
+			if client.stopCalls != 0 || client.deleteCalls != 0 {
+				t.Fatalf("destructive RPC calls = stop:%d delete:%d, want zero", client.stopCalls, client.deleteCalls)
+			}
+		})
+	}
+}
+
+func TestLegacyPodTeardownDoesNotInvokeGenerationSuspend(t *testing.T) {
+	for _, operation := range []string{"kill", "delete"} {
+		t.Run(operation, func(t *testing.T) {
+			client := &fakeSandboxManagerClient{
+				results: []sandboxStateResult{{
+					resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED.Enum()}}},
+				}},
+			}
+			identity := taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 7}
+
+			detached, err := releaseLegacyTaskTeardown(context.Background(), client, operation, identity)
+			if err != nil {
+				t.Fatalf("releaseLegacyTaskTeardown() error = %v", err)
+			}
+			if detached {
+				t.Fatal("legacy stopped sandbox was unexpectedly detached")
+			}
+			if len(client.teardownRequests) != 0 {
+				t.Fatal("legacy pod teardown invoked planned suspend")
+			}
+			if operation == "kill" && (client.stopCalls != 1 || client.deleteCalls != 0) {
+				t.Fatalf("legacy kill calls = stop:%d delete:%d", client.stopCalls, client.deleteCalls)
+			}
+			if operation == "delete" && (client.stopCalls != 0 || client.deleteCalls != 1) {
+				t.Fatalf("legacy delete calls = stop:%d delete:%d", client.stopCalls, client.deleteCalls)
+			}
+		})
+	}
+}
+
+func TestLegacyKillThenDeleteStillCallsManagerDelete(t *testing.T) {
+	podTask := &task{
+		id:        "task",
+		sandboxID: "sbx",
+		status:    tasktypes.Status_RUNNING,
+	}
+	client := &fakeSandboxManagerClient{
+		results: []sandboxStateResult{
+			{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTED.Enum()}}}},
+			{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED.Enum()}}}},
+		},
+	}
+	managerCalls := 0
+	service := &spaceTaskService{
+		tasks: map[string]*task{"task": podTask},
+		sandboxManagerClientFactory: func() (pb.SandboxManagerClient, io.Closer, error) {
+			managerCalls++
+			return client, fakeConn{}, nil
+		},
+	}
+
+	if _, err := service.Kill(context.Background(), &taskAPI.KillRequest{ID: "task"}); err != nil {
+		t.Fatalf("Kill() error = %v", err)
+	}
+	if _, err := service.Delete(context.Background(), &taskAPI.DeleteRequest{ID: "task"}); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+
+	if managerCalls != 2 {
+		t.Fatalf("sandbox manager connections = %d, want 2", managerCalls)
+	}
+	if client.stopCalls != 1 || client.deleteCalls != 1 {
+		t.Fatalf("legacy teardown calls = stop:%d delete:%d, want stop:1 delete:1", client.stopCalls, client.deleteCalls)
+	}
+	if _, ok := service.tasks["task"]; ok {
+		t.Fatal("Delete() left the legacy task in the task map")
+	}
+}
+
+func TestLegacyKillAndDeleteSerializeManagerTeardown(t *testing.T) {
+	podTask := &task{
+		id:        "task",
+		sandboxID: "sbx",
+		status:    tasktypes.Status_RUNNING,
+	}
+	client := &blockingLegacyTeardownClient{
+		firstStateEntered:  make(chan struct{}),
+		secondStateEntered: make(chan struct{}),
+		releaseFirstState:  make(chan struct{}),
+		operations:         make(chan string, 2),
+	}
+	service := &spaceTaskService{
+		tasks: map[string]*task{"task": podTask},
+		sandboxManagerClientFactory: func() (pb.SandboxManagerClient, io.Closer, error) {
+			return client, fakeConn{}, nil
+		},
+	}
+
+	killDone := make(chan error, 1)
+	go func() {
+		_, err := service.Kill(context.Background(), &taskAPI.KillRequest{ID: "task"})
+		killDone <- err
+	}()
+	<-client.firstStateEntered
+
+	deleteDone := make(chan error, 1)
+	go func() {
+		_, err := service.Delete(context.Background(), &taskAPI.DeleteRequest{ID: "task"})
+		deleteDone <- err
+	}()
+
+	overlappedManagerDecision := false
+	select {
+	case <-client.secondStateEntered:
+		overlappedManagerDecision = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(client.releaseFirstState)
+
+	if err := <-killDone; err != nil {
+		t.Fatalf("Kill() error = %v", err)
+	}
+	if err := <-deleteDone; err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+	if overlappedManagerDecision {
+		t.Fatal("Delete reached the legacy manager decision while Kill teardown was still in flight")
+	}
+
+	first := <-client.operations
+	second := <-client.operations
+	if first != "stop" || second != "delete" {
+		t.Fatalf("legacy manager operations = [%s %s], want [stop delete]", first, second)
+	}
+}
+
+func TestLegacyKillHandoffDetachesBeforeNewerExecutionDelete(t *testing.T) {
+	podTask := &task{
+		id:        "task",
+		sandboxID: "sbx",
+		status:    tasktypes.Status_RUNNING,
+	}
+	client := &fakeSandboxManagerClient{
+		results: []sandboxStateResult{
+			{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_SUSPENDING.Enum()}}}},
+			{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTED.Enum()}}}},
+		},
+	}
+	managerCalls := 0
+	service := &spaceTaskService{
+		tasks: map[string]*task{"task": podTask},
+		sandboxManagerClientFactory: func() (pb.SandboxManagerClient, io.Closer, error) {
+			managerCalls++
+			return client, fakeConn{}, nil
+		},
+	}
+
+	if _, err := service.Kill(context.Background(), &taskAPI.KillRequest{ID: "task"}); err != nil {
+		t.Fatalf("Kill() error = %v", err)
+	}
+	if !podTask.sandboxDetached {
+		t.Fatal("Kill() did not latch the observed suspend handoff")
+	}
+	if _, err := service.Delete(context.Background(), &taskAPI.DeleteRequest{ID: "task"}); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+
+	if managerCalls != 1 {
+		t.Fatalf("sandbox manager connections = %d, want 1", managerCalls)
+	}
+	if client.stopCalls != 0 || client.deleteCalls != 0 {
+		t.Fatalf("legacy handoff teardown calls = stop:%d delete:%d, want zero", client.stopCalls, client.deleteCalls)
+	}
+	if _, ok := service.tasks["task"]; ok {
+		t.Fatal("Delete() left the detached legacy task in the task map")
+	}
+}
+
+func assertTeardownRequests(t *testing.T, requests []*pb.PrepareTeardownSuspendRequest, sandboxID string, legacyJournalGeneration int64) {
+	t.Helper()
+	if len(requests) == 0 {
+		t.Fatal("PrepareTeardownSuspend() received no requests")
+	}
+	for _, request := range requests {
+		if request.GetSandboxId() != sandboxID || request.GetExecutionGeneration() != legacyJournalGeneration {
+			t.Fatalf("PrepareTeardownSuspend() request = %+v, want sandbox %q and legacy journal generation %d", request, sandboxID, legacyJournalGeneration)
+		}
+	}
+	for _, request := range requests {
+		if request.GetAction() != pb.TeardownSuspendAction_TEARDOWN_SUSPEND_ACTION_BEGIN_OR_JOIN {
+			t.Fatalf("teardown action = %v, want BEGIN_OR_JOIN", request.GetAction())
+		}
+	}
+}
+
+func TestSandboxStateWithRetry(t *testing.T) {
+	tests := []struct {
+		name      string
+		results   []sandboxStateResult
+		wantErr   bool
+		wantCalls int
+	}{
+		{
+			name: "retries transient state error",
+			results: []sandboxStateResult{
+				{err: status.Error(codes.Unavailable, "sbx-manager unavailable")},
+				{resp: &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTED.Enum()}}}},
+			},
+			wantCalls: 2,
+		},
+		{
+			name: "does not retry not found",
+			results: []sandboxStateResult{
+				{err: status.Error(codes.NotFound, "missing sandbox")},
+			},
+			wantErr:   true,
+			wantCalls: 1,
+		},
+		{
+			name: "does not retry non transient state error",
+			results: []sandboxStateResult{
+				{err: status.Error(codes.InvalidArgument, "bad sandbox id")},
+			},
+			wantErr:   true,
+			wantCalls: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &fakeSandboxManagerClient{results: tt.results}
+
+			_, err := sandboxStateWithRetry(context.Background(), client, "sbx")
+
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("sandboxStateWithRetry() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if client.calls != tt.wantCalls {
+				t.Fatalf("State() calls = %d, want %d", client.calls, tt.wantCalls)
+			}
+		})
+	}
+}
+
+type sandboxStateResult struct {
+	resp *pb.StateResponse
+	err  error
+}
+
+type teardownScenario struct {
+	task    *task
+	client  *fakeSandboxManagerClient
+	service *spaceTaskService
+}
+
+func newTeardownScenario(t *testing.T, configure ...func(*teardownScenario)) *teardownScenario {
+	t.Helper()
+	scenario := &teardownScenario{
+		task: &task{
+			id:                  "task",
+			sandboxID:           "sbx",
+			executionGeneration: 2,
+			generationTeardown:  requiresGenerationTeardown(2, ""),
+			status:              tasktypes.Status_RUNNING,
+		},
+		client: &fakeSandboxManagerClient{},
+	}
+	for _, configureScenario := range configure {
+		configureScenario(scenario)
+	}
+	scenario.service = &spaceTaskService{
+		tasks: map[string]*task{"task": scenario.task},
+		sandboxManagerClientFactory: func() (pb.SandboxManagerClient, io.Closer, error) {
+			return scenario.client, fakeConn{}, nil
+		},
+	}
+	return scenario
+}
+
+type fakeSandboxManagerClient struct {
+	pb.SandboxManagerClient
+
+	results          []sandboxStateResult
+	calls            int
+	gotSandboxIDs    []string
+	teardownResults  []teardownSuspendResult
+	teardownRequests []*pb.PrepareTeardownSuspendRequest
+	onTeardownCall   func()
+	stopCalls        int
+	deleteCalls      int
+}
+
+type blockingLegacyTeardownClient struct {
+	pb.SandboxManagerClient
+
+	mu                 sync.Mutex
+	stateCalls         int
+	firstStateEntered  chan struct{}
+	secondStateEntered chan struct{}
+	releaseFirstState  chan struct{}
+	operations         chan string
+}
+
+func (f *blockingLegacyTeardownClient) State(context.Context, *pb.StateRequest, ...grpc.CallOption) (*pb.StateResponse, error) {
+	f.mu.Lock()
+	f.stateCalls++
+	call := f.stateCalls
+	f.mu.Unlock()
+
+	if call == 1 {
+		close(f.firstStateEntered)
+		<-f.releaseFirstState
+		return &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTED.Enum()}}}, nil
+	}
+	if call == 2 {
+		close(f.secondStateEntered)
+		return &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STOPPED.Enum()}}}, nil
+	}
+	return nil, status.Errorf(codes.Internal, "unexpected State call %d", call)
+}
+
+func (f *blockingLegacyTeardownClient) Stop(context.Context, *pb.StopRequest, ...grpc.CallOption) (*pb.StopResponse, error) {
+	f.operations <- "stop"
+	return &pb.StopResponse{}, nil
+}
+
+func (f *blockingLegacyTeardownClient) Delete(context.Context, *pb.DeleteRequest, ...grpc.CallOption) (*pb.DeleteResponse, error) {
+	f.operations <- "delete"
+	return &pb.DeleteResponse{}, nil
+}
+
+func (f *fakeSandboxManagerClient) State(ctx context.Context, in *pb.StateRequest, opts ...grpc.CallOption) (*pb.StateResponse, error) {
+	f.gotSandboxIDs = in.GetSandboxIds()
+	idx := f.calls
+	if idx >= len(f.results) {
+		idx = len(f.results) - 1
+	}
+	f.calls++
+	result := f.results[idx]
+	return result.resp, result.err
+}
+
+type teardownSuspendResult struct {
+	outcome pb.TeardownSuspendOutcome
+	err     error
+}
+
+func (f *fakeSandboxManagerClient) PrepareTeardownSuspend(ctx context.Context, in *pb.PrepareTeardownSuspendRequest, opts ...grpc.CallOption) (*pb.PrepareTeardownSuspendResponse, error) {
+	f.teardownRequests = append(f.teardownRequests, in)
+	idx := len(f.teardownRequests) - 1
+	if idx >= len(f.teardownResults) {
+		idx = len(f.teardownResults) - 1
+	}
+	result := f.teardownResults[idx]
+	if f.onTeardownCall != nil {
+		f.onTeardownCall()
+	}
+	return &pb.PrepareTeardownSuspendResponse{Outcome: result.outcome}, result.err
+}
+
+func (f *fakeSandboxManagerClient) Stop(ctx context.Context, in *pb.StopRequest, opts ...grpc.CallOption) (*pb.StopResponse, error) {
+	f.stopCalls++
+	return &pb.StopResponse{}, nil
+}
+
+func (f *fakeSandboxManagerClient) Delete(ctx context.Context, in *pb.DeleteRequest, opts ...grpc.CallOption) (*pb.DeleteResponse, error) {
+	f.deleteCalls++
+	return &pb.DeleteResponse{}, nil
+}
+
+// The Rust renderer verifies this same pod contract. CRI forwards annotations
+// to the infra OCI spec; workload env is intentionally NOT copied into Process.
+func TestColdCreateReceivesRenderedPodEnv(t *testing.T) {
+	wire, err := os.ReadFile("testdata/cold-create-env.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pod struct {
+		Metadata struct{ Annotations map[string]string }
+		Spec     struct {
+			Containers []struct {
+				Env []struct {
+					Name  string
+					Value string
+				}
+			}
+		}
+	}
+	if err := json.Unmarshal(wire, &pod); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{}
+	for _, entry := range pod.Spec.Containers[0].Env {
+		want[entry.Name] = entry.Value
+	}
+	spec := &ociSpec{Annotations: pod.Metadata.Annotations, Process: &ociProcess{Env: []string{"PATH=/usr/bin"}}}
+	client := &initialCreateRecorder{}
+	if _, err := spec.createSandbox(context.Background(), client, &pb.CreateRequest{Template: "seed"}); err != nil {
+		t.Fatal(err)
+	}
+	if client.calls != 1 || !reflect.DeepEqual(client.request.Env, want) {
+		t.Fatal("first manager Create did not receive the exact rendered desired environment")
+	}
+}
+
+type initialCreateRecorder struct {
+	pb.SandboxManagerClient
+	calls   int
+	request *pb.CreateRequest
+}
+
+func (c *initialCreateRecorder) Create(_ context.Context, r *pb.CreateRequest, _ ...grpc.CallOption) (*pb.CreateResponse, error) {
+	c.calls++
+	c.request = r
+	return &pb.CreateResponse{SandboxId: "test"}, nil
+}
+
+func TestInitialCreateEnvMetadataBoundaries(t *testing.T) {
+	encode := func(raw string) string { return base64.StdEncoding.EncodeToString([]byte(raw)) }
+	maximum := map[string]string{}
+	var maximumWire strings.Builder
+	for i := 0; i < 256; i++ {
+		key := fmt.Sprintf("K%0127d", i)
+		value := strings.Repeat("\x01", 128)
+		maximum[key] = value
+		maximumWire.WriteString(key + "=" + value + "\x00")
+	}
+
+	for _, tc := range []struct {
+		name        string
+		annotations map[string]string
+		want        map[string]string
+		invalid     bool
+	}{
+		{name: "maximum EnvMap", annotations: map[string]string{"space.pplx.net/process-env-v1": encode(maximumWire.String())}, want: maximum},
+		{name: "legacy missing", want: map[string]string{"PATH": "/usr/bin"}},
+		{name: "explicit empty", annotations: map[string]string{"space.pplx.net/process-env-v1": ""}, want: map[string]string{}},
+		{name: "reserved filtered", annotations: map[string]string{"space.pplx.net/process-env-v1": encode("SPACE_INTERNAL_TOKEN=secret\x00SPACE_INTERNAL_CONTROL_TOKEN=secret\x00KEEP=\x00")}, want: map[string]string{"KEEP": ""}},
+		{name: "control characters", annotations: map[string]string{"space.pplx.net/process-env-v1": encode("CONTROL=\x01\r\n\t=雪\x00")}, want: map[string]string{"CONTROL": "\x01\r\n\t=雪"}},
+		{name: "unsupported version", annotations: map[string]string{"space.pplx.net/process-env-v2": ""}, invalid: true},
+		{name: "encoded allocation bound", annotations: map[string]string{"space.pplx.net/process-env-v1": strings.Repeat("A", base64.StdEncoding.EncodedLen(64*1024+2*256)+4)}, invalid: true},
+		{name: "maximum value", annotations: map[string]string{"space.pplx.net/process-env-v1": encode("KEY=" + strings.Repeat("x", 8192) + "\x00")}, want: map[string]string{"KEY": strings.Repeat("x", 8192)}},
+		{name: "oversized key", annotations: map[string]string{"space.pplx.net/process-env-v1": encode(strings.Repeat("K", 129) + "=x\x00")}, invalid: true},
+		{name: "too many entries", annotations: map[string]string{"space.pplx.net/process-env-v1": encode(func() string {
+			var wire strings.Builder
+			for i := 0; i < 257; i++ {
+				fmt.Fprintf(&wire, "K%d=\x00", i)
+			}
+			return wire.String()
+		}())}, invalid: true},
+		{name: "too many total bytes", annotations: map[string]string{"space.pplx.net/process-env-v1": encode(func() string {
+			var wire strings.Builder
+			for i := 0; i < 8; i++ {
+				fmt.Fprintf(&wire, "K%d=%s\x00", i, strings.Repeat("x", 8190))
+			}
+			wire.WriteString("Z=\x00")
+			return wire.String()
+		}())}, invalid: true},
+		{name: "oversized value", annotations: map[string]string{"space.pplx.net/process-env-v1": encode("KEY=" + strings.Repeat("x", 8193) + "\x00")}, invalid: true},
+		{name: "base64 newline", annotations: map[string]string{"space.pplx.net/process-env-v1": encode("KEY=x\x00") + "\n"}, invalid: true},
+		{name: "base64 pad bits", annotations: map[string]string{"space.pplx.net/process-env-v1": "Sz0AAB=="}, invalid: true},
+		{name: "bad base64", annotations: map[string]string{"space.pplx.net/process-env-v1": "!"}, invalid: true},
+		{name: "missing terminator", annotations: map[string]string{"space.pplx.net/process-env-v1": encode("KEY=value")}, invalid: true},
+		{name: "bad UTF8", annotations: map[string]string{"space.pplx.net/process-env-v1": encode("KEY=\xff\x00")}, invalid: true},
+		{name: "key grammar", annotations: map[string]string{"space.pplx.net/process-env-v1": encode("_aZ09=value\x00")}, want: map[string]string{"_aZ09": "value"}},
+		{name: "bad continuation", annotations: map[string]string{"space.pplx.net/process-env-v1": encode("A-B=value\x00")}, invalid: true},
+		{name: "Unicode first", annotations: map[string]string{"space.pplx.net/process-env-v1": encode("éA=value\x00")}, invalid: true},
+		{name: "Unicode continuation", annotations: map[string]string{"space.pplx.net/process-env-v1": encode("Aé=value\x00")}, invalid: true},
+		{name: "bad key", annotations: map[string]string{"space.pplx.net/process-env-v1": encode("1KEY=value\x00")}, invalid: true},
+		{name: "duplicate key", annotations: map[string]string{"space.pplx.net/process-env-v1": encode("KEY=a\x00KEY=b\x00")}, invalid: true},
+		{name: "embedded NUL", annotations: map[string]string{"space.pplx.net/process-env-v1": encode("KEY=a\x00b\x00")}, invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := &ociSpec{Annotations: tc.annotations, Process: &ociProcess{Env: []string{"PATH=/usr/bin"}}}
+			client := &initialCreateRecorder{}
+			_, err := spec.createSandbox(context.Background(), client, &pb.CreateRequest{})
+			if tc.invalid {
+				if status.Code(err) != codes.InvalidArgument || status.Convert(err).Message() != "invalid cold-create environment metadata" || client.calls != 0 {
+					t.Fatal("malformed explicit metadata reached initial Create")
+				}
+			} else if err != nil || client.calls != 1 || !reflect.DeepEqual(client.request.Env, tc.want) {
+				t.Fatal("initial Create environment contract mismatch")
+			}
+		})
+	}
+}

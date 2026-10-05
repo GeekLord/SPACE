@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: space-traces
+  labels:
+    space-local-owner: traces
+    # Collector and Tempo run non-root with no host mounts.
+    pod-security.kubernetes.io/enforce: restricted

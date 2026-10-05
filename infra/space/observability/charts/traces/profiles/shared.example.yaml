@@ -1,0 +1,15 @@
+# Copy to an operator-owned values file. No producer or query access by default.
+profile: shared
+storage:
+  storageClassName: null # Required: choose a reviewed RWO class, or existingClaim.
+  size: 4Gi
+  retain: true
+scheduling:
+  nodeSelector: {}
+  tolerations: []
+networkPolicy:
+  receiverPeers: [] # Explicit namespaceSelector AND podSelector for canary producers.
+  queryPeers: [] # Explicit namespaceSelector AND podSelector for Grafana, if used.
+  additionalEgress: [] # NodeLocal DNS, if needed; do not add unrestricted egress.
+tempo:
+  blockRetention: 6h # Traces are high volume; size storage before raising this.

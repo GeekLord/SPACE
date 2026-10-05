@@ -1,0 +1,109 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.serviceAccount.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-cluster-controller
+    app.kubernetes.io/instance: {{ .Release.Name }}
+---
+# Reuse the api-server's Role: cluster-controller needs the same pod CRUD +
+# event watch verbs to drive orphan-sweep deletes and warm-pool refills.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-cluster-controller-pods
+  namespace: {{ .Values.k8s.sandboxNamespace }}
+  labels:
+    app.kubernetes.io/name: space-cluster-controller
+    app.kubernetes.io/instance: {{ .Release.Name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.serviceAccount.name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Values.apiReleaseName }}-api-pods
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-cluster-controller-nodes
+  labels:
+    app.kubernetes.io/name: space-cluster-controller
+    app.kubernetes.io/instance: {{ .Release.Name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.serviceAccount.name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Values.apiReleaseName }}-api-nodes
+---
+# Leader-election lease: the cluster-controller holds a coordination.k8s.io
+# Lease in its own namespace and runs the singleton reconcilers only while it
+# holds it. Single-replica here, but the acquire/renew/release path still runs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-cluster-controller-lease
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-cluster-controller
+    app.kubernetes.io/instance: {{ .Release.Name }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-cluster-controller-lease
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-cluster-controller
+    app.kubernetes.io/instance: {{ .Release.Name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.serviceAccount.name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-cluster-controller-lease
+{{- if eq (.Values.reconcilers.nodeDrain.env.SPACE_NODE_DRAIN_TERMINATOR_KIND | default "aws") "kube-delete" }}
+---
+# kube-delete terminator backend: cluster-controller-only delete on
+# nodes. Not granted on the api-nodes ClusterRole because api-server
+# must not be able to evict nodes.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-cluster-controller-nodes-delete
+  labels:
+    app.kubernetes.io/name: space-cluster-controller
+    app.kubernetes.io/instance: {{ .Release.Name }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-cluster-controller-nodes-delete
+  labels:
+    app.kubernetes.io/name: space-cluster-controller
+    app.kubernetes.io/instance: {{ .Release.Name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.serviceAccount.name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Name }}-cluster-controller-nodes-delete
+{{- end }}

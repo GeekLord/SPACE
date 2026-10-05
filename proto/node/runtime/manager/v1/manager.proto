@@ -1,0 +1,404 @@
+syntax = "proto3";
+package space.node.runtime.manager.v1;
+
+import "execution/v1/execution.proto";
+
+// Node-local runtime and kernel manager.
+//
+// It reports the runtime releases and guest kernels on the node and
+// installs and removes guest kernels. It does not own selection, and launches
+// do not depend on it: an install makes a kernel present, never selected.
+service RuntimeManager {
+  // Diagnostic listing of the configured vendor and cache layouts. Never
+  // downloads, repairs aliases, adopts ownership, writes descriptors, or runs
+  // an artifact.
+  rpc ListExecutionArtifacts(ListExecutionArtifactsRequest) returns (ListExecutionArtifactsResponse);
+
+  // Whether the paths the runtime manager relies on are protected from other
+  // local accounts. Reports provisioning; never repairs it.
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+
+  // The guest kernels the kernel source offers for a runtime's release line
+  // and this node's architecture, with whether each is already here. Lists
+  // every line the node has a release of the runtime for when no line is
+  // named. A runtime the source publishes no kernels for fails with
+  // FAILED_PRECONDITION. Read-only; contacts the kernel source.
+  rpc ListAvailableKernels(ListAvailableKernelsRequest) returns (ListAvailableKernelsResponse);
+
+  // Download a kernel the source offers for a runtime line, verify it,
+  // and install it as space-managed. Returns the operation at once, queued
+  // behind any running one; the runtime manager owns the work from then on,
+  // so a caller that goes away changes nothing, and a restart resumes it. Installing a kernel already installed from the same
+  // source, or already present with the same bytes, succeeds without
+  // writing; a kernel of that version with different bytes fails with
+  // FAILED_PRECONDITION. Requires root or the local operator role. Disabled,
+  // with FAILED_PRECONDITION, unless the service was started with a kernel
+  // install root.
+  rpc InstallKernel(InstallKernelRequest) returns (InstallKernelResponse);
+
+  // Remove a kernel the runtime manager installed. Refuses external kernels
+  // and a kernel the root's default or legacy-default alias selects. Returns
+  // the operation at once, like an install. Requires root or the local
+  // operator role.
+  rpc UninstallKernel(UninstallKernelRequest) returns (UninstallKernelResponse);
+
+  rpc GetOperation(GetOperationRequest) returns (GetOperationResponse);
+
+  // Stop an operation still queued or downloading. A finished operation is
+  // returned unchanged; one already publishing or removing fails with
+  // FAILED_PRECONDITION. Requires root or the local operator role.
+  rpc CancelOperation(CancelOperationRequest) returns (CancelOperationResponse);
+}
+
+enum ExecutionArtifactKind {
+  EXECUTION_ARTIFACT_KIND_UNSPECIFIED = 0;
+  // A runtime release; runtime_kind says which runtime.
+  EXECUTION_ARTIFACT_KIND_RUNTIME = 1;
+  // An artifact component such as a guest kernel; component_kind says which.
+  EXECUTION_ARTIFACT_KIND_COMPONENT = 2;
+}
+
+// Which kind of storage an artifact was found on.
+enum ArtifactLocation {
+  ARTIFACT_LOCATION_UNSPECIFIED = 0;
+  // The image-provided vendor tree, which survives reboots.
+  ARTIFACT_LOCATION_VENDOR = 1;
+  // The recreatable cache filesystem that launches read from.
+  ARTIFACT_LOCATION_CACHE = 2;
+}
+
+// How an artifact is laid out where it was found.
+enum ArtifactProvenance {
+  ARTIFACT_PROVENANCE_UNSPECIFIED = 0;
+  // A directory named for the artifact's version.
+  ARTIFACT_PROVENANCE_VERSION_DIRECTORY = 1;
+  // Shipped inside a runtime release directory. Says where the component was
+  // found, not that the runtime can use it.
+  ARTIFACT_PROVENANCE_RUNTIME_RELEASE_BUNDLE = 2;
+  // The unversioned default layout that predates version directories.
+  ARTIFACT_PROVENANCE_LEGACY_FLAT = 3;
+}
+
+// Who owns an artifact's bytes. Ownership comes from the runtime manager's
+// install records, not from the artifact's location.
+enum ArtifactManagement {
+  ARTIFACT_MANAGEMENT_UNSPECIFIED = 0;
+  // Installed by the runtime manager, which may remove it under the
+  // uninstall rules.
+  ARTIFACT_MANAGEMENT_SPACE_MANAGED = 1;
+  // Supplied by something else; listed, never modified, removed, or adopted.
+  ARTIFACT_MANAGEMENT_EXTERNAL = 2;
+}
+
+// Who supplied an external artifact.
+enum ArtifactProvider {
+  // Also the value for space-managed artifacts, which have no provider.
+  ARTIFACT_PROVIDER_UNSPECIFIED = 0;
+  ARTIFACT_PROVIDER_NODE_IMAGE = 1;
+  ARTIFACT_PROVIDER_HOST_OS = 2;
+  // External, with no evidence of whose.
+  ARTIFACT_PROVIDER_UNKNOWN = 3;
+}
+
+enum ExecutionArtifactVersionSource {
+  EXECUTION_ARTIFACT_VERSION_SOURCE_UNSPECIFIED = 0;
+  EXECUTION_ARTIFACT_VERSION_SOURCE_DIRECTORY_NAME = 1;
+  // The "Linux version" banner in a kernel image whose layout names no
+  // version.
+  EXECUTION_ARTIFACT_VERSION_SOURCE_IMAGE_BANNER = 3;
+}
+
+enum ExecutionArtifactStatus {
+  EXECUTION_ARTIFACT_STATUS_UNSPECIFIED = 0;
+  EXECUTION_ARTIFACT_STATUS_VALID = 1;
+  // A required file is missing.
+  EXECUTION_ARTIFACT_STATUS_INCOMPLETE = 2;
+  // A required file exists but could not be read.
+  EXECUTION_ARTIFACT_STATUS_UNREADABLE = 3;
+  // Present, in a shape current consumers cannot use as-is.
+  EXECUTION_ARTIFACT_STATUS_INVALID = 4;
+  // The entry's name is not a version its layout recognizes.
+  EXECUTION_ARTIFACT_STATUS_UNRECOGNIZED = 5;
+  // A well-formed release with no known state-format mapping.
+  EXECUTION_ARTIFACT_STATUS_UNSUPPORTED = 6;
+}
+
+enum ScanRootPresence {
+  SCAN_ROOT_PRESENCE_UNSPECIFIED = 0;
+  SCAN_ROOT_PRESENCE_PRESENT = 1;
+  // Absent roots are not errors; an empty node lists nothing.
+  SCAN_ROOT_PRESENCE_ABSENT = 2;
+  SCAN_ROOT_PRESENCE_UNREADABLE = 3;
+}
+
+enum ScanIssueKind {
+  SCAN_ISSUE_KIND_UNSPECIFIED = 0;
+  SCAN_ISSUE_KIND_ENTRY_LIMIT = 1;
+  SCAN_ISSUE_KIND_DEADLINE = 2;
+  SCAN_ISSUE_KIND_ROOT_UNREADABLE = 3;
+  // An image was, or grew, larger than the digest limit and has no digest.
+  SCAN_ISSUE_KIND_DIGEST_LIMIT = 4;
+}
+
+message ListExecutionArtifactsRequest {
+  // Kinds to list. Empty lists every kind.
+  repeated ExecutionArtifactKind kinds = 1;
+  // Narrows listed components to these kinds. Empty lists every component
+  // kind.
+  repeated space.execution.v1.ArtifactComponentKind component_kinds = 2;
+}
+
+message ListExecutionArtifactsResponse {
+  repeated ExecutionArtifact artifacts = 1;
+  // Compatibility links as observed on disk. These are not a runtime-manager
+  // selection; the runtime manager does not own selection yet.
+  repeated ObservedAlias aliases = 2;
+  repeated ScannedRoot roots = 3;
+  // Anything that stopped the scan from seeing everything.
+  repeated ScanIssue issues = 4;
+  // Discovery coverage: false whenever issues is non-empty. Does not promise
+  // that every artifact is valid or every evidence field is available.
+  // Per-entry read failures or concurrent changes may leave digest/version
+  // unset even in a complete listing; another list request probes them again.
+  // Inspect each entry's status and optional evidence before using it.
+  bool complete = 5;
+}
+
+message ExecutionArtifact {
+  ExecutionArtifactKind kind = 1;
+  // Set for runtimes.
+  space.execution.v1.RuntimeKind runtime_kind = 2;
+  // Set for components.
+  space.execution.v1.ArtifactComponentKind component_kind = 3;
+  // The component's role, such as boot for a guest kernel.
+  optional string role = 4;
+  ArtifactLocation location = 5;
+  ArtifactProvenance provenance = 6;
+  // The directory entry that named the artifact.
+  string name = 7;
+  // The release directory for runtimes, the image file for components.
+  string path = 8;
+  optional string version = 9;
+  ExecutionArtifactVersionSource version_source = 10;
+  // From the ELF header; unset when not an ELF image or an unknown machine.
+  optional string architecture = 11;
+  // From the known-release map; unset when the release is not in it.
+  optional StateFormat state_format = 12;
+  // sha256:<hex> of a kernel image. Runtimes are not hashed.
+  optional string digest = 13;
+  ExecutionArtifactStatus status = 14;
+  // Why the status is not valid, or why evidence is missing.
+  optional string detail = 15;
+  ArtifactManagement management = 16;
+  // Set only when management is external.
+  ArtifactProvider provider = 17;
+  // For a kernel, the runtime release it ships with or was installed for.
+  // Both are unset when nothing on disk ties it to one.
+  space.execution.v1.RuntimeKind for_runtime_kind = 18;
+  optional string for_runtime_version = 19;
+}
+
+message StateFormat {
+  string format = 1;
+  string version = 2;
+}
+
+message ObservedAlias {
+  string path = 1;
+  // Raw link target when path is a symlink.
+  optional string target = 2;
+  // Fully resolved target when it exists.
+  optional string resolved = 3;
+  optional string detail = 4;
+}
+
+// A configured root and what its entries are expected to be.
+message ScannedRoot {
+  ExecutionArtifactKind kind = 1;
+  space.execution.v1.RuntimeKind runtime_kind = 2;
+  space.execution.v1.ArtifactComponentKind component_kind = 3;
+  ArtifactLocation location = 4;
+  ArtifactProvenance provenance = 5;
+  string path = 6;
+  ScanRootPresence presence = 7;
+}
+
+message ScanIssue {
+  ScanIssueKind kind = 1;
+  string path = 2;
+  string detail = 3;
+}
+
+message GetStatusRequest {}
+
+message GetStatusResponse {
+  // The account the service runs as, which protected paths are checked
+  // against.
+  uint32 service_uid = 1;
+  uint32 service_gid = 2;
+  repeated ProtectedPath protected_paths = 3;
+}
+
+enum ProtectedPathRole {
+  PROTECTED_PATH_ROLE_UNSPECIFIED = 0;
+  // A root of releases or kernels, the node image's or the runtime
+  // manager's own: owned by root or the runtime manager and writable by no
+  // other account. A linked root is audited where it resolves.
+  PROTECTED_PATH_ROLE_INSTALL_ROOT = 1;
+  // Staged into the shared cache by root-run bootstrap: writable by root only.
+  PROTECTED_PATH_ROLE_ROOT_MANAGED_CACHE = 2;
+  // The runtime manager's persistent state: private to its account.
+  PROTECTED_PATH_ROLE_STATE_DIRECTORY = 3;
+}
+
+enum PathProtection {
+  PATH_PROTECTION_UNSPECIFIED = 0;
+  PATH_PROTECTION_PROTECTED = 1;
+  // Not provisioned yet.
+  PATH_PROTECTION_ABSENT = 2;
+  PATH_PROTECTION_UNPROTECTED = 3;
+}
+
+message ProtectedPath {
+  string path = 1;
+  ProtectedPathRole role = 2;
+  PathProtection protection = 3;
+  // For unprotected paths, each way another account could write or displace
+  // the path or a directory above it.
+  repeated string problems = 4;
+}
+
+message ListAvailableKernelsRequest {
+  // The runtime whose kernels to list. Unspecified means the runtime the
+  // kernel source publishes for.
+  space.execution.v1.RuntimeKind runtime_kind = 1;
+  // A release line ("1.15") or release ("1.15.1") of the runtime.
+  optional string runtime_version = 2;
+}
+
+message ListAvailableKernelsResponse {
+  repeated AvailableKernel kernels = 1;
+  space.execution.v1.RuntimeKind runtime_kind = 2;
+  // The lines listed, as "1.15".
+  repeated string runtime_lines = 3;
+  // Where the kernels come from, such as s3://spec.ccfc.min/firecracker-ci.
+  string source = 4;
+}
+
+enum KernelPresence {
+  KERNEL_PRESENCE_UNSPECIFIED = 0;
+  KERNEL_PRESENCE_NOT_INSTALLED = 1;
+  // Installed by the runtime manager from this source entry.
+  KERNEL_PRESENCE_INSTALLED = 2;
+  // A kernel of this version is on the node but was not installed from this
+  // entry: external, or installed from another line.
+  KERNEL_PRESENCE_VERSION_PRESENT = 3;
+}
+
+message AvailableKernel {
+  // The kernel's version, which is also its install directory's name, such
+  // as 6.1.155 or 6.1.155-no-acpi.
+  string version = 1;
+  // The runtime line the source publishes the kernel for.
+  space.execution.v1.RuntimeKind runtime_kind = 2;
+  string runtime_line = 3;
+  string architecture = 4;
+  uint64 size = 5;
+  // The MD5 digest the source publishes. Kernels without one cannot be
+  // verified and are not installable.
+  optional string md5 = 6;
+  string source = 7;
+  KernelPresence presence = 8;
+}
+
+message InstallKernelRequest {
+  // The runtime, and its release line or release, whose kernels to install
+  // from.
+  space.execution.v1.RuntimeKind runtime_kind = 1;
+  string runtime_version = 2;
+  string version = 3;
+}
+
+message InstallKernelResponse {
+  Operation operation = 1;
+}
+
+message UninstallKernelRequest {
+  string version = 1;
+}
+
+message UninstallKernelResponse {
+  Operation operation = 1;
+}
+
+enum OperationKind {
+  OPERATION_KIND_UNSPECIFIED = 0;
+  OPERATION_KIND_INSTALL_KERNEL = 1;
+  OPERATION_KIND_UNINSTALL_KERNEL = 2;
+}
+
+enum OperationState {
+  OPERATION_STATE_UNSPECIFIED = 0;
+  // Waiting for the operation ahead of it; one runs at a time.
+  OPERATION_STATE_QUEUED = 1;
+  OPERATION_STATE_DOWNLOADING = 2;
+  // Downloaded and verified; being published into the install root. Past
+  // cancelling.
+  OPERATION_STATE_PUBLISHING = 3;
+  OPERATION_STATE_REMOVING = 4;
+  OPERATION_STATE_CANCELLING = 5;
+  OPERATION_STATE_SUCCEEDED = 6;
+  // A transfer failure is retried a bounded number of times first; bytes
+  // that do not match what the source published are not.
+  OPERATION_STATE_FAILED = 7;
+  OPERATION_STATE_CANCELLED = 8;
+}
+
+enum OperationOutcome {
+  OPERATION_OUTCOME_UNSPECIFIED = 0;
+  OPERATION_OUTCOME_INSTALLED = 1;
+  // The runtime manager had already installed this kernel from this entry.
+  OPERATION_OUTCOME_ALREADY_INSTALLED = 2;
+  // An external kernel of this version already has these bytes. It stays
+  // external.
+  OPERATION_OUTCOME_PROVIDED_EXTERNALLY = 3;
+  OPERATION_OUTCOME_UNINSTALLED = 4;
+}
+
+message Operation {
+  // UUIDv7.
+  string operation_id = 1;
+  OperationKind kind = 2;
+  OperationState state = 3;
+  string kernel_version = 4;
+  // The runtime line an install is for; unset for uninstalls.
+  space.execution.v1.RuntimeKind runtime_kind = 5;
+  optional string runtime_line = 6;
+  optional string source = 7;
+  // Set once succeeded.
+  OperationOutcome outcome = 8;
+  // Why the operation failed or was cancelled.
+  optional string error = 9;
+  // The kernel's directory.
+  optional string path = 10;
+  // sha256:<hex> of the kernel image, once known.
+  optional string digest = 11;
+  int64 created_at_unix_ms = 12;
+  int64 updated_at_unix_ms = 13;
+}
+
+message GetOperationRequest {
+  string operation_id = 1;
+}
+
+message GetOperationResponse {
+  Operation operation = 1;
+}
+
+message CancelOperationRequest {
+  string operation_id = 1;
+}
+
+message CancelOperationResponse {
+  Operation operation = 1;
+}

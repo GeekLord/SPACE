@@ -1,0 +1,54 @@
+name: Assume an AWS role
+description: >-
+  Exchange the job's GitHub OIDC token for one AWS session and export its
+  credentials to the rest of the job. The session is fixed-length: the GitHub
+  token itself expires in minutes, so an SDK refreshing from a token file would
+  fail partway through a long step. The calling job needs `id-token: write`.
+
+inputs:
+  role-arn:
+    description: ARN of the role to assume.
+    required: true
+  session-name:
+    description: STS role session name, as it appears in CloudTrail.
+    required: true
+  duration-seconds:
+    description: Session length. Must not exceed the role's maximum session duration.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Exchange the OIDC token for an AWS session
+      shell: bash
+      env:
+        ROLE_ARN: ${{ inputs.role-arn }}
+        SESSION_NAME: ${{ inputs.session-name }}
+        DURATION_SECONDS: ${{ inputs.duration-seconds }}
+      run: |
+        set -euo pipefail
+        if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]]; then
+          echo "::error::No OIDC token available: the job needs 'id-token: write'." >&2
+          exit 1
+        fi
+        token="$(curl -fsS \
+          -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" | jq -r .value)"
+        # Capture before parsing: a failed exchange must stop the step, not
+        # export empty credentials.
+        creds="$(aws sts assume-role-with-web-identity \
+          --role-arn "${ROLE_ARN}" \
+          --role-session-name "${SESSION_NAME}" \
+          --web-identity-token "${token}" \
+          --duration-seconds "${DURATION_SECONDS}" \
+          --query '[Credentials.AccessKeyId, Credentials.SecretAccessKey, Credentials.SessionToken]' \
+          --output text)"
+        read -r access_key_id secret_access_key session_token <<<"${creds}"
+        for value in "${access_key_id}" "${secret_access_key}" "${session_token}"; do
+          echo "::add-mask::${value}"
+        done
+        {
+          echo "AWS_ACCESS_KEY_ID=${access_key_id}"
+          echo "AWS_SECRET_ACCESS_KEY=${secret_access_key}"
+          echo "AWS_SESSION_TOKEN=${session_token}"
+        } >>"${GITHUB_ENV}"

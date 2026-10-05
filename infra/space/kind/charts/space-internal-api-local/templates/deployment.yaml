@@ -1,0 +1,183 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-internal-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-internal-api
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    team: {{ .Values.datadogTeam | quote }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: space-internal-api
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      annotations:
+        ad.datadoghq.com/tags: '{"team":"{{ .Values.datadogTeam }}"}'
+      labels:
+        app.kubernetes.io/name: space-internal-api
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        team: {{ .Values.datadogTeam | quote }}
+    spec:
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: internal-api
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/opt/space/bin/space-internal-api-svc"]
+          args:
+            - --listen
+            - "0.0.0.0:{{ .Values.service.port }}"
+          env:
+            # Local Kind only; deployed services require authenticated internal RPC TLS.
+            - name: SPACE_INTERNAL_RPC_INSECURE_DEV
+              value: "true"
+            - name: SPACE_INGRESS_WAKE_ENABLED
+              value: {{ .Values.ingressWake.enabled | quote }}
+            {{- if .Values.k8s.enabled }}
+            - name: SPACE_K8S_CONTROL_PLANE
+              value: "true"
+            - name: SPACE_SANDBOX_NAMESPACE
+              value: {{ .Values.k8s.sandboxNamespace | quote }}
+            - name: SPACE_SANDBOX_POD_IMAGE
+              value: {{ .Values.k8s.sandboxPodImage | quote }}
+            - name: SPACE_SANDBOX_NODE_SELECTOR_KEY
+              value: {{ .Values.k8s.sandboxNodeSelectorKey | quote }}
+            - name: SPACE_SANDBOX_NODE_SELECTOR_VALUE
+              value: {{ .Values.k8s.sandboxNodeSelectorValue | quote }}
+            - name: SPACE_INTERNAL_SECRET_NAME
+              value: {{ .Values.internal.secretName | quote }}
+            {{- end }}
+            - name: SPACE_K8S_TOKEN_AUTH_ENABLED
+              value: "true"
+            - name: SPACE_K8S_TOKEN_AUTH_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            - name: SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED
+              value: "false"
+            - name: SPACE_CLUSTER_API_AUTH_ALLOWED_SERVICE_ACCOUNTS
+              value: "space-node-stack,space-builder-node-stack,space-api,space-cluster-controller,space-data-plane,space-template-publish"
+            - name: SPACE_TEMPLATE_PUBLISH_SYSTEM_SERVICE_ACCOUNTS
+              value: "space-builder-node-stack,space-template-publish"
+            - name: SPACE_TEMPLATE_PUBLISH_TENANT_SERVICE_ACCOUNTS
+              value: "space-builder-node-stack"
+            {{- with .Values.visibilityCache }}
+            {{- /*
+                 Rendered per key and only when set, so an unset value leaves the
+                 binary's own default in force and the pod spec unchanged. Guard
+                 on `empty (toString .)` rather than plain truthiness: a bare
+                 `if .ttlSeconds` treats an unquoted YAML `0` as false and would
+                 silently drop the one value an operator most needs to deliver —
+                 the kill switch. Quote them in the values file.
+
+                 The `kindIs "invalid"` conjunct rejects an explicit YAML null,
+                 which `toString` renders as the non-empty string "<nil>" and
+                 would otherwise emit a valueless env var — changing the pod spec
+                 and rolling the deployment to deliver an empty string.
+            */}}
+            {{- if and (not (kindIs "invalid" .ttlSeconds)) (not (empty (toString .ttlSeconds))) }}
+            - name: SPACE_INTERNAL_API_VISIBILITY_CACHE_TTL_SECS
+              value: {{ .ttlSeconds | quote }}
+            {{- end }}
+            {{- if and (not (kindIs "invalid" .staleCeilingSeconds)) (not (empty (toString .staleCeilingSeconds))) }}
+            - name: SPACE_INTERNAL_API_VISIBILITY_CACHE_STALE_CEILING_SECS
+              value: {{ .staleCeilingSeconds | quote }}
+            {{- end }}
+            {{- end }}
+            # Datadog tracing — see datadog-agent-local chart.
+            {{- include "space-kind-telemetry.env" . | nindent 12 }}
+            - name: SPACE_K8S_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: SPACE_K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.postgres.secretName }}
+                  key: {{ .Values.postgres.secretKey }}
+            - name: SPACE_DB_USER_PASSWORD
+              value: {{ .Values.postgres.managedUserPassword | quote }}
+            - name: SPACE_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.internal.secretName }}
+                  key: SPACE_INTERNAL_TOKEN
+            - name: SPACE_ECW_CREDENTIAL_KEY_PATH
+              value: /var/run/space-ecw-credential/ecw-credential-key
+            - name: SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH
+              value: /var/run/space-route-signing/signing-key.pem
+            - name: SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.spaceApiRouteToken.ed25519.signingSecretName }}
+                  key: {{ .Values.spaceApiRouteToken.ed25519.signingKeyId }}
+            - name: SPACE_API_ROUTE_ED25519_ISSUER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.spaceApiRouteToken.ed25519.signingSecretName }}
+                  key: {{ .Values.spaceApiRouteToken.ed25519.issuer }}
+            - name: SPACE_CLUSTER_ID
+              value: {{ .Values.clusterId | quote }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          readinessProbe:
+            exec:
+              command:
+                - /opt/space/bin/grpc_health_probe
+                - -addr=127.0.0.1:{{ .Values.service.port }}
+                - -connect-timeout=1s
+                - -rpc-timeout=1s
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command:
+                - /opt/space/bin/grpc_health_probe
+                - -addr=127.0.0.1:{{ .Values.service.port }}
+                - -connect-timeout=1s
+                - -rpc-timeout=1s
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: route-signing
+              mountPath: /var/run/space-route-signing
+              readOnly: true
+            - name: ecw-credential
+              mountPath: /var/run/space-ecw-credential
+              readOnly: true
+      volumes:
+        - name: route-signing
+          secret:
+            secretName: {{ .Values.spaceApiRouteToken.ed25519.signingSecretName }}
+            defaultMode: 0444
+            items:
+              - key: {{ .Values.spaceApiRouteToken.ed25519.signingKey }}
+                path: signing-key.pem
+        - name: ecw-credential
+          secret:
+            secretName: {{ .Values.internal.secretName }}
+            defaultMode: 0444
+            items:
+              - key: ecw-credential-key
+                path: ecw-credential-key

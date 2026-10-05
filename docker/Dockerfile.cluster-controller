@@ -1,0 +1,29 @@
+# syntax=docker/dockerfile:1.7
+
+ARG SPACE_RUST_BUILD_IMAGE=space-rust-build-cluster-controller:local
+FROM ${SPACE_RUST_BUILD_IMAGE} AS rust-build
+
+FROM public.ecr.aws/docker/library/debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      bash \
+      ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --system --gid 953 space-cluster-controller \
+    && useradd --system --uid 953 --gid 953 --create-home --home-dir /space space-cluster-controller
+
+WORKDIR /space
+
+LABEL org.opencontainers.image.title="space-cluster-controller"
+LABEL org.opencontainers.image.description="Deployable SPACE cluster-controller image hosting cluster-singleton reconciler loops."
+
+COPY --from=rust-build /artifacts/bin/space-cluster-controller /space/bin/space-cluster-controller
+
+RUN chown -R space-cluster-controller:space-cluster-controller /space
+
+ARG SPACE_GIT_SHA=unknown
+LABEL org.opencontainers.image.revision="${SPACE_GIT_SHA}"
+RUN mkdir -p /etc/space && printf '%s\n' "${SPACE_GIT_SHA}" > /etc/space/build-git-sha
+
+USER space-cluster-controller

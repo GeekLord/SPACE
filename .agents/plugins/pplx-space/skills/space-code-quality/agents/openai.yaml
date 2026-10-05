@@ -1,0 +1,3 @@
+interface:
+  display_name: "SPACE Code Quality"
+  short_description: "Tests, snapshots, comments, and review fixes"

@@ -1,0 +1,299 @@
+syntax = "proto3";
+package space.node.api.v1;
+
+// Shared message types and services for node API.
+
+// ── Node info (registered by both worker and builder) ─────────────────────
+
+enum NodeRole {
+  NODE_ROLE_WORKER = 0;
+  NODE_ROLE_BUILDER = 1;
+  NODE_ROLE_CLUSTER = 2;
+}
+
+enum NodeSchedulingStatus {
+  NODE_SCHEDULING_STATUS_UNSPECIFIED = 0;
+  NODE_SCHEDULING_STATUS_READY = 1;
+  NODE_SCHEDULING_STATUS_WARMING = 2;
+  NODE_SCHEDULING_STATUS_DRAINING = 3;
+  NODE_SCHEDULING_STATUS_DEGRADED = 4;
+  NODE_SCHEDULING_STATUS_EMPTY = 5;
+  NODE_SCHEDULING_STATUS_UNAVAILABLE = 6;
+  NODE_SCHEDULING_STATUS_FULL = 7;
+}
+
+enum CacheDiskAdmissionState {
+  CACHE_DISK_ADMISSION_STATE_UNSPECIFIED = 0;
+  CACHE_DISK_ADMISSION_STATE_READY = 1;
+  CACHE_DISK_ADMISSION_STATE_WARNING = 2;
+  CACHE_DISK_ADMISSION_STATE_FULL = 3;
+  CACHE_DISK_ADMISSION_STATE_UNAVAILABLE = 4;
+}
+
+service NodeInfo {
+  rpc GetNodeInfo(GetNodeInfoRequest) returns (GetNodeInfoResponse);
+}
+
+// NodeCtl is a node-local reconciliation surface served by space-nodectl-svc
+// over a Unix socket.
+service NodeCtl {
+  rpc GetReconciliationStatus(GetReconciliationStatusRequest) returns (GetReconciliationStatusResponse);
+  rpc GetControllerState(GetControllerStateRequest) returns (GetControllerStateResponse);
+  rpc RefreshFacetState(RefreshFacetStateRequest) returns (RefreshFacetStateResponse);
+  rpc TriggerStateReconciliation(TriggerStateReconciliationRequest) returns (TriggerStateReconciliationResponse);
+  rpc MarkFacetDirty(MarkFacetDirtyRequest) returns (MarkFacetDirtyResponse);
+  rpc SetFacetSyncDisabled(SetFacetSyncDisabledRequest) returns (SetFacetSyncDisabledResponse);
+}
+
+message GetReconciliationStatusRequest {}
+message GetReconciliationStatusResponse {
+  repeated ReconciliationStatus reconciliations = 1;
+  repeated FacetSyncOverride sync_overrides = 2;
+}
+
+message ReconciliationStatus {
+  string name = 1;
+  uint64 poll_interval_secs = 2;
+  uint64 last_started_at_unix_secs = 3;
+  uint64 last_completed_at_unix_secs = 4;
+  uint64 last_success_at_unix_secs = 5;
+  uint64 next_due_at_unix_secs = 6;
+  bool running = 7;
+  uint64 templates_seen = 8;
+  uint64 sandboxes_seen = 9;
+  uint64 templates_applied = 10;
+  uint64 sandboxes_applied = 11;
+  string last_error = 13;
+}
+
+enum FacetDirection {
+  FACET_DIRECTION_UNSPECIFIED = 0;
+  FACET_DIRECTION_INBOUND = 1;
+  FACET_DIRECTION_OUTBOUND = 2;
+}
+
+enum ReconcileFacet {
+  RECONCILE_FACET_UNSPECIFIED = 0;
+  RECONCILE_FACET_NETWORK_POLICY = 1;
+  RECONCILE_FACET_SANDBOX_INVENTORY = 2;
+  RECONCILE_FACET_TEMPLATE_INVENTORY = 3;
+  RECONCILE_FACET_TEMPLATE_BASE_SNAPSHOT_POLICY = 4;
+  RECONCILE_FACET_SANDBOX_DESIRED_STATE = 5;
+  RECONCILE_FACET_TEMPLATE_DESIRED_STATE = 6;
+  RECONCILE_FACET_NODE_STATUS = 7;
+}
+
+message NetworkPolicyTargetRef {
+  oneof target {
+    string template = 1;
+    string sandbox_id = 2;
+  }
+}
+
+message FacetRef {
+  ReconcileFacet facet = 1;
+  oneof element {
+    string sandbox_id = 2;
+    string template = 3;
+    NetworkPolicyTargetRef network_policy_target = 4;
+  }
+}
+
+message RefreshFacetStateRequest {
+  repeated FacetRef refs = 1;
+}
+
+message RefreshFacetStateResponse {}
+
+enum StateReconciliationReason {
+  STATE_RECONCILIATION_REASON_UNSPECIFIED = 0;
+  STATE_RECONCILIATION_REASON_NODE_REGISTERED = 1;
+  STATE_RECONCILIATION_REASON_NODE_UPDATED = 2;
+  STATE_RECONCILIATION_REASON_MANUAL_NODE_STATUS_REFRESH = 3;
+  STATE_RECONCILIATION_REASON_MANUAL_NODE_RECONCILE = 4;
+  STATE_RECONCILIATION_REASON_MANUAL_NODE_NETWORK_POLICY_RECONCILE = 5;
+  STATE_RECONCILIATION_REASON_NODE_TEMPLATE_PULLED = 6;
+  STATE_RECONCILIATION_REASON_SANDBOX_REGISTERED = 7;
+  STATE_RECONCILIATION_REASON_SANDBOX_PORT_EXPOSURE_UPDATED = 8;
+  STATE_RECONCILIATION_REASON_SANDBOX_NETWORK_POLICY_UPDATED = 9;
+  STATE_RECONCILIATION_REASON_SANDBOX_DESIRED_STATE_UPDATED = 10;
+  STATE_RECONCILIATION_REASON_TEMPLATE_NETWORK_POLICY_UPDATED = 11;
+  STATE_RECONCILIATION_REASON_TEMPLATE_DESIRED_STATE_UPDATED = 12;
+  STATE_RECONCILIATION_REASON_TEMPLATE_BASE_SNAPSHOT_POLICY_UPDATED = 13;
+  STATE_RECONCILIATION_REASON_TEMPLATE_POOL_POLICY_UPDATED = 14;
+  STATE_RECONCILIATION_REASON_TEMPLATE_POOL_POLICY_DELETED = 15;
+  STATE_RECONCILIATION_REASON_NODE_SANDBOX_INVENTORY_PUBLISHED = 16;
+  STATE_RECONCILIATION_REASON_NODE_TEMPLATE_INVENTORY_PUBLISHED = 17;
+}
+
+message TriggerStateReconciliationRequest {
+  repeated StateReconciliationReason reasons = 1;
+  string diagnostic_reason = 2;
+}
+
+message TriggerStateReconciliationResponse {}
+
+message MarkFacetDirtyRequest {
+  repeated FacetRef refs = 1;
+}
+
+message MarkFacetDirtyResponse {}
+
+message SetFacetSyncDisabledRequest {
+  string facet = 1;
+  FacetDirection direction = 2;
+  bool disabled = 3;
+  optional uint64 ttl_secs = 4;
+  bool no_expiry = 5;
+  string reason = 6;
+}
+
+message SetFacetSyncDisabledResponse {}
+
+message FacetSyncOverride {
+  string facet = 1;
+  FacetDirection direction = 2;
+  optional uint64 disabled_until_unix_secs = 3;
+  string reason = 4;
+  uint64 updated_at_unix_secs = 5;
+}
+
+message GetControllerStateRequest {
+  optional string facet = 1;
+  bool include_queue = 2;
+}
+
+message GetControllerStateResponse {
+  repeated FacetControllerState facets = 1;
+  repeated FacetQueueItem outbound_queue = 2;
+  repeated FacetSyncOverride sync_overrides = 3;
+  bool cluster_sync_configured = 4;
+}
+
+message FacetControllerState {
+  string facet = 1;
+  bool supports_inbound = 2;
+  bool supports_outbound = 3;
+  ReconciliationStatus inbound = 4;
+  ReconciliationStatus outbound = 5;
+  FacetSyncOverride inbound_pause = 6;
+  FacetSyncOverride outbound_pause = 7;
+}
+
+message FacetQueueItem {
+  string facet = 1;
+  optional string element = 2;
+  uint64 attempts = 3;
+  string last_error = 4;
+  uint64 updated_at_unix_secs = 5;
+  uint64 last_attempt_at_unix_secs = 6;
+}
+
+message GetNodeInfoRequest {}
+message CacheDiskStatus {
+  // `statvfs.f_blocks * f_frsize` for `/space/cache`. This is filesystem
+  // capacity, not the sum of logical bytes referenced by btrfs subvolumes.
+  uint64 statvfs_total_bytes = 1;
+  // `statvfs.f_bfree * f_frsize`; diagnostic only. Admission uses
+  // `statvfs_available_bytes`, not `total - logical referenced bytes`.
+  uint64 statvfs_free_bytes = 2;
+  // `statvfs.f_bavail * f_frsize`; the conservative physical headroom signal
+  // used by node-local admission before btrfs pressure checks.
+  uint64 statvfs_available_bytes = 3;
+  double statvfs_available_fraction = 4;
+  uint64 effective_statvfs_available_bytes = 5;
+  uint64 pending_reservation_bytes = 6;
+  CacheDiskAdmissionState admission_state = 7;
+  string admission_reason = 8;
+  string admission_detail = 9;
+  // Absent when `/space/cache` is not btrfs or the btrfs CLI is unavailable.
+  optional uint64 btrfs_metadata_available_bytes = 10;
+  // Absent when `/space/cache` is not btrfs or the btrfs CLI is unavailable.
+  optional uint64 btrfs_device_unallocated_bytes = 11;
+}
+
+message NodeResourceStatus {
+  CacheDiskStatus cache_disk = 1;
+}
+
+message GetNodeInfoResponse {
+  NodeRole role = 1;
+  string node_id = 2;       // logical node identity; direct registry verification expects UUID
+  NodeSchedulingStatus scheduling_status = 3;
+  string scheduling_reason = 4;
+  uint32 network_slots_ready = 5;
+  uint32 network_pool_min_ready = 6;
+  uint32 network_slots_degraded = 7;
+  uint32 network_slots_quarantined = 8;
+  optional NodeCtlStatus node_ctl = 9;
+  uint32 network_slots_total = 10;
+  uint32 network_slots_leased = 11;
+  uint32 network_pool_max_slots = 12;
+  NodeResourceStatus resource_status = 14;
+}
+
+message NodeCtlStatus {
+  bool reachable = 1;
+  optional string error = 2;
+  repeated ReconciliationStatus reconciliations = 3;
+  repeated FacetSyncOverride sync_overrides = 4;
+}
+
+// ── Template transfer messages ─────────────────────────────────────────────
+
+message TransferSource {
+  oneof source {
+    NodeSource node = 1;
+  }
+}
+
+message NodeSource {
+  string address = 1;             // node-api-svc host:port
+}
+
+message SnapshotInfo {
+  uint32 vcpu = 1;
+  uint32 memory_mib = 2;
+  string snapshot_hash = 3;
+}
+
+message PullTemplateRequest {
+  string template_id = 1;
+  optional string content_hash = 2;        // exact build
+  optional string tag = 3;                  // resolve on source
+  repeated TransferSource sources = 4;
+  bool include_snapshot = 5;
+  optional uint32 snapshot_vcpu = 6;
+  optional uint32 snapshot_memory_mib = 7;
+  bool skip_if_exists = 8;
+  optional string local_tag = 9;           // tag to apply locally after pull
+  // When true, PullTemplate waits for ImportTemplate to satisfy local
+  // base-snapshot policy. Unset or false returns after the template build import.
+  optional bool block_on_snapshot_policy_achieved = 11;
+}
+
+message PullTemplateResponse {
+  string content_hash = 1;
+  bool already_existed = 2;
+  uint64 bytes_transferred = 3;
+}
+
+message ListNodeTemplatesRequest {}
+
+message ListNodeTemplatesResponse {
+  repeated NodeTemplateBuild builds = 1;
+}
+
+message NodeTemplateBuild {
+  string name = 1;
+  optional string content_hash = 2;
+  optional string build_date = 3;
+  // Logical expanded rootfs artifact size from build metadata or object transfer.
+  optional uint64 artifact_size_bytes = 4;
+  optional string runtime = 5;
+  optional string arch = 6;
+  repeated SnapshotInfo snapshots = 8;
+  // Node-local allocated bytes for the materialized template rootfs cache.
+  optional uint64 cache_size_bytes = 9;
+  optional uint32 disk_size_mb = 10;
+}

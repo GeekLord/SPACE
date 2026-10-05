@@ -1,0 +1,25 @@
+# Copy to an operator-owned values file. No query access by default.
+profile: shared
+clusterLabel: "" # Required: the cluster name used by existing log queries.
+storage:
+  storageClassName: null # Required: choose a reviewed RWO class, or existingClaim.
+  size: 2Gi
+  retain: true
+scheduling:
+  nodeSelector: {} # Loki backend placement.
+  tolerations: []
+alloy:
+  nodeSelector: {kubernetes.io/os: linux}
+  tolerations: [] # Add the taints of every node whose logs must be collected.
+networkPolicy:
+  queryPeers: [] # Explicit namespaceSelector AND podSelector for Grafana, if used.
+  additionalEgress: [] # NodeLocal DNS, if needed; do not add unrestricted egress.
+collection:
+  podTargets: [] # Verify the real CRI namespace_pod directory names first.
+  # Replace with all excluded builder containers for this deployment. This
+  # example is the local node-stack topology, not a shared-cluster inventory.
+  excludedPodSources:
+    - {namespace: space, podNamePrefix: space-builder-node-stack-, container: node-stack}
+  journal:
+    path: /var/log/journal # Verify the host actually has a persistent journal.
+    dropRegex: "" # Set for excluded builder unit;identifier pairs, if collected.

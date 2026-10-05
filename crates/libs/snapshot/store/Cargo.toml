@@ -1,0 +1,27 @@
+[package]
+name = "pplx-space-snapshot-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+jiff = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true, features = ["derive", "json", "postgres", "runtime-tokio", "time", "tls-rustls-aws-lc-rs", "uuid"] }
+thiserror = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+
+# internal
+pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
+
+[dev-dependencies]
+pplx-space-db-test-fixtures = { workspace = true }
+pplx-space-test-env = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

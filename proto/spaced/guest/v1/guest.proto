@@ -1,0 +1,16 @@
+syntax = "proto3";
+package space.spaced.guest.v1;
+
+import "spaced/activity/v1/activity.proto";
+
+// In-guest metadata/control API exposed by spaced-guest-svc on /run/spaced.sock.
+service Meta {
+  rpc Ping(PingRequest) returns (PingResponse);
+  rpc SetActivityState(space.spaced.activity.v1.SetActivityStateRequest) returns (space.spaced.activity.v1.SetActivityStateResponse);
+  rpc RequestActiveFor(space.spaced.activity.v1.RequestActiveForRequest) returns (space.spaced.activity.v1.RequestActiveForResponse);
+  rpc RequestShutdown(space.spaced.activity.v1.RequestShutdownRequest) returns (space.spaced.activity.v1.RequestShutdownResponse);
+}
+
+message PingRequest {}
+
+message PingResponse {}

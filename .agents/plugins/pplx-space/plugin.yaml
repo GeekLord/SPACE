@@ -1,0 +1,6 @@
+name: pplx-space
+version: '0.2.31'
+description: 'SPACE development, validation, infrastructure, and operations workflows.'
+
+components:
+  skills: ./skills/

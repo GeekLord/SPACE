@@ -1,0 +1,96 @@
+image:
+  repository: space-node-stack
+  tag: local
+  pullPolicy: IfNotPresent
+
+datadogTeam: team-space
+
+# Telemetry defaults come from the space-kind-telemetry library.
+telemetry: {}
+
+service:
+  name: space-internal-api
+  port: 9800
+  type: ClusterIP
+
+internal:
+  secretName: space-internal
+
+spaceApiRouteToken:
+  ed25519:
+    signingSecretName: space-route-signing
+    signingKey: signing-key.pem
+    signingKeyId: SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID
+    issuer: SPACE_API_ROUTE_ED25519_ISSUER
+
+clusterId: "kind-local"
+
+postgres:
+  secretName: space-postgres
+  secretKey: POSTGRES_CONNECTION_STRING
+  # Dev-default space_user password; the role is provisioned by the api
+  # chart's bootstrap-roles initContainer with the same value.
+  managedUserPassword: space-dev-user
+
+nodeSelector:
+  space.pplx.net/infra: "true"
+
+resources:
+  requests:
+    cpu: 25m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+# Template-visibility cache for the release-resolution RPCs (see the
+# `template_visibility_cache` module docs in the cluster-api crate).
+#
+# Leave a key empty to use the binary's default; an empty key renders no env var
+# at all, so the pod spec is unchanged. Setting BOTH durations to "0" disables
+# the cache and restores the pre-cache behavior — every lookup queries, and every
+# failed lookup degrades to UNSPECIFIED immediately. Expose the rollback in
+# values so disabling the cache does not require changing the binary.
+#
+# The EKS copy of this block says "restarting cluster-api, not by shipping a chart
+# change". Neither half transfers to kind: this chart deploys
+# `<release>-internal-api`, and because it is rendered rather than installed
+# (see below) there is no out-of-tree override — editing this file *is* the
+# in-tree change, and it is the only path.
+#
+# Quote the values — all of them, always. A bare 0 is a YAML integer that plain
+# truthiness reads as unset (the template guards against this), and a large
+# unquoted number survives Helm's JSON round-trip as Go float notation.
+visibilityCache:
+  # Left EMPTY on purpose, which renders no env var and leaves the binary's own
+  # default in force — and that default is OFF.
+  #
+  # Note what "set these" means for kind specifically: `infra/space/kind/scripts/
+  # bootstrap.sh` renders this chart with `helm template … | kubectl apply` rather
+  # than `helm install`, so there is no Helm release for it. It passes no `-f`,
+  # and its only `--set` values come from `DD_HELM_ARGS` (Datadog wiring, never
+  # this block), so the only way
+  # to turn the cache on locally is editing this file. The workload this chart deploys is
+  # `<release>-internal-api`, not `cluster-api`.
+  #
+  # Setting only staleCeilingSeconds to "0" does NOT stop cached answers — the
+  # freshness window is checked before the query. Stopping them takes both.
+  ttlSeconds: ""
+  staleCeilingSeconds: ""
+
+# Ingress activation must use the same substrate and pod configuration as the API.
+# The minimal Tilt harness overrides this to use DirectSubstrate.
+k8s:
+  enabled: true
+  sandboxNamespace: space
+  sandboxPodImage: registry.k8s.io/pause:3.10
+  sandboxNodeSelectorKey: node.kubernetes.io/space-enabled
+  sandboxNodeSelectorValue: "true"
+
+serviceAccount:
+  name: space-internal-api
+apiReleaseName: space
+
+# Activation is opt-in; substrate wiring alone does not enable automatic wake.
+ingressWake:
+  enabled: false

@@ -1,0 +1,19 @@
+# KubernetesSubstrate pins per-sandbox pods to runtimeClassName: space.
+# `infra/space/kind/scripts/install-shim.sh` installs the SPACE containerd
+# shim (`io.containerd.space.v2`) on each kind sandbox worker and registers
+# a `space` CRI runtime that points at it. The shim hijacks the per-sandbox
+# pod's pause container, reads the SPACE annotations (sandbox-id, vcpu,
+# memory, template, …), and calls into the local sandbox-manager UDS to
+# create a real sandbox via node-manager. Locally that node-manager is
+# `space-local-nodemgr-svc`, which boots the guest as a systemd-nspawn
+# container; in prod the same socket fronts Firecracker.
+#
+# If the shim isn't installed (e.g. on a fresh cluster before bootstrap.sh
+# has run install-shim.sh), kubelet will fail pod-start with
+# "runtime handler 'space' is not configured" and the api-server will report
+# `proxy_unreachable`. Run install-shim.sh and recreate the affected pods.
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: space
+handler: space

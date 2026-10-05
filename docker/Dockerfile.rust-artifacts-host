@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1.7
+#
+# Kind-only: the artifact image assembled from the incremental cargo build.
+#
+# infra/space/kind/scripts/build-rust-artifacts.sh (incremental mode) compiles the
+# union of the production artifact sets inside the CI builder image and
+# stages the binaries into the exact /artifacts layout that
+# docker/Dockerfile.rust-build-kind declares. This file only packages that
+# staging directory — plus the health probe the production worker set ships —
+# under the tag every runtime Dockerfile already consumes through
+# SPACE_RUST_BUILD_IMAGE. Nothing compiles here.
+#
+# Build (repo root context + a named context holding the staged layout):
+#   docker build -t space-rust-build-kind:local -f docker/Dockerfile.rust-artifacts-host \
+#     --build-context artifacts=$HOME/.space-devbox/kind/rust-artifacts/artifacts .
+
+ARG SPACE_GRPC_HEALTH_PROBE_IMAGE=space-grpc-health-probe:local
+
+FROM ${SPACE_GRPC_HEALTH_PROBE_IMAGE} AS grpc-health-probe
+
+FROM scratch AS build-artifacts-kind-host
+
+LABEL org.opencontainers.image.title="space-rust-build-kind"
+LABEL org.opencontainers.image.description="SPACE Rust build artifacts for the local kind stack, assembled from the incremental builder-container cargo build."
+
+COPY --from=artifacts / /artifacts/
+COPY --from=grpc-health-probe /grpc_health_probe /artifacts/bin/grpc_health_probe

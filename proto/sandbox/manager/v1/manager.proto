@@ -1,0 +1,1728 @@
+syntax = "proto3";
+package space.sandbox.manager.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+import "execution/v1/execution.proto";
+import "net/gateway/v1/gateway.proto";
+import "net/policy/v1/policy.proto";
+import "spaced/operations/v1/operations.proto";
+
+service SandboxManager {
+  // Create a new sandbox (allocate resources, prepare filesystem) without starting the VM.
+  rpc Create(CreateRequest) returns (CreateResponse);
+
+  // Start a sandbox: fresh boot, or restore from checkpoint/suspend state.
+  rpc Start(StartRequest) returns (StartResponse);
+
+  // Stop sandboxes (SIGTERM + grace period + SIGKILL, then cleanup).
+  rpc Stop(StopRequest) returns (StopResponse);
+
+  // Send a signal to a sandbox's VM process, then cleanup.
+  rpc Kill(KillRequest) returns (KillResponse);
+
+  // Delete sandboxes by ID prefix, optional template filter, or all.
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+
+  // Query deeper state for one or more sandboxes.
+  rpc State(StateRequest) returns (StateResponse);
+
+  // Return cached node-local component health for one sandbox. This RPC never
+  // performs probes; the background health monitor owns observation cadence.
+  rpc GetSandboxHealth(GetSandboxHealthRequest) returns (GetSandboxHealthResponse);
+
+  // Return node-local sandbox env projection for SPACE-controlled entrypoints.
+  rpc GetEnv(GetEnvRequest) returns (GetEnvResponse);
+
+  // Page through sandboxes with cheap inventory information, in sandbox-ID
+  // order. Every sandbox present for the whole scan appears exactly once; one
+  // created or deleted during the scan may or may not appear, as if the scan
+  // had finished before or started after that change.
+  rpc List(ListRequest) returns (ListResponse);
+
+  // Bounded operator discovery, including rowless cache directories. This is
+  // not a snapshot or mutation authority: concurrent changes may be omitted or
+  // repeated, and each exact-ID mutation rechecks its own ownership. A failed
+  // stream is incomplete, never permission to treat unseen sandboxes as absent.
+  rpc ScanCleanupTargets(ScanCleanupTargetsRequest) returns (stream CleanupTargetBatch);
+
+  // List every sandbox — regardless of owner — whose state still holds a
+  // parent-referencing instance subvolume, so template-manager can protect
+  // the parent template build from on-node GC and manual deletion. Unlike
+  // List, this deliberately does NOT apply the template-manager-owner filter:
+  // an adopted pool sandbox becomes user-owned (pool_template cleared, owner
+  // set to the platform user) yet its instance subvolume still references the
+  // parent build for incremental suspend/restore. State scoping excludes rows
+  // whose instance subvolume is already being torn down. Read-only.
+  rpc ListBuildReferencingSandboxes(ListBuildReferencingSandboxesRequest) returns (ListBuildReferencingSandboxesResponse);
+
+  // Return btrfs disk usage for explicitly requested sandboxes.
+  rpc GetDiskUsage(GetDiskUsageRequest) returns (GetDiskUsageResponse);
+
+  // Clean up dead sandboxes and orphaned network allocations.
+  rpc Cleanup(CleanupRequest) returns (CleanupResponse);
+
+  // List available templates.
+  rpc ListTemplates(ListTemplatesRequest) returns (ListTemplatesResponse);
+
+  // Pause a running sandbox (freeze vCPUs, process stays alive).
+  rpc Pause(PauseRequest) returns (PauseResponse);
+
+  // Resume a paused sandbox (thaw vCPUs).
+  rpc Resume(ResumeRequest) returns (ResumeResponse);
+
+  // Wake a sandbox from any dormant state for guest-facing access.
+  rpc Wake(WakeRequest) returns (WakeResponse);
+
+  // Create a snapshot of a sandbox (disk-only or full VM state).
+  // For full: pause + FC snapshot + full memory file + resume.
+  // For disk: btrfs subvolume snapshot (instant CoW).
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
+
+  // Internal: create a template base snapshot for a template-owned sandbox.
+  // Produces template artifacts snapshot.base + vmstate.base.
+  rpc CreateTemplateBaseSnapshot(CreateTemplateBaseSnapshotRequest) returns (CreateTemplateBaseSnapshotResponse);
+
+  // Suspend a sandbox (FC vmstate + full memory snapshot + stop, frees resources).
+  rpc Suspend(SuspendRequest) returns (SuspendResponse);
+
+  // Start, join, or observe the durable suspend that gates container-runtime
+  // teardown. Safe-to-release is reported only for the request's node-local
+  // execution lease after the remote artifact is registered ready.
+  rpc PrepareTeardownSuspend(PrepareTeardownSuspendRequest) returns (PrepareTeardownSuspendResponse);
+
+  // Enqueue durable backup of a local artifact, adopting an unpinned
+  // suspended snapshot when CurrentInstance is requested.
+  rpc EnqueueArtifactBackup(EnqueueArtifactBackupRequest) returns (EnqueueArtifactBackupResponse);
+
+  // Remove the entire local presence (wake-cache snapshot, instance
+  // rootfs, node-local DB rows) of a suspended sandbox whose cluster row
+  // no longer exists. Callers must have an authoritative cluster signal
+  // that the sandbox was deleted; the handler enforces that the local row
+  // is still `suspended` and quiescent before tearing down.
+  rpc EvictClusterDeletedSandbox(EvictClusterDeletedSandboxRequest) returns (EvictClusterDeletedSandboxResponse);
+
+  // Enable rolling btrfs snapshots for a sandbox.
+  rpc EnableSnapshots(EnableSnapshotsRequest) returns (EnableSnapshotsResponse);
+
+  // Disable rolling btrfs snapshots for a sandbox.
+  rpc DisableSnapshots(DisableSnapshotsRequest) returns (DisableSnapshotsResponse);
+
+  // List available btrfs snapshots for a sandbox.
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+
+  // Delete one or all btrfs snapshots for a sandbox.
+  rpc DeleteSnapshots(DeleteSnapshotsRequest) returns (DeleteSnapshotsResponse);
+
+  // Roll back a sandbox's filesystem to a previous snapshot.
+  rpc Rollback(RollbackRequest) returns (RollbackResponse);
+
+  // Return cgroup resource usage stats for a sandbox.
+  rpc Stats(StatsRequest) returns (StatsResponse);
+
+  // Update resource limits (cgroup) for a running sandbox.
+  rpc Update(UpdateRequest) returns (UpdateResponse);
+
+  // Set or replace the resolved auto lifecycle policy for a sandbox.
+  rpc SetAutoLifecyclePolicy(SetAutoLifecyclePolicyRequest) returns (SetAutoLifecyclePolicyResponse);
+
+  // Record auto-lifecycle activity without changing policy or sandbox power state.
+  rpc TouchAutoLifecycle(TouchAutoLifecycleRequest) returns (TouchAutoLifecycleResponse);
+
+  // Return a bounded batch of durable cluster auto-delete completions. Listing
+  // records delivery attempts but never removes evidence.
+  rpc ListAutoLifecycleDeleteReceipts(ListAutoLifecycleDeleteReceiptsRequest) returns (ListAutoLifecycleDeleteReceiptsResponse);
+
+  // Remove exactly the completed receipts already acknowledged by the cluster.
+  rpc AcknowledgeAutoLifecycleDeleteReceipts(AcknowledgeAutoLifecycleDeleteReceiptsRequest) returns (AcknowledgeAutoLifecycleDeleteReceiptsResponse);
+
+  // Report every sandbox whose current lifecycle artifact this node cannot
+  // prove is backed up.
+  //
+  // Unpaged, and the bound is every pinned artifact carrying no local
+  // backup marker: backups in flight, backups whose upload gave up
+  // permanently, restores whose marker has not been recovered, and the
+  // rare pin whose artifact row is missing or belongs to another sandbox.
+  // Wider than the in-flight count, then, and still nothing like the
+  // node's artifact history, which is the set this replaces as a drain
+  // driver.
+  //
+  // The response is all-or-nothing — a row this node cannot decode fails
+  // the call rather than silently shrinking the set, because a caller
+  // cannot distinguish a short answer from a complete one.
+  rpc ListPendingLocalBackups(ListPendingLocalBackupsRequest) returns (ListPendingLocalBackupsResponse);
+
+  // Get the resolved effective network policy for a sandbox.
+  rpc GetNetworkPolicy(GetNetworkPolicyRequest) returns (GetNetworkPolicyResponse);
+
+  // Apply a sandbox's desired network policy on the node.
+  rpc SetNetworkPolicy(SetNetworkPolicyRequest) returns (SetNetworkPolicyResponse);
+
+  // Notify sbx-manager that a template's network policy changed on this node.
+  rpc TemplateNetworkPolicyUpdated(TemplateNetworkPolicyUpdatedRequest) returns (TemplateNetworkPolicyUpdatedResponse);
+
+  // Deliberately cycle (kill + relaunch in place) one sandbox's net-gateway
+  // sidecar while the Firecracker VM keeps running. Gateways keep their
+  // launch-time binary until cycled, so this is the operator path for
+  // retiring gateways left running a pre-deploy binary. Synchronous and
+  // single-sandbox; batching, rate-limiting, and dry-run live in the caller
+  // (`space-sbxmgr cycle-net-gateway`). In-flight guest connections through
+  // the old gateway drop; the relaunched gateway re-binds fresh TPROXY
+  // sockets in the persistent sandbox netns and a policy reconcile is
+  // enqueued to re-hydrate it.
+  rpc CycleNetGateway(CycleNetGatewayRequest) returns (CycleNetGatewayResponse);
+
+  // ── Spaced guest operations ───────────────────────────────────────────────
+
+  rpc SpacedPingGuest(SpacedPingGuestRequest) returns (SpacedPingGuestResponse);
+  rpc SpacedGetStatus(SpacedGetStatusRequest) returns (SpacedGetStatusResponse);
+  rpc SpacedWaitReady(SpacedWaitReadyRequest) returns (SpacedWaitReadyResponse);
+
+  rpc SpacedStat(SpacedStatRequest) returns (space.spaced.operations.v1.StatResponse);
+  rpc SpacedList(SpacedListRequest) returns (stream space.spaced.operations.v1.FileInfo);
+  rpc SpacedRead(SpacedReadRequest) returns (stream space.spaced.operations.v1.FileChunk);
+  rpc SpacedWrite(stream SpacedWriteRequest) returns (space.spaced.operations.v1.WriteResponse);
+  rpc SpacedWriteBatch(SpacedWriteBatchRequest) returns (space.spaced.operations.v1.WriteBatchResponse);
+  rpc SpacedMkdir(SpacedMkdirRequest) returns (space.spaced.operations.v1.MkdirResponse);
+  rpc SpacedRemove(SpacedRemoveRequest) returns (space.spaced.operations.v1.RemoveResponse);
+  rpc SpacedRename(SpacedRenameRequest) returns (space.spaced.operations.v1.RenameResponse);
+  rpc SpacedNormalizeWatchRoot(SpacedNormalizeWatchRootRequest) returns (space.spaced.operations.v1.NormalizeWatchRootResponse);
+  rpc SpacedWatch(SpacedWatchRequest) returns (stream space.spaced.operations.v1.FileEvent);
+  rpc SpacedCreateWatcher(SpacedCreateWatcherRequest) returns (space.spaced.operations.v1.CreateWatcherResponse);
+  rpc SpacedGetWatcherEvents(SpacedGetWatcherEventsRequest) returns (space.spaced.operations.v1.GetWatcherEventsResponse);
+  rpc SpacedRemoveWatcher(SpacedRemoveWatcherRequest) returns (space.spaced.operations.v1.RemoveWatcherResponse);
+  rpc SpacedEnableFileChanges(SpacedEnableFileChangesRequest) returns (space.spaced.operations.v1.EnableFileChangesResponse);
+  rpc SpacedDisableFileChanges(SpacedDisableFileChangesRequest) returns (space.spaced.operations.v1.DisableFileChangesResponse);
+  rpc SpacedGetModifiedFiles(SpacedGetModifiedFilesRequest) returns (space.spaced.operations.v1.GetModifiedFilesResponse);
+
+  rpc SpacedStartProcess(SpacedStartProcessRequest) returns (stream space.spaced.operations.v1.ProcessEvent);
+  rpc SpacedConnectProcess(SpacedConnectProcessRequest) returns (stream space.spaced.operations.v1.ProcessEvent);
+  rpc SpacedListProcesses(SpacedListProcessesRequest) returns (SpacedListProcessesResponse);
+  rpc SpacedSendSignal(SpacedSendSignalRequest) returns (space.spaced.operations.v1.SendSignalResponse);
+  rpc SpacedSendInput(SpacedSendInputRequest) returns (space.spaced.operations.v1.SendInputResponse);
+  rpc SpacedCloseStdin(SpacedCloseStdinRequest) returns (space.spaced.operations.v1.CloseStdinResponse);
+  rpc SpacedResizePty(SpacedResizePtyRequest) returns (space.spaced.operations.v1.ResizePtyResponse);
+  rpc SpacedKillProcess(SpacedKillProcessRequest) returns (space.spaced.operations.v1.KillResponse);
+
+  // Open / close the in-VM loopback bridge for an explicitly authorized port.
+  // Forwards to spaced-host-svc (and through it, to spaced-guest-svc); the
+  // host-side firewall path (`expose_port` + `allow_port` on node-mgr) must
+  // be installed independently — these RPCs only manage the in-VM side.
+  rpc SpacedOpenLoopbackBridge(SpacedOpenLoopbackBridgeRequest) returns (space.spaced.operations.v1.OpenLoopbackBridgeResponse);
+  rpc SpacedCloseLoopbackBridge(SpacedCloseLoopbackBridgeRequest) returns (space.spaced.operations.v1.CloseLoopbackBridgeResponse);
+  rpc ServicePortIngress(stream space.net.gateway.v1.ServicePortIngressFrame) returns (stream space.net.gateway.v1.ServicePortIngressFrame);
+
+  // Internal: find a paused pool sandbox, reassign to user, resume it.
+  rpc AdoptPoolSandbox(AdoptPoolSandboxRequest) returns (AdoptPoolSandboxResponse);
+
+  // Wait for stopped, failed, cleanup_failed, suspended, or quarantined, or time out.
+  // Quarantine completes the wait without implying that runtime or files were removed.
+  rpc Wait(WaitRequest) returns (WaitResponse);
+
+  // Clone a paused donor sandbox to create a new sandbox (for pool cloning).
+  rpc CloneFromDonor(CloneFromDonorRequest) returns (CloneFromDonorResponse);
+
+  // ── Snapshot transfer ──────────────────────────────────────────────────────
+
+  // Export a sandbox snapshot for cross-node resume or external persistence.
+  rpc ExportSnapshot(ExportSnapshotRequest) returns (stream ExportSnapshotChunk);
+
+  // Import a snapshot bundle from another node or external storage.
+  rpc ImportSnapshot(stream ImportSnapshotRequest) returns (ImportSnapshotResponse);
+
+  // ── Sandbox rootfs transfer ───────────────────────────────────────────────
+
+  // Export a sandbox's rootfs (instance directory) for cross-node migration.
+  rpc ExportSandbox(ExportSandboxRequest) returns (stream ExportSandboxChunk);
+
+  // Import a sandbox rootfs from another node or external storage.
+  rpc ImportSandbox(stream ImportSandboxRequest) returns (ImportSandboxResponse);
+
+  // Internal: resolve the effective sandbox memory policy for this node.
+  rpc ResolveSandboxMemory(ResolveSandboxMemoryRequest) returns (ResolveSandboxMemoryResponse);
+
+  // Atomically release one runtime execution. An accepted response transfers
+  // teardown ownership to sandbox-manager: tracked rows are claimed durably
+  // and completed asynchronously, while a rowless local runtime is cleaned
+  // synchronously before the response. The caller detaches its task after
+  // either response disposition and performs no further sandbox teardown.
+  rpc ReleaseExecution(ReleaseExecutionRequest) returns (ReleaseExecutionResponse);
+}
+
+enum BootMode {
+  BOOT_MODE_UNSPECIFIED = 0;
+  BOOT_MODE_COLD = 1;          // Fresh boot from template
+  BOOT_MODE_BASE_SNAPSHOT = 2; // Warm boot from base memory snapshot
+  BOOT_MODE_POOL = 3;          // Adopt from pre-warmed pool
+}
+
+enum AutoLifecycleIdleAction {
+  AUTO_LIFECYCLE_IDLE_ACTION_UNSPECIFIED = 0;
+  AUTO_LIFECYCLE_IDLE_ACTION_NONE = 1;
+  AUTO_LIFECYCLE_IDLE_ACTION_PAUSE = 2;
+  AUTO_LIFECYCLE_IDLE_ACTION_SUSPEND = 3;
+  AUTO_LIFECYCLE_IDLE_ACTION_STOP = 4;
+  AUTO_LIFECYCLE_IDLE_ACTION_DELETE = 5;
+}
+
+enum AutoLifecycleWakeSource {
+  AUTO_LIFECYCLE_WAKE_SOURCE_UNSPECIFIED = 0;
+  AUTO_LIFECYCLE_WAKE_SOURCE_ACCESS = 1;
+  AUTO_LIFECYCLE_WAKE_SOURCE_COMMAND = 2;
+}
+
+enum AutoLifecycleConditionKind {
+  AUTO_LIFECYCLE_CONDITION_KIND_UNSPECIFIED = 0;
+  AUTO_LIFECYCLE_CONDITION_KIND_INACTIVITY = 1;
+  AUTO_LIFECYCLE_CONDITION_KIND_GUEST_ACTIVITY = 2;
+}
+
+enum AutoLifecycleActivitySource {
+  AUTO_LIFECYCLE_ACTIVITY_SOURCE_UNSPECIFIED = 0;
+  AUTO_LIFECYCLE_ACTIVITY_SOURCE_ACCESS = 1;
+  AUTO_LIFECYCLE_ACTIVITY_SOURCE_COMMAND = 2;
+}
+
+enum AutoLifecycleTouchResult {
+  AUTO_LIFECYCLE_TOUCH_RESULT_UNSPECIFIED = 0;
+  AUTO_LIFECYCLE_TOUCH_RESULT_APPLIED = 1;
+  AUTO_LIFECYCLE_TOUCH_RESULT_ALREADY_CURRENT = 2;
+  AUTO_LIFECYCLE_TOUCH_RESULT_DISABLED = 3;
+  AUTO_LIFECYCLE_TOUCH_RESULT_NOT_STARTED = 4;
+}
+
+enum AutoLifecycleConditionSetId {
+  AUTO_LIFECYCLE_CONDITION_SET_ID_UNSPECIFIED = 0;
+  AUTO_LIFECYCLE_CONDITION_SET_ID_ACCESS_IDLE = 1;
+  AUTO_LIFECYCLE_CONDITION_SET_ID_COMMAND_IDLE = 2;
+  AUTO_LIFECYCLE_CONDITION_SET_ID_GUEST_ACTIVITY = 3;
+}
+
+enum AutoLifecycleTransition {
+  AUTO_LIFECYCLE_TRANSITION_UNSPECIFIED = 0;
+  AUTO_LIFECYCLE_TRANSITION_NOOP = 1;
+  AUTO_LIFECYCLE_TRANSITION_PAUSE = 2;
+  AUTO_LIFECYCLE_TRANSITION_SUSPEND = 3;
+  AUTO_LIFECYCLE_TRANSITION_STOP = 4;
+  AUTO_LIFECYCLE_TRANSITION_DELETE = 5;
+}
+
+enum WakeTransition {
+  WAKE_TRANSITION_UNSPECIFIED = 0;
+  WAKE_TRANSITION_NOOP = 1;
+  WAKE_TRANSITION_RESUME = 2;
+  WAKE_TRANSITION_RESTORE = 3;
+  WAKE_TRANSITION_START = 4;
+  // Wake observed an in-flight transient lifecycle transition, waited for it to
+  // settle, and then returned without issuing resume/restore/start itself.
+  WAKE_TRANSITION_WAIT = 5;
+}
+
+message AutoLifecycleWakePolicy {
+  repeated AutoLifecycleWakeSource on = 1;
+}
+
+message AutoLifecycleConditionSet {
+  AutoLifecycleConditionSetId id = 1;
+  AutoLifecycleConditionKind kind = 2;
+  optional AutoLifecycleActivitySource activity_source = 3;
+  optional google.protobuf.Duration max_guest_idle_extension = 4;
+}
+
+message AutoLifecycleStage {
+  AutoLifecycleConditionSetId condition_set = 1;
+  google.protobuf.Duration at = 2;
+  AutoLifecycleIdleAction action = 3;
+}
+
+message AutoLifecyclePolicy {
+  AutoLifecycleWakePolicy wake = 1;
+  repeated AutoLifecycleConditionSet condition_sets = 2;
+  repeated AutoLifecycleStage stages = 3;
+}
+
+message AutoLifecycleConditionStatus {
+  AutoLifecycleConditionSetId condition_set = 1;
+  bool armed = 2;
+  optional google.protobuf.Timestamp epoch_at = 3;
+  optional google.protobuf.Timestamp last_touched_at = 4;
+}
+
+message AutoLifecycleStatus {
+  repeated AutoLifecycleConditionStatus conditions = 1;
+  optional google.protobuf.Timestamp next_auto_event_at = 2;
+  uint32 open_activity_leases = 3;
+  optional AutoLifecycleTransition last_auto_transition = 4;
+  optional google.protobuf.Timestamp last_auto_transition_at = 5;
+  optional string last_auto_error = 6;
+  optional google.protobuf.Timestamp last_access_at = 7;
+  optional google.protobuf.Timestamp last_command_at = 8;
+}
+
+message CreateRequest {
+  string template = 1;
+  string owner = 2;
+  string runtime = 3;            // Required: "fc" (the only runtime supported by Create).
+  bool snapshots_enabled = 4;    // Enable rolling btrfs snapshots when started
+  bool autostart = 5;            // If true, start the sandbox after creation
+  optional string pool_template = 6; // Internal: mark this sandbox as a pool member for the given template
+  BootMode boot_mode = 7;        // Which start method; fallthrough: pool → base_snapshot → cold
+  bool blocking = 8;             // When autostart=true, block until guest reports ready
+  optional string sandbox_id = 9; // Caller-provided sandbox ID to preserve control-plane identity
+  optional string content_hash = 10; // Pin to exact build (skips "newest" resolution if set)
+  map<string, string> env = 11;   // Sandbox env for SPACE-launched processes and space-ssh sessions
+  optional AutoLifecyclePolicy auto_lifecycle = 12;
+  // Optional per-sandbox rootfs size override. If unset, sandbox-manager clones
+  // the template rootfs exactly as template-manager materialized it.
+  optional uint32 rootfs_size_mb = 13;
+  optional space.net.policy.v1.NetworkPolicyV1 network_policy = 14;
+  uint64 network_policy_generation = 15;
+  space.net.policy.v1.PolicyAuthority network_policy_authority = 16;
+  space.net.policy.v1.PolicyAuthority auto_lifecycle_authority = 17;
+  optional space.net.policy.v1.NetworkPolicyV1 template_network_policy = 18;
+  uint64 template_network_policy_generation = 19;
+  space.net.policy.v1.PolicyAuthority template_network_policy_authority = 20;
+  // BYOK: run this sandbox on dm-crypt encrypted volumes. Immutable for the
+  // sandbox's lifetime — stamped by the control plane at create from the
+  // owner org's enrollment, honored fail-closed by every subsequent
+  // start/suspend/restore without re-deciding. Mutually exclusive with
+  // pool_template: pool members are always plaintext (encrypted sandboxes
+  // bypass warm pools at the API).
+  bool volume_encryption = 22;
+  optional space.net.gateway.v1.SpaceApiRouteIdentity route_identity = 26;
+  // Effective immutable disk-I/O assignment resolved by the control plane.
+  // Older callers omit these and receive the platform defaults.
+  optional uint64 disk_io_max_operations_per_sec = 28;
+  optional uint64 disk_io_max_bandwidth_mib_per_sec = 29;
+}
+
+message CreateResponse {
+  string sandbox_id = 1;
+  optional uint32 pid = 2;
+  optional string guest_ip = 3;
+  optional string namespace = 4;
+  optional string log_path = 5;
+  optional string vsock_uds_path = 6;
+  BootMode boot_mode_used = 7;   // Actual mode after fallthrough
+  bool reused_existing = 8;
+  // Present when create also activated or returned an already-active runtime.
+  optional space.net.gateway.v1.SpaceApiRouteIdentity route_identity = 9;
+}
+
+message StartRequest {
+  string sandbox_id = 1;
+  optional uint32 vcpu = 2;
+  optional uint32 memory_mib = 3; // Guest RAM in MiB
+  optional string checkpoint = 4;  // Restore from checkpoint or "suspend" state instead of fresh boot
+  bool from_warm = 5;     // Start from warm template snapshot instead of cold boot
+  // Fresh starts wait until guest ready; checkpoint/base-snapshot restores
+  // return after VM resume and snapshot readiness acceptance.
+  bool blocking = 6;
+  // Internal-only: use an externally-created network namespace (e.g. from K8s CNI).
+  // Public WorkerApi rejects this field; node-local start-context paths may set it.
+  optional string netns_path = 7;
+  // Applies only to fresh-start guest readiness waits; ignored for
+  // checkpoint/base-snapshot restore.
+  optional uint32 ready_timeout_secs = 8;
+  // Target lifecycle for checkpoint-based starts (a `checkpoint` value
+  // is required for non-default behavior; ignored for fresh boots).
+  // Unspecified → STARTED. PAUSED skips the post-load resume so the
+  // restored VM stays in the firecracker-paused state. Used by the
+  // cluster-controller's lifecycle-preserving drain evacuation path.
+  WakeTargetState target_state = 9;
+  // Internal-only exact S3 fallback for `checkpoint = "suspend"`.
+  optional string suspend_restore_storage_uri = 10;
+  // Node holding trusted local suspend bytes. A different node must use the
+  // exact S3 fallback instead of any local residual state.
+  optional string suspend_restore_source_node = 11;
+  optional space.net.gateway.v1.SpaceApiRouteIdentity route_identity = 16;
+  // Internal-only authority for restoring a verified typed artifact under a
+  // fresh sandbox identity. DISK cold-boots; FULL is reserved until rich
+  // runtime restore semantics are implemented. The source identity is checked
+  // against snapshot metadata; the target identity remains sandbox_id plus
+  // route_identity generation.
+  optional RestoreArtifactAsNewContext restore_artifact_as_new = 17;
+  // Internal-only lifecycle operation owner. Independent of route_identity:
+  // receipts complete this operation without rotating the serving route.
+  optional string operation_activation_attempt_id = 18;
+  // Cluster policy captured after the activation claim. Installed atomically
+  // with local activation admission, after artifact materialization. Local
+  // overrides win; an already-running retry preserves policy and deadlines.
+  // Callers must check activation-policy capability before sending this field.
+  // Omission preserves the existing policy.
+  optional AutoLifecyclePolicy activation_auto_lifecycle = 19;
+}
+
+message StartResponse {
+  string sandbox_id = 1;
+  uint32 pid = 2;
+  string guest_ip = 3;
+  string guest_gateway = 4;
+  string namespace = 5;
+  string log_path = 6;
+  string vsock_uds_path = 7;
+  // Authoritative normalized identity installed for this activation. Absent
+  // when the activation installed no route identity.
+  optional space.net.gateway.v1.SpaceApiRouteIdentity route_identity = 8;
+}
+
+message StopRequest {
+  // One exact sandbox UUID. Human selection belongs in ScanCleanupTargets.
+  string sandbox_id = 1;
+  // Require this template at cleanup admission; never expands the target set.
+  optional string template_filter = 2;
+  bool blocking = 3;          // If true, wait until sandbox state is stopped
+  bool immediate_kill = 4;     // If true, skip SIGTERM grace and use SIGKILL immediately
+}
+
+message StopResponse {
+  repeated string stopped_ids = 1;
+}
+
+message KillRequest {
+  string sandbox_id = 1;
+  uint32 signal = 2;  // Unix signal number (e.g. 9 = SIGKILL, 15 = SIGTERM)
+  bool blocking = 3;  // If true and signal is fatal, wait until cleanup reaches stopped
+}
+
+message KillResponse {
+}
+
+message DeleteRequest {
+  // One exact sandbox UUID. Human selection belongs in ScanCleanupTargets.
+  string sandbox_id = 1;
+  // Require this template at cleanup admission; never expands the target set.
+  optional string template_filter = 2;
+  bool blocking = 3;          // If true, wait until the sandbox row is deleted
+}
+
+message DeleteResponse {
+  repeated string deleted_ids = 1;
+}
+
+message StateRequest {
+  repeated string sandbox_ids = 1;
+}
+
+message StateResponse {
+  repeated SandboxInfo sandboxes = 1;
+  repeated string missing_ids = 2;
+}
+
+message GetEnvRequest {
+  string sandbox_id = 1;
+}
+
+message GetEnvResponse {
+  map<string, string> env = 1;
+}
+
+message ListRequest {
+  // Maximum sandboxes per page; the server caps it and may return fewer to stay
+  // within its byte budgets. Zero selects the server's default page size.
+  uint32 page_size = 1;
+  // Opaque `next_page_token` from the previous page. Empty starts a scan.
+  string page_token = 2;
+}
+
+message ScanCleanupTargetsRequest {}
+
+message CleanupTargetObservation {
+  string sandbox_id = 1;
+  optional string template = 2;
+  // False preserves an undecodable persisted target for operator reporting;
+  // clients must not select it using absent/defaulted metadata.
+  bool metadata_valid = 4;
+}
+
+message CleanupTargetBatch {
+  repeated CleanupTargetObservation targets = 1;
+}
+
+// Node-local lifecycle, including cleanup states that are not control-plane
+// desired lifecycles. Unknown observations are never evidence of a safe state.
+enum SandboxLifecycleState {
+  SANDBOX_LIFECYCLE_STATE_UNSPECIFIED = 0;
+  SANDBOX_LIFECYCLE_STATE_CREATING = 1;
+  SANDBOX_LIFECYCLE_STATE_CREATED = 2;
+  SANDBOX_LIFECYCLE_STATE_STARTING = 3;
+  SANDBOX_LIFECYCLE_STATE_STARTED = 4;
+  SANDBOX_LIFECYCLE_STATE_STOPPING = 5;
+  SANDBOX_LIFECYCLE_STATE_STOPPED = 6;
+  SANDBOX_LIFECYCLE_STATE_DELETING = 7;
+  SANDBOX_LIFECYCLE_STATE_PAUSING = 8;
+  SANDBOX_LIFECYCLE_STATE_PAUSED = 9;
+  SANDBOX_LIFECYCLE_STATE_RESUMING = 10;
+  SANDBOX_LIFECYCLE_STATE_CHECKPOINTING = 11;
+  SANDBOX_LIFECYCLE_STATE_SUSPENDING = 12;
+  SANDBOX_LIFECYCLE_STATE_SUSPENDED = 13;
+  SANDBOX_LIFECYCLE_STATE_RESTORING = 14;
+  SANDBOX_LIFECYCLE_STATE_CLEANUP_REQUIRED = 15;
+  SANDBOX_LIFECYCLE_STATE_CLEANUP_FAILED = 16;
+  SANDBOX_LIFECYCLE_STATE_QUARANTINED = 17;
+  SANDBOX_LIFECYCLE_STATE_FAILED = 18;
+}
+
+message SandboxInfo {
+  string sandbox_id = 1;
+  optional string template = 2;
+  optional uint32 pid = 4;     // VM/sandbox PID when running
+  optional string namespace = 5;
+  optional string uptime = 7;
+  optional string owner = 8;
+  optional string image_hash = 9; // template hash at creation time
+  bool spaced_host_alive = 10; // is spaced-host-svc process alive?
+  optional uint32 uid = 14;       // allocated sandbox UID when running
+  optional uint32 slot = 15;      // network slot when running
+  optional uint32 guest_cid = 16; // vsock CID when running
+  optional string created_at = 17; // creation timestamp
+  optional string runtime = 18; // Recorded runtime; Create supports only "fc", while imports may preserve other runtime kinds.
+  bool netgtw_alive = 19;       // is net-gateway-svc process alive?
+  bool snapshots_enabled = 20;  // are rolling btrfs snapshots enabled?
+  optional string pool_template = 22; // set if this sandbox is a pool member
+  optional AutoLifecyclePolicy auto_lifecycle = 23;
+  optional AutoLifecycleStatus auto_lifecycle_status = 24;
+  optional string failure_reason = 25;
+  bool firecracker_alive = 26; // is the Firecracker process alive?
+  bool vsock_raw_ping_ok = 27; // can sbx-manager ping spaced-guest directly over v.sock?
+  optional google.protobuf.Timestamp last_guest_ready_at = 28; // last time host observed guest ready
+  optional google.protobuf.Timestamp last_guest_heartbeat_at = 29; // last guest-originated heartbeat
+  optional uint64 network_tx_bytes = 30; // guest -> network, persisted lifetime counter
+  optional uint64 network_rx_bytes = 31; // network -> guest, persisted lifetime counter
+  uint64 network_policy_generation = 32; // desired sandbox override/inheritance generation
+  uint64 applied_network_policy_generation = 33; // effective generation last pushed to net-gateway
+  space.net.policy.v1.NetworkPolicySource applied_network_policy_source = 34;
+  space.net.policy.v1.PolicyAuthority network_policy_authority = 35;
+  space.net.policy.v1.PolicyAuthority auto_lifecycle_authority = 36;
+  optional string current_local_artifact_id = 37;
+  optional ArtifactKind current_local_artifact_kind = 38;
+  // Current-instance artifact origin. Only STOP and SUSPEND are valid here;
+  // SNAPSHOT is used for named snapshots in PublishedArtifact/local artifact rows.
+  optional ArtifactOrigin current_local_artifact_origin = 39;
+  optional space.execution.v1.ExecutionMetadata execution = 40;
+  optional string spaced_version = 41;
+  // Build git sha reported by the running net-gateway sidecar. Absent when no
+  // stats probe has succeeded yet, or when the gateway answered without a sha
+  // (a binary predating sha reporting — see netgtw_stale, which is true in
+  // that case).
+  optional string netgtw_git_sha = 42;
+  // True when the net-gateway's last stats probe reported a build sha that
+  // differs from this sandbox-manager's own — the gateway is still running a
+  // pre-deploy binary. A gateway that answered with no sha at all predates
+  // sha reporting entirely and is also true (stale) here. Absent only when no
+  // probe has succeeded yet, so "not probed" is not conflated with a verdict.
+  optional bool netgtw_stale = 43;
+  // Bounded node-local quarantine classification for a quarantined row.
+  optional string quarantine_reason_code = 44;
+  // Generation-fenced proof of a node-local transition that the control plane
+  // may consume idempotently.
+  optional TransitionReceipt transition_receipt = 45;
+  // The row exists locally and status is authoritative, but one or more
+  // optional inventory fields could not be decoded or inspected. Consumers
+  // must preserve previously observed optional fields for this publication.
+  bool state_degraded = 46;
+  SandboxHealthStatus health_status = 47;
+  optional google.protobuf.Timestamp health_observed_at = 48;
+  // Exact Kubernetes execution identity observed for this sandbox. These
+  // fields are carried with node state publication so the control plane can
+  // fence a terminal suspend projection to the pod that produced the bytes.
+  optional int64 execution_generation = 49;
+  optional string pod_uid = 50;
+  // Highest current or retained node-local route generations. These remain
+  // available after the active runtime identity is cleared.
+  optional uint64 route_provenance_generation = 51;
+  optional int64 route_provenance_execution_generation = 52;
+  space.net.gateway.v1.SandboxSubstrateKind route_provenance_substrate_kind = 53;
+  // Time the node-local state last changed. Carried with the matching state so
+  // cluster publication can measure node-to-Postgres convergence.
+  optional google.protobuf.Timestamp state_changed_at = 54;
+  optional QuarantineRecoveryObservation quarantine_recovery = 55;
+  // Current route incarnation for this runtime. Unlike execution generation,
+  // this changes when an activation retry replaces an attempt in place.
+  optional string activation_attempt_id = 56;
+  // Always set by the sandbox manager; readers reject its absence. Present
+  // UNSPECIFIED or an unknown value means undecodable state.
+  optional SandboxLifecycleState lifecycle = 57;
+}
+
+enum SandboxHealthStatus {
+  SANDBOX_HEALTH_STATUS_UNSPECIFIED = 0;
+  SANDBOX_HEALTH_STATUS_INITIALIZING = 1;
+  SANDBOX_HEALTH_STATUS_HEALTHY = 2;
+  SANDBOX_HEALTH_STATUS_DEGRADED = 3;
+}
+
+enum SandboxHealthComponent {
+  SANDBOX_HEALTH_COMPONENT_UNSPECIFIED = 0;
+  SANDBOX_HEALTH_COMPONENT_FIRECRACKER = 1;
+  SANDBOX_HEALTH_COMPONENT_SPACED_HOST = 2;
+  SANDBOX_HEALTH_COMPONENT_SPACED_GUEST = 3;
+  SANDBOX_HEALTH_COMPONENT_NET_GATEWAY = 4;
+}
+
+enum SandboxHealthProbeOutcome {
+  SANDBOX_HEALTH_PROBE_OUTCOME_UNSPECIFIED = 0;
+  SANDBOX_HEALTH_PROBE_OUTCOME_SUCCESS = 1;
+  SANDBOX_HEALTH_PROBE_OUTCOME_TIMEOUT = 2;
+  SANDBOX_HEALTH_PROBE_OUTCOME_UNAVAILABLE = 3;
+  SANDBOX_HEALTH_PROBE_OUTCOME_UNEXPECTED_STATE = 4;
+  SANDBOX_HEALTH_PROBE_OUTCOME_NOT_APPLICABLE = 5;
+}
+
+message SandboxHealthObservation {
+  google.protobuf.Timestamp observed_at = 1;
+  uint64 latency_micros = 2;
+  SandboxHealthProbeOutcome outcome = 3;
+  string detail = 4;
+}
+
+message SandboxComponentHealth {
+  SandboxHealthComponent component = 1;
+  repeated SandboxHealthObservation observations = 2;
+}
+
+message GetSandboxHealthRequest {
+  string sandbox_id = 1;
+}
+
+message GetSandboxHealthResponse {
+  string sandbox_id = 1;
+  SandboxHealthStatus status = 2;
+  optional google.protobuf.Timestamp evaluated_at = 3;
+  repeated SandboxHealthComponent degraded_components = 4;
+  repeated SandboxComponentHealth components = 5;
+}
+
+// One atomic wire value for a durable node-local transition. String
+// vocabularies are validated by the receiver so a newer producer's value can
+// be omitted without rejecting the sandbox's core state.
+message TransitionReceipt {
+  string id = 1;
+  string kind = 2;
+  string target_state = 3;
+  int64 execution_generation = 4;
+  string reason_code = 5;
+  // Required for activation receipts. New quarantine recoveries carry the
+  // originating attempt; legacy recoveries may omit it.
+  optional string activation_attempt_id = 6;
+}
+
+message SandboxListElement {
+  string sandbox_id = 1;
+  optional string template = 2;
+  optional string image_hash = 4;
+  optional string pool_template = 5;
+  optional string runtime = 6;
+  optional string created_at = 7;
+  optional string owner = 8;
+  optional SandboxLifecycleState lifecycle = 9;
+}
+
+message ListResponse {
+  // A page may be empty and still carry a `next_page_token`.
+  repeated SandboxListElement sandboxes = 1;
+  // Empty when the scan is complete.
+  string next_page_token = 2;
+}
+
+message ListBuildReferencingSandboxesRequest {}
+
+message ListBuildReferencingSandboxesResponse {
+  // Sandboxes of any owner whose state still holds a parent-referencing
+  // instance subvolume. `template` + `image_hash` identify the referenced
+  // build; `pool_template` lets the caller preserve pool-member delete scopes.
+  repeated SandboxListElement sandboxes = 1;
+}
+
+message GetDiskUsageRequest {
+  repeated string sandbox_ids = 1;
+}
+
+enum MissingDiskUsageReason {
+  MISSING_DISK_USAGE_REASON_UNSPECIFIED = 0;
+  MISSING_DISK_USAGE_REASON_SANDBOX_NOT_FOUND = 1;
+  MISSING_DISK_USAGE_REASON_INSTANCE_PATH_MISSING = 2;
+}
+
+message MissingDiskUsageId {
+  string id = 1;
+  MissingDiskUsageReason reason = 2;
+}
+
+message GetDiskUsageResponse {
+  map<string, uint64> usage_bytes = 1; // sandbox_id -> instance referenced bytes
+  repeated MissingDiskUsageId missing_ids = 2;
+}
+
+message CleanupRequest {}
+
+message CleanupResponse {
+  repeated string cleaned_ids = 1;
+}
+
+message ListTemplatesRequest {}
+
+message TemplateInfo {
+  string id = 1;
+  string description = 2;
+  string base = 3;
+  string built_at = 4;
+  uint64 size_bytes = 5;
+  string sha256 = 6;
+  string spaced_version = 7;
+  string spaced_compatibility_family = 8;
+}
+
+message ListTemplatesResponse {
+  repeated TemplateInfo templates = 1;
+}
+
+message PauseRequest {
+  string sandbox_id = 1;
+  // Pause always reaches paused before returning.
+}
+message PauseResponse {}
+message ResumeRequest {
+  // Optional cluster policy installed before thawing the fenced execution.
+  // Requires activation-policy capability; omission preserves existing policy.
+  optional AutoLifecyclePolicy activation_auto_lifecycle = 4;
+  // With activation_auto_lifecycle, match this generation before changing policy.
+  // Omission matches only a resident with no generation, never any generation.
+  optional int64 expected_execution_generation = 5;
+  string sandbox_id = 1;
+  bool blocking = 2;  // If true, block until guest health check passes
+  optional uint32 ready_timeout_secs = 3;
+}
+message ResumeResponse {
+  optional space.net.gateway.v1.SpaceApiRouteIdentity route_identity = 1;
+}
+message WakeRequest {
+  string sandbox_id = 1;
+  bool blocking = 2;          // If true, wait until sandbox is ready for guest access
+  optional WakeStartContext start_context = 3; // Internal-only launch context for node-local recovery paths
+  // Target lifecycle state for the wake. Unspecified → STARTED
+  // (back-compat default). PAUSED is used by the cluster-controller's
+  // lifecycle-preserving drain evacuation: it restores the VM from a
+  // suspend snapshot but leaves it in the paused state instead of
+  // issuing the post-load resume — preserving the user-visible
+  // `paused` lifecycle without an additional pause RPC after wake.
+  WakeTargetState target_state = 4;
+  // Unspecified is explicit operator wake. Access/command wakes must honor the
+  // worker's effective policy under wake exclusion. Requires blocking STARTED.
+  AutoLifecycleWakeSource implicit_wake_source = 5;
+}
+// Target lifecycle state for a Wake / WakeSandbox call. UNSPECIFIED is
+// treated as STARTED to preserve the historical behavior of the API.
+enum WakeTargetState {
+  WAKE_TARGET_STATE_UNSPECIFIED = 0;
+  WAKE_TARGET_STATE_STARTED = 1;
+  WAKE_TARGET_STATE_PAUSED = 2;
+}
+message WakeStartContext {
+  optional uint32 vcpu = 1;
+  optional uint32 memory_mib = 2; // Guest RAM in MiB
+  optional string netns_path = 3;
+  optional string suspend_restore_storage_uri = 4;
+  optional string suspend_restore_source_node = 5;
+  optional space.net.gateway.v1.SpaceApiRouteIdentity route_identity = 10;
+  // Control-plane lifecycle lease, not a route authorization dimension.
+  // Omitted by legacy callers; receipts then retain their legacy route-ID owner.
+  optional string operation_activation_attempt_id = 11;
+  // Same activation contract as StartRequest.activation_auto_lifecycle.
+  optional AutoLifecyclePolicy activation_auto_lifecycle = 12;
+  // Resident-resume fence only; never authority for a fresh activation.
+  // Requires activation_auto_lifecycle. Absent matches only a legacy resident.
+  optional int64 expected_execution_generation = 13;
+}
+message WakeResponse {
+  string sandbox_id = 1;
+  WakeTransition transition = 2;
+  optional space.net.gateway.v1.SpaceApiRouteIdentity route_identity = 3;
+}
+
+enum SnapshotType {
+  SNAPSHOT_TYPE_UNSPECIFIED = 0;
+  SNAPSHOT_TYPE_DISK = 1;  // Filesystem only (btrfs subvolume snapshot, local rollback only)
+  SNAPSHOT_TYPE_FULL = 2;  // Complete checkpoint: disk state (btrfs snapshot of instance/) + VM state (vmstate + memory)
+}
+
+message CreateSnapshotRequest {
+  string sandbox_id = 1;
+  SnapshotType type = 2;         // disk or full
+  optional string label = 3;     // User-provided label (stored in sidecar JSON, full snapshots only)
+  // Retention is scheduler-owned; creation always completes before returning.
+  // Optional operation-safe identity. When present, snapshot creation is
+  // deterministic and retries replay the exact published artifact.
+  optional SnapshotCreationIdentity creation_identity = 6;
+  // Required with creation_identity. Selects and fences the state being
+  // captured. Additional source variants can reuse this snapshot operation.
+  optional CreateSnapshotSource source = 8;
+}
+message CreateSnapshotResponse {
+  string snapshot_name = 1;      // Name of the created snapshot (e.g. "f-manual-20260410T140000Z")
+  SnapshotType type = 2;         // — use this name for rollback/delete/export
+  optional PublishedArtifact published_artifact = 3;
+  // Present when the requested source was already durable.
+  optional PublishedDurableArtifact published_durable_artifact = 4;
+}
+
+message SnapshotCreationIdentity {
+  string request_id = 1;
+}
+
+enum SnapshotSourceLifecycle {
+  SNAPSHOT_SOURCE_LIFECYCLE_UNSPECIFIED = 0;
+  SNAPSHOT_SOURCE_LIFECYCLE_STARTED = 1;
+  SNAPSHOT_SOURCE_LIFECYCLE_PAUSED = 2;
+}
+
+message CurrentSandboxSnapshotSource {
+  int64 execution_generation = 1;
+  SnapshotSourceLifecycle lifecycle = 2;
+}
+
+message CreateSnapshotSource {
+  oneof source {
+    CurrentSandboxSnapshotSource current_sandbox = 1;
+    DurableArtifactSnapshotSource durable_artifact = 2;
+  }
+}
+
+message DurableArtifactSnapshotSource {
+  string source_storage_uri = 1;
+  string destination_storage_uri = 2;
+  string destination_sandbox_id = 3;
+  ArtifactOrigin destination_origin = 4;
+}
+
+message PublishedDurableArtifact {
+  string storage_uri = 1;
+  uint64 bytes_published = 2;
+}
+
+message CreateTemplateBaseSnapshotRequest {
+  string sandbox_id = 1;
+  uint32 vcpu = 2;
+  uint32 memory_mib = 3;
+}
+message CreateTemplateBaseSnapshotResponse {
+  string snapshot_hash = 1;
+  uint32 memory_mib = 2;         // Guest RAM in MiB captured in snapshot.base
+}
+// Codec for the rootfs artifact a suspend snapshot writes to object
+// storage. Per-request opt-in: callers stay on `UNSPECIFIED` (which
+// the handler maps to `FULL`) unless they specifically want a
+// different payload shape. Existing snapshots in object storage are
+// all `FULL`; backwards compatibility for restoring them is required
+// forever.
+enum SuspendSnapshotFormat {
+  // Default. Handler routes to `FULL`.
+  SUSPEND_SNAPSHOT_FORMAT_UNSPECIFIED = 0;
+  // Full `rootfs.ext4` image written to object storage. The historical
+  // shape; the only codec used by legacy snapshots already in storage.
+  SUSPEND_SNAPSHOT_FORMAT_FULL = 1;
+  // `btrfs send -p <template_subvol> <instance_ro_snap>` stream
+  // (`rootfs.btrfs-send` on the wire). Requires the sandbox `instance`
+  // to be a btrfs subvolume snapshot of the local template subvolume
+  // (Parent UUID set) and the template's `received_uuid` to match the
+  // deterministic `UUIDv5(SPACE_TEMPLATE_RECEIVED_UUID_NS, name@hash)`
+  // value so the stream is portable across nodes. If those
+  // preconditions don't hold the handler rejects the request with
+  // `FAILED_PRECONDITION`; the caller can retry with `FULL`.
+  SUSPEND_SNAPSHOT_FORMAT_BTRFS_SEND = 2;
+}
+
+message SuspendRequest {
+  string sandbox_id = 1;
+  bool blocking = 2;             // If true, wait until state is suspended
+  // Rootfs codec for the snapshot. `UNSPECIFIED` (the default) maps to
+  // `FULL` for backwards compatibility — existing API-substrate callers
+  // and legacy clients land here, and behave exactly as they did before
+  // any btrfs-send work shipped.
+  SuspendSnapshotFormat format = 4;
+}
+
+enum ArtifactKind {
+  ARTIFACT_KIND_UNSPECIFIED = 0;
+  ARTIFACT_KIND_DISK = 1;
+  ARTIFACT_KIND_FULL = 2;
+}
+
+enum ArtifactOrigin {
+  ARTIFACT_ORIGIN_UNSPECIFIED = 0;
+  ARTIFACT_ORIGIN_STOP = 1;
+  ARTIFACT_ORIGIN_SUSPEND = 2;
+  ARTIFACT_ORIGIN_SNAPSHOT = 3;
+  ARTIFACT_ORIGIN_FORK = 4;
+}
+
+message PublishedArtifact {
+  string local_artifact_id = 1;
+  ArtifactKind artifact_kind = 2;
+  ArtifactOrigin origin = 3;
+  optional string snapshot_name = 4;
+}
+
+// A blocking suspend returns its newly published node-local restore artifact.
+// A non-blocking suspend returns before publication and leaves these fields
+// unset until state/query APIs observe completion.
+message SuspendResponse {
+  optional PublishedArtifact published_artifact = 1;
+}
+
+message CurrentInstanceSource {}
+
+message EnqueueArtifactBackupRequest {
+  string sandbox_id = 1;
+  // Required. ARTIFACT_KIND_UNSPECIFIED is invalid; callers must pass
+  // ARTIFACT_KIND_DISK or ARTIFACT_KIND_FULL.
+  ArtifactKind expected_artifact_kind = 2;
+  oneof source {
+    CurrentInstanceSource current_instance = 3;
+    string snapshot_name = 4;
+    string local_artifact_id = 5;
+  }
+}
+
+message EnqueueArtifactBackupResponse {
+  string local_artifact_id = 1;
+  ArtifactKind artifact_kind = 2;
+  string backup_attempt_id = 3;
+}
+
+message EvictClusterDeletedSandboxRequest {
+  string sandbox_id = 1;
+}
+
+message EvictClusterDeletedSandboxResponse {}
+
+message EnableSnapshotsRequest { string sandbox_id = 1; }
+message EnableSnapshotsResponse {}
+message DisableSnapshotsRequest { string sandbox_id = 1; }
+message DisableSnapshotsResponse {}
+
+message ListSnapshotsRequest { repeated string sandbox_ids = 1; }
+message ListSnapshotsResponse {
+  repeated SnapshotDetail snapshots = 1;
+}
+message SnapshotDetail {
+  string id = 1;                 // Snapshot name (e.g. "f-manual-20260410T140000Z") — use for rollback/delete/export
+  string sandbox_id = 2;
+  SnapshotType type = 3;
+  // Point-in-time local evidence, not a restore lease. Full snapshots require
+  // publication and capture files for "ready"; transferred disk snapshots also
+  // require publication and a matching transfer binding. Legacy unverified captures are
+  // "unknown", missing capture files "incomplete". May also be "restoring" or "deleting".
+  string state = 4;
+  optional string timestamp = 5; // Compact UTC (YYYYMMDDTHHmmssZ) for disk snapshots
+  optional string source_node_id = 6; // UUID of node that created it
+  optional string label = 7;     // User-provided label
+  optional string retention_tier = 8; // Scheduler retention tier
+  uint32 vcpu = 9;               // VM config at capture time; 0 when not recorded
+  uint32 memory_mib = 10;        // 0 when not recorded
+  optional uint64 size_bytes = 11; // absent when measurement is unavailable
+  optional string template_id = 12; // Captured provenance only; absent when unknown
+  optional string content_hash = 13; // Never inferred from the sandbox's current template
+  repeated SnapshotLocation locations = 14; // Empty when no location evidence is available
+}
+message SnapshotLocation {
+  string location_type = 1;      // "node" or "volume"
+  optional string node_id = 2;   // set when location_type = "node"
+  optional string node_address = 3;
+  optional string volume_id = 4; // set when location_type = "volume"
+  string state = 5;              // "transferring", "available", "deleting", "failed"
+  uint64 size_bytes = 6;
+}
+
+message DeleteSnapshotsRequest {
+  string sandbox_id = 1;
+  optional string snapshot_name = 2; // Delete a specific snapshot
+  bool all = 3;              // Delete all snapshots
+}
+message DeleteSnapshotsResponse {
+  repeated string deleted = 1;
+}
+
+message RollbackRequest {
+  string sandbox_id = 1;
+  string snapshot_name = 2;  // Which snapshot to roll back to
+  bool auto_restart = 3;     // If true, restart sandbox after rollback
+  // Internal-only: use an externally-created network namespace on auto-restart.
+  // Public WorkerApi rejects this field.
+  optional string netns_path = 4;
+  // Control-plane-owned identity for the execution created by auto-restart.
+  optional space.net.gateway.v1.SpaceApiRouteIdentity route_identity = 5;
+}
+message RollbackResponse {
+  string sandbox_id = 1;
+  string rolled_back_to = 2;
+  optional space.net.gateway.v1.SpaceApiRouteIdentity route_identity = 3;
+}
+
+message StatsRequest {
+  string sandbox_id = 1;
+}
+
+message StatsResponse {
+  string sandbox_id = 1;
+  // Cgroup CPU
+  string cpu_max = 2;         // e.g. "200000 100000" (2 vCPUs)
+  // Cgroup memory
+  uint64 memory_max = 3;      // bytes
+  uint64 memory_current = 4;  // bytes
+  // Cgroup PIDs
+  uint64 pids_max = 5;
+  uint64 pids_current = 6;
+  // Cumulative CPU time from cgroup cpu.stat
+  uint64 cpu_usage_usec = 7;
+  // Persisted lifetime network byte counters from the per-sandbox net-gateway.
+  uint64 network_tx_bytes = 8; // guest -> network
+  uint64 network_rx_bytes = 9; // network -> guest
+  // Live net-gateway stats when sbx-manager can reach the private sidecar
+  // socket. Byte counters still fall back to persisted lifetime values.
+  bool net_gateway_reachable = 10;
+  uint64 tcp_active_connections = 11;
+  uint64 tcp_total_connections = 12;
+  uint64 udp_active_mappings = 13;
+  uint64 bytes_forwarded = 14;
+  uint64 tcp_denied_connections = 15;
+}
+
+message UpdateRequest {
+  string sandbox_id = 1;
+  optional uint32 vcpu = 2;
+  optional uint32 memory_mib = 3; // Host cgroup memory.max in MiB
+  optional uint32 pids_max = 4;
+  optional string expected_current_owner = 5;
+  optional string owner = 6;
+  // Full replacement for sandbox process env. Requires replace_process_env=true.
+  map<string, string> process_env = 7;
+  bool replace_process_env = 8;
+}
+message UpdateResponse {}
+
+message SpacedPingGuestRequest {
+  string sandbox_id = 1;
+}
+message SpacedPingGuestResponse {}
+
+message SpacedGetStatusRequest {
+  string sandbox_id = 1;
+}
+message SpacedGetStatusResponse {
+  bool ready = 1;
+  optional google.protobuf.Duration guest_uptime = 2;
+  optional SpacedVersionInfo host_version = 3;
+  optional SpacedVersionInfo guest_version = 4;
+}
+
+message SpacedVersionInfo {
+  string version = 1;
+  string compatibility_family = 2;
+}
+
+message SpacedWaitReadyRequest {
+  string sandbox_id = 1;
+  optional google.protobuf.Duration timeout = 2;
+}
+message SpacedWaitReadyResponse {
+  optional google.protobuf.Duration guest_uptime = 1;
+}
+
+message SpacedStatRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.StatRequest operation = 2;
+}
+
+message SpacedListRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.ListRequest operation = 2;
+}
+
+message SpacedReadRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.ReadRequest operation = 2;
+}
+
+message SpacedWriteRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.WriteRequest operation = 2;
+}
+message SpacedWriteBatchRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.WriteBatchRequest operation = 2;
+}
+
+message SpacedMkdirRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.MkdirRequest operation = 2;
+}
+
+message SpacedRemoveRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.RemoveRequest operation = 2;
+}
+
+message SpacedRenameRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.RenameRequest operation = 2;
+}
+
+message SpacedNormalizeWatchRootRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.NormalizeWatchRootRequest operation = 2;
+}
+
+message SpacedWatchRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.WatchRequest operation = 2;
+}
+
+message SpacedCreateWatcherRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.CreateWatcherRequest operation = 2;
+}
+
+message SpacedGetWatcherEventsRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.GetWatcherEventsRequest operation = 2;
+}
+
+message SpacedRemoveWatcherRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.RemoveWatcherRequest operation = 2;
+}
+
+message SpacedEnableFileChangesRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.EnableFileChangesRequest operation = 2;
+}
+
+message SpacedDisableFileChangesRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.DisableFileChangesRequest operation = 2;
+}
+
+message SpacedGetModifiedFilesRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.GetModifiedFilesRequest operation = 2;
+}
+
+message SpacedStartProcessRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.StartRequest operation = 2;
+}
+
+message SpacedConnectProcessRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.ConnectProcessRequest operation = 2;
+}
+
+message SpacedListProcessesRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.ListProcessesRequest operation = 2;
+}
+message SpacedListProcessesResponse {
+  repeated space.spaced.operations.v1.ProcessInfo processes = 1;
+}
+
+message SpacedSendSignalRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.SendSignalRequest operation = 2;
+}
+
+message SpacedSendInputRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.SendInputRequest operation = 2;
+}
+
+message SpacedCloseStdinRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.CloseStdinRequest operation = 2;
+}
+
+message SpacedResizePtyRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.ResizePtyRequest operation = 2;
+}
+
+message SpacedKillProcessRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.KillRequest operation = 2;
+}
+
+message SetAutoLifecyclePolicyRequest {
+  string sandbox_id = 1;
+  AutoLifecyclePolicy policy = 2;
+  space.net.policy.v1.PolicyAuthority authority = 3;
+}
+
+message SetAutoLifecyclePolicyResponse {
+  AutoLifecyclePolicy effective_policy = 1;
+  space.net.policy.v1.PolicyAuthority authority = 2;
+}
+
+message TouchAutoLifecycleRequest {
+  string sandbox_id = 1;
+  AutoLifecycleActivitySource source = 2;
+  google.protobuf.Timestamp observed_at = 3;
+  // Runtime-only access extension or explicit reset; ordinary touches omit it.
+  AccessIdleUpdate access_idle_update = 4;
+}
+
+message AccessIdleUpdate {
+  int64 execution_generation = 1;
+  google.protobuf.Timestamp expires_at = 2;
+  oneof operation {
+    google.protobuf.Timestamp extend_until = 3;
+    AutoLifecyclePolicy reset_policy = 4;
+  }
+}
+
+message TouchAutoLifecycleResponse {
+  AutoLifecycleTouchResult result = 3;
+}
+
+message GetNetworkPolicyRequest { repeated string sandbox_ids = 1; }
+
+message GetNetworkPolicyResponse {
+  repeated NetworkPolicyDetail policies = 1;
+}
+
+message SetNetworkPolicyRequest {
+  string sandbox_id = 1;
+  optional space.net.policy.v1.NetworkPolicyV1 policy = 2;
+  bool inherit_template = 3;
+  uint64 policy_generation = 4;
+  space.net.policy.v1.PolicyAuthority authority = 5;
+  // When true, block until the live net-gateway confirms the policy rather
+  // than enqueuing the background reconciler. Callers that need the policy
+  // enforced before the sandbox is woken should set this.
+  bool sync_to_gateway = 6;
+}
+
+message SetNetworkPolicyResponse {
+  space.net.policy.v1.NetworkPolicyV1 effective_policy = 1;
+  bool inherited = 2;
+  // Non-empty when inherited=true; names the template that supplied the policy.
+  string source_template = 3;
+  uint64 effective_generation = 4;
+  uint64 applied_generation = 5;
+  space.net.policy.v1.NetworkPolicySource applied_source = 6;
+  space.net.policy.v1.NetworkPolicyApplyDecision apply_decision = 7;
+  space.net.policy.v1.PolicyAuthority authority = 8;
+  // True when sync_to_gateway was requested and the live net-gateway confirmed
+  // the effective policy before this response. Only pre-0.8 API servers read
+  // it; current callers rely on the call failing when sync does not complete.
+  bool applied_synchronously = 9 [deprecated = true];
+}
+
+message TemplateNetworkPolicyUpdatedRequest {
+  string template = 1;
+  space.net.policy.v1.NetworkPolicyV1 policy = 2;
+  uint64 generation = 3;
+  space.net.policy.v1.PolicyAuthority authority = 4;
+}
+
+message TemplateNetworkPolicyUpdatedResponse {
+  uint32 matched_sandboxes = 1;
+  uint32 notified_gateways = 2;
+  space.net.policy.v1.NetworkPolicyApplyDecision apply_decision = 3;
+}
+
+message CycleNetGatewayRequest {
+  string sandbox_id = 1;
+}
+
+message CycleNetGatewayResponse {
+  // Pid of the gateway process that was killed.
+  uint32 old_pid = 1;
+  // Pid of the relaunched gateway process.
+  uint32 new_pid = 2;
+  // Build sha the old gateway last reported via stats probes, empty when it
+  // never reported one (pre-reporting binary or no successful probe).
+  string old_build_git_sha = 3;
+}
+
+message AdoptPoolSandboxRequest {
+  string template = 1;
+  string owner = 2;
+  map<string, string> env = 3;
+  optional AutoLifecyclePolicy auto_lifecycle = 4;
+  optional space.net.policy.v1.NetworkPolicyV1 network_policy = 5;
+  uint64 network_policy_generation = 6;
+  space.net.policy.v1.PolicyAuthority network_policy_authority = 7;
+  optional string content_hash = 8;
+  optional space.net.policy.v1.NetworkPolicyV1 template_network_policy = 9;
+  uint64 template_network_policy_generation = 10;
+  space.net.policy.v1.PolicyAuthority template_network_policy_authority = 11;
+  space.net.policy.v1.PolicyAuthority auto_lifecycle_authority = 12;
+  // Identity assigned to the claimed sandbox; idle pool donors have none.
+  optional space.net.gateway.v1.SpaceApiRouteIdentity route_identity = 14;
+}
+message AdoptPoolSandboxResponse {
+  string sandbox_id = 1;
+  // Authoritative identity installed while claiming the donor.
+  optional space.net.gateway.v1.SpaceApiRouteIdentity route_identity = 2;
+}
+
+message WaitRequest {
+  string sandbox_id = 1;
+  optional uint32 timeout_secs = 2;
+}
+message WaitResponse {
+  string sandbox_id = 1;
+  optional SandboxLifecycleState lifecycle = 3;
+}
+
+message CloneFromDonorRequest {
+  string donor_sandbox_id = 1;  // paused sandbox to clone from
+  string template = 2;          // template name
+  string owner = 3;             // owner for the new sandbox
+  optional string pool_template = 4; // pool membership marker
+}
+
+message CloneFromDonorResponse {
+  string sandbox_id = 1;        // new cloned sandbox ID
+}
+
+// ── Snapshot transfer messages ─────────────────────────────────────────────
+
+message ExportSnapshotRequest {
+  string sandbox_id = 1;
+  string snapshot_name = 2;       // required snapshot name
+  bool include_rootfs = 3;        // include rootfs (large) or just memory + vmstate
+  bool use_delta = 4;             // if include_rootfs, compute page-level diff against template
+}
+
+message ExportSnapshotChunk {
+  oneof payload {
+    ExportSnapshotHeader header = 1;
+    ExportSnapshotFileChunk chunk = 2;
+  }
+}
+
+message ExportSnapshotHeader {
+  string sandbox_id = 1;
+  string template_id = 2;        // which template this sandbox was created from
+  string content_hash = 3;
+  bytes snapshot_metadata = 4;    // cgroup config, network config, vcpu/mem, arch
+  SnapshotType snapshot_type = 5; // disk or full — so importer knows the artifact shape
+}
+
+// Separate from template FileChunk to avoid cross-package dependency.
+message ExportSnapshotFileChunk {
+  string file_name = 1;
+  bytes data = 2;
+  uint64 offset = 3;
+  bool eof = 4;
+}
+
+message ImportSnapshotRequest {
+  oneof payload {
+    ImportSnapshotHeader header = 1;
+    ImportSnapshotFileChunk chunk = 2;
+  }
+}
+
+message ImportSnapshotHeader {
+  string sandbox_id = 1;
+  string template_id = 2;
+  string content_hash = 3;
+  bytes snapshot_metadata = 4;
+  SnapshotType snapshot_type = 5;  // disk or full — determines directory naming and classification
+  optional string target_name = 6; // use this name instead of generating f-imported-{ts}-{id}
+}
+
+message ImportSnapshotFileChunk {
+  string file_name = 1;
+  bytes data = 2;
+  uint64 offset = 3;
+  bool eof = 4;
+}
+
+message ImportSnapshotResponse {
+  string sandbox_id = 1;
+  string content_hash = 2;
+  string local_path = 3;       // where the snapshot was written on this node
+  uint64 size_bytes = 4;       // total bytes written
+}
+
+// ── Sandbox rootfs transfer messages ──────────────────────────────────────
+
+message ExportSandboxRequest {
+  string sandbox_id = 1;
+  bool use_delta = 2;            // true = compute and stream page-level diff against template rootfs
+}
+
+message ExportSandboxChunk {
+  oneof payload {
+    ExportSandboxHeader header = 1;
+    ExportSandboxFileChunk chunk = 2;
+  }
+}
+
+message ExportSandboxHeader {
+  string sandbox_id = 1;
+  string template_id = 2;
+  string content_hash = 3;
+  uint64 total_size_bytes = 4;
+  string runtime = 5;           // "fc", "gvisor", etc.
+  string owner = 6;             // sandbox owner
+  bool snapshots_enabled = 7;   // whether rolling snapshots were enabled on the source
+  string created_at = 8;        // original creation timestamp (preserved across migrations)
+  optional uint64 guest_uptime_secs = 9; // cumulative guest uptime
+  bool is_delta = 10;           // true = rootfs.ext4 is a SPACE file delta against template, not full file
+  map<string, string> env = 11; // sandbox env projected into SPACE-controlled entrypoints
+  optional AutoLifecyclePolicy auto_lifecycle = 12;
+  optional uint32 rootfs_size_mb = 13; // explicit sandbox rootfs size override, if any
+  optional space.net.policy.v1.NetworkPolicyV1 network_policy = 14;
+  uint64 network_policy_generation = 15;
+  space.net.policy.v1.PolicyAuthority network_policy_authority = 16;
+  space.net.policy.v1.PolicyAuthority auto_lifecycle_authority = 17;
+  optional space.execution.v1.ExecutionMetadata execution = 18;
+  // BYOK: source sandbox runs on dm-crypt encrypted volumes. Export of
+  // encrypted sandboxes is rejected (the stream carries a plaintext rootfs),
+  // so this is false today; carried for wire-shape completeness so import
+  // preserves the immutable flag if a future exporter supports it.
+  bool volume_encryption = 19;
+  optional uint64 disk_io_max_operations_per_sec = 21;
+  optional uint64 disk_io_max_bandwidth_mib_per_sec = 22;
+}
+
+message ExportSandboxFileChunk {
+  string file_name = 1;
+  bytes data = 2;
+  uint64 offset = 3;
+  bool eof = 4;
+}
+
+message ImportSandboxRequest {
+  oneof payload {
+    ImportSandboxHeader header = 1;
+    ImportSandboxFileChunk chunk = 2;
+  }
+}
+
+message ImportSandboxHeader {
+  string sandbox_id = 1;
+  string template_id = 2;
+  string content_hash = 3;
+  string runtime = 4;
+  string owner = 5;
+  bool snapshots_enabled = 6;
+  string created_at = 7;        // original creation timestamp
+  optional uint64 guest_uptime_secs = 8; // cumulative guest uptime
+  bool is_delta = 9;            // true = rootfs is a SPACE file delta, apply against template
+  map<string, string> env = 10; // sandbox env projected into SPACE-controlled entrypoints
+  optional AutoLifecyclePolicy auto_lifecycle = 11;
+  optional uint32 rootfs_size_mb = 12; // explicit sandbox rootfs size override, if any
+  optional space.net.policy.v1.NetworkPolicyV1 network_policy = 13;
+  uint64 network_policy_generation = 14;
+  space.net.policy.v1.PolicyAuthority network_policy_authority = 15;
+  space.net.policy.v1.PolicyAuthority auto_lifecycle_authority = 16;
+  optional space.execution.v1.ExecutionMetadata execution = 17;
+  // BYOK: the sandbox's immutable encrypted-volumes flag, preserved across
+  // the transfer.
+  bool volume_encryption = 18;
+  optional uint64 disk_io_max_operations_per_sec = 20;
+  optional uint64 disk_io_max_bandwidth_mib_per_sec = 21;
+}
+
+message ImportSandboxFileChunk {
+  string file_name = 1;
+  bytes data = 2;
+  uint64 offset = 3;
+  bool eof = 4;
+}
+
+message ImportSandboxResponse {
+  string sandbox_id = 1;
+  optional AutoLifecyclePolicy auto_lifecycle = 2;
+  optional AutoLifecycleStatus auto_lifecycle_status = 3;
+}
+
+// ── Loopback bridge management ───────────────────────────────────────────
+
+message SpacedOpenLoopbackBridgeRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.OpenLoopbackBridgeRequest operation = 2;
+}
+
+message SpacedCloseLoopbackBridgeRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.CloseLoopbackBridgeRequest operation = 2;
+}
+
+message ResolveSandboxMemoryRequest {
+  uint32 requested_memory_mib = 1; // Requested guest RAM in MiB
+}
+
+message ResolveSandboxMemoryResponse {
+  uint32 requested_memory_mib = 1; // Requested guest RAM in MiB
+  uint32 effective_memory_mib = 2; // Effective guest RAM in MiB after template/node caps
+  uint64 cgroup_memory_mib = 3;    // Host cgroup memory.max in MiB for this sandbox
+  uint32 guest_memory_max_mib = 4; // Current node guest RAM cap in MiB
+  uint64 cgroup_memory_max_mib = 5; // Current node cgroup memory.max cap in MiB
+  uint64 memory_headroom_mib = 6;  // MiB reserved between guest RAM and cgroup max
+}
+
+message NetworkPolicyDetail {
+  string sandbox_id = 1;
+  space.net.policy.v1.NetworkPolicyV1 effective_policy = 2;
+  bool inherited = 3;
+  // Non-empty when inherited=true; names the template that supplied the policy.
+  string source_template = 4;
+  uint64 effective_generation = 5;
+  uint64 applied_generation = 6;
+  space.net.policy.v1.NetworkPolicySource applied_source = 7;
+  space.net.policy.v1.PolicyAuthority authority = 8;
+}
+
+enum TeardownSuspendAction {
+  TEARDOWN_SUSPEND_ACTION_UNSPECIFIED = 0;
+  // Idempotently begin or rejoin the execution's planned suspend. A PENDING
+  // response does not prove that the operation was durably journaled, so a
+  // caller seeking release must retry BEGIN_OR_JOIN until a terminal outcome.
+  TEARDOWN_SUSPEND_ACTION_BEGIN_OR_JOIN = 1;
+  // Observe or reattach only to an operation that is already journaled. This
+  // action never starts a missing operation.
+  TEARDOWN_SUSPEND_ACTION_OBSERVE_ONLY = 2;
+}
+
+enum TeardownSuspendOutcome {
+  TEARDOWN_SUSPEND_OUTCOME_UNSPECIFIED = 0;
+  // Teardown is not yet safe. The caller must leave the task and sandbox intact.
+  TEARDOWN_SUSPEND_OUTCOME_PENDING = 1;
+  // This execution has a remotely ready suspend artifact.
+  TEARDOWN_SUSPEND_OUTCOME_DURABLE = 2;
+  // This execution no longer owns local runtime resources: a newer execution
+  // owns them, or generation-fenced activation rollback conclusively retired
+  // them. The task must detach without deleting the sandbox or its filesystem.
+  TEARDOWN_SUSPEND_OUTCOME_SUPERSEDED = 3;
+  // A generation-fenced local delete committed for this execution or a newer
+  // one. The task may detach without creating a suspend artifact.
+  TEARDOWN_SUSPEND_OUTCOME_DELETED = 4;
+}
+
+message PrepareTeardownSuspendRequest {
+  string sandbox_id = 1;
+  // Monotonic execution identity supplied by the execution owner. The node
+  // uses it only as a local lease; it does not query the control plane.
+  int64 execution_generation = 2;
+  TeardownSuspendAction action = 3;
+}
+
+message PrepareTeardownSuspendResponse {
+  TeardownSuspendOutcome outcome = 1;
+  optional string reason = 2;
+  // Present only with DURABLE. Identifies the exact artifact published for
+  // the requested execution generation.
+  optional PublishedArtifact published_artifact = 3;
+}
+message RestoreArtifactAsNewContext {
+  string source_sandbox_id = 1;
+  string artifact_snapshot_id = 2;
+  string target_owner = 3;
+  // The requested kind must match snapshot metadata. DISK is implemented now;
+  // FULL is part of the stable transport but fails as unimplemented.
+  ArtifactKind artifact_kind = 4;
+  // Effective immutable assignment for the target sandbox. Older shims omit
+  // these fields, in which case the restored snapshot's assignment is kept.
+  optional uint64 disk_io_max_operations_per_sec = 5;
+  optional uint64 disk_io_max_bandwidth_mib_per_sec = 6;
+}
+
+enum ReleaseExecutionIntent {
+  RELEASE_EXECUTION_INTENT_UNSPECIFIED = 0;
+  RELEASE_EXECUTION_INTENT_STOP = 1;
+  RELEASE_EXECUTION_INTENT_DELETE = 2;
+}
+
+enum ReleaseExecutionDisposition {
+  RELEASE_EXECUTION_DISPOSITION_UNSPECIFIED = 0;
+  // Sandbox-manager accepted teardown ownership. A tracked lifecycle intent
+  // was durably claimed for asynchronous completion, or rowless local cleanup
+  // completed synchronously before the response. The caller must detach its
+  // task and perform no further sandbox teardown.
+  RELEASE_EXECUTION_DISPOSITION_LIFECYCLE_MUTATION_ACCEPTED = 1;
+  // Sandbox-manager already owns lifecycle or a newer execution superseded
+  // the caller. The caller must detach its task and perform no further
+  // sandbox teardown.
+  RELEASE_EXECUTION_DISPOSITION_DETACH = 2;
+}
+
+message ReleaseExecutionRequest {
+  string sandbox_id = 1;
+  // Exact generation owned by the runtime task being released.
+  int64 execution_generation = 2;
+  ReleaseExecutionIntent intent = 3;
+}
+
+message ReleaseExecutionResponse {
+  ReleaseExecutionDisposition disposition = 1;
+}
+
+message AutoLifecycleDeleteReceipt {
+  string receipt_id = 1;
+  string sandbox_id = 2;
+  int64 execution_generation = 3;
+  string route_activation_id = 4;
+  string auto_lifecycle_policy_fingerprint = 5;
+}
+
+message ListAutoLifecycleDeleteReceiptsRequest {}
+
+message ListAutoLifecycleDeleteReceiptsResponse {
+  repeated AutoLifecycleDeleteReceipt receipts = 1;
+}
+
+message AcknowledgeAutoLifecycleDeleteReceiptsRequest {
+  repeated string receipt_ids = 1;
+}
+
+message AcknowledgeAutoLifecycleDeleteReceiptsResponse {
+  repeated string acknowledged_receipt_ids = 1;
+}
+
+// A sandbox's current lifecycle artifact with no `backup_completed_at`
+// stamp. `local_artifacts` lets stop-, suspend- and snapshot-origin
+// artifacts coexist for one sandbox; only the artifact the sandbox row
+// currently pins appears here, so there is at most one entry per sandbox.
+//
+// `node/api/v1/cluster.proto` carries this same message up to the control
+// plane inside `PendingLocalBackupReport`, so the node never re-encodes an
+// artifact identity between the two hops. Identity is the
+// `local_artifact_id` / `artifact_kind` pair that `snapshots` rows carry
+// (Postgres migration 079).
+message PendingLocalBackup {
+  string sandbox_id = 1;
+  string local_artifact_id = 2;
+  ArtifactKind artifact_kind = 3;
+}
+
+message ListPendingLocalBackupsRequest {}
+
+message ListPendingLocalBackupsResponse {
+  repeated PendingLocalBackup pending = 1;
+}
+
+// Node-local facts about the current legacy quarantine-recovery episode.
+// Consumers must not treat this observation as recovery authority.
+enum QuarantineRecoveryObservedOwner {
+  QUARANTINE_RECOVERY_OBSERVED_OWNER_UNSPECIFIED = 0;
+  QUARANTINE_RECOVERY_OBSERVED_OWNER_LEGACY_RECOVERY = 1;
+}
+
+message QuarantineRecoveryObservation {
+  // Positive versions preserve the meaning of existing fields and extend this
+  // message additively; consumers read the fields they know.
+  uint32 schema_version = 1;
+  string local_quarantine_id = 2;
+  QuarantineRecoveryObservedOwner observed_owner = 3;
+  uint32 attempt_count = 4;
+  optional google.protobuf.Timestamp next_attempt_at = 5;
+  // The worker could not decode this observation. Consumers preserve the last
+  // valid quarantine-recovery subdocument while accepting unrelated state.
+  bool degraded = 6;
+}

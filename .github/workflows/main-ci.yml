@@ -1,0 +1,232 @@
+name: Main CI
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  # Inventory only; kept outside required aggregate dependencies.
+  quarantine_backlog:
+    if: github.repository == 'perplexityai/SPACE'
+    uses: ./.github/workflows/quarantine-ci.yml
+    permissions:
+      contents: read
+
+  # The only job that writes the CI image. Pull requests, the merge queue, and
+  # the other main jobs read it; each builds it locally until this job has
+  # published a new tag. It is not required by space-ci: a failed publish
+  # leaves every check correct, only slower.
+  ci_image:
+    if: github.repository == 'perplexityai/SPACE'
+    name: Publish the CI image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Publish the CI image if its tag is new
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: bash ci/scripts/ci-image.sh publish
+
+  # The only job that writes the third-party image mirror,
+  # ghcr.io/perplexityai/space-ci-mirror. It copies each digest in
+  # ci/mirrored-images.txt that the mirror lacks. Jobs fall back to the source
+  # until it has, so space-ci does not require this job, and the next main push
+  # retries a failed copy.
+  mirror_images:
+    if: github.repository == 'perplexityai/SPACE'
+    name: Mirror third-party CI images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Copy every image the mirror lacks
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: bash ci/scripts/mirror-images.sh publish
+
+  rust_static:
+    if: github.repository == 'perplexityai/SPACE'
+    uses: ./.github/workflows/rust-static-ci.yml
+    permissions:
+      contents: read
+      packages: read
+
+  common:
+    if: github.repository == 'perplexityai/SPACE'
+    uses: ./.github/workflows/common-ci.yml
+    permissions:
+      contents: read
+      packages: read
+    with:
+      base_sha: ${{ github.event.before }}
+      # One push can land a whole merge-queue batch, so before..after can span
+      # several PRs; judge migration isolation per landed commit instead.
+      per_commit_migration_isolation: true
+      # Main is the one pipeline that pays for the full-scale runs. Pull
+      # requests and the merge queue keep the default and rely on the
+      # small-scale coverage of the same contracts.
+      main_only_tests: true
+
+  artifacts:
+    if: github.repository == 'perplexityai/SPACE'
+    uses: ./.github/workflows/artifact-ci.yml
+    # Reads the third-party image mirror, and the bundle build exchanges this
+    # job's OIDC token for the image push role.
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    with:
+      publish: true
+
+  guest_kernel:
+    if: github.repository == 'perplexityai/SPACE'
+    name: Build and QEMU-smoke guest kernel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Build and smoke-boot the guest kernel without publishing
+        run: |
+          set -euo pipefail
+          kernel_version=6.1.155
+          output_root="$(mktemp -d)"
+          trap 'rm -rf "${output_root}"' EXIT
+
+          OUTPUT_DIR="${output_root}" KERNEL_VERSION="${kernel_version}" \
+            templates/firecracker/kernel/build.sh
+          artifact_dir="${output_root}/vmlinux-${kernel_version}"
+          test -f "${artifact_dir}/vmlinux.bin"
+          test -f "${artifact_dir}/config"
+          (
+            cd "${artifact_dir}"
+            sha256sum --check --strict vmlinux.bin.sha256
+          )
+          templates/firecracker/kernel/smoke-boot.sh \
+            "${artifact_dir}/vmlinux.bin" "${kernel_version}"
+
+  kind_smoke:
+    if: github.repository == 'perplexityai/SPACE'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/kind-ci.yml
+
+  # Rust jobs on main save each compiler-cache refresh under a new key, and
+  # restores take only the newest snapshot of a job, or of a job's build inputs
+  # for Cargo target directories. Delete the older ones so they do not fill the
+  # repository's cache quota. Only this job holds actions:write. It is not
+  # required by space-ci: a failed deletion leaves every check correct, and the
+  # next main run retries it.
+  rust_cache_cleanup:
+    if: ${{ !cancelled() && github.repository == 'perplexityai/SPACE' }}
+    name: Delete superseded Rust compiler caches
+    needs:
+      - rust_static
+      - common
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Delete superseded Rust compiler caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 ci/scripts/sccache-snapshot.py prune --repository "${GITHUB_REPOSITORY}" --ref "${GITHUB_REF}"
+
+  space-ci:
+    if: always() && github.repository == 'perplexityai/SPACE'
+    name: space-ci
+    runs-on: ubuntu-24.04
+    needs:
+      - rust_static
+      - common
+      - artifacts
+      - guest_kernel
+      - kind_smoke
+    steps:
+      - name: Require every applicable main check
+        env:
+          RUST_STATIC_RESULT: ${{ needs.rust_static.result }}
+          COMMON_RESULT: ${{ needs.common.result }}
+          ARTIFACTS_RESULT: ${{ needs.artifacts.result }}
+          GUEST_KERNEL_RESULT: ${{ needs.guest_kernel.result }}
+          KIND_SMOKE_RESULT: ${{ needs.kind_smoke.result }}
+        run: |
+          set -euo pipefail
+          for result in \
+            "${RUST_STATIC_RESULT}" \
+            "${COMMON_RESULT}" \
+            "${ARTIFACTS_RESULT}" \
+            "${GUEST_KERNEL_RESULT}" \
+            "${KIND_SMOKE_RESULT}"; do
+            [[ "${result}" == success ]]
+          done
+
+  notify-main-ci-failure:
+    if: >-
+      ${{
+        always() &&
+        github.repository == 'perplexityai/SPACE' &&
+        needs['space-ci'].result == 'failure'
+      }}
+    name: Notify Slack on main CI failure
+    needs:
+      - space-ci
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    environment:
+      name: internal-slack
+      deployment: false
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Post failure to Slack
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_CI_WEBHOOK_URL }}
+          GH_TOKEN: ${{ github.token }}
+          API_URL: ${{ github.api_url }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_ID: ${{ github.run_id }}
+          COMMIT_SHA: ${{ github.sha }}
+          COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+          COMMIT_AUTHOR: ${{ github.event.head_commit.author.name || github.actor }}
+          COMMIT_DESCRIPTION: ${{ github.event.head_commit.message }}
+        run: bash ci/scripts/notify-main-ci-failure.sh

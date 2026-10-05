@@ -1,0 +1,458 @@
+syntax = "proto3";
+package space.volume.manager.v1;
+
+// VolumeManager runs on each worker node. Sandbox Manager calls the lifecycle
+// RPCs (Attach/Detach/List) during sandbox start/stop. spaced-host calls the
+// file-operation RPCs on behalf of guest processes.
+//
+// File-transfer RPCs are implemented by the volume-manager transfer worker.
+service VolumeManager {
+    // --- Lifecycle RPCs (called by Sandbox Manager) ---
+
+    // Register a volume attachment for a sandbox. Validates bucket access and
+    // stores the attachment in local SQLite.
+    rpc AttachVolume(AttachVolumeRequest) returns (AttachVolumeResponse);
+
+    // Remove a volume attachment and clean up cached state.
+    rpc DetachVolume(DetachVolumeRequest) returns (DetachVolumeResponse);
+
+    // List volumes attached to a sandbox.
+    rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse);
+
+    // --- File Operation RPCs (called by spaced-host) ---
+
+    // List directory contents. Maps to S3 ListObjectsV2.
+    rpc VolumeReadDir(VolumeReadDirRequest) returns (VolumeReadDirResponse);
+
+    // Get file/directory metadata. Maps to S3 HeadObject.
+    rpc VolumeStat(VolumeStatRequest) returns (VolumeStatResponse);
+
+    // Read file content. Maps to S3 GetObject with Range header.
+    rpc VolumeRead(VolumeReadRequest) returns (stream VolumeReadResponse);
+
+    // --- Transfer RPCs ---
+
+    // Upload a local file to the volume's S3 bucket.
+    rpc PushFile(PushFileRequest) returns (PushFileResponse);
+
+    // Download a file from the volume's S3 bucket to a local path.
+    rpc PullFile(PullFileRequest) returns (PullFileResponse);
+
+    // --- Async Transfer RPCs ---
+
+    // Submit an upload job. Returns immediately with a job_id; the transfer
+    // runs in the background with bounded concurrency.
+    rpc SubmitPushFile(PushFileRequest) returns (SubmitTransferResponse);
+
+    // Submit a download job. Returns immediately with a job_id.
+    rpc SubmitPullFile(PullFileRequest) returns (SubmitTransferResponse);
+
+    // Query the status of a previously submitted transfer job.
+    rpc GetTransferJob(GetTransferJobRequest) returns (GetTransferJobResponse);
+
+    // Wait until a previously submitted transfer job reaches a terminal state.
+    // The durable job continues independently if this request disconnects.
+    rpc WaitTransferJob(GetTransferJobRequest) returns (GetTransferJobResponse);
+
+    // List transfer jobs, optionally filtered by subject or status.
+    rpc ListTransferJobs(ListTransferJobsRequest) returns (ListTransferJobsResponse);
+
+    // Durably cancel one job or the currently-submitted jobs owned by a restore
+    // attempt. The caller must stop submitting work to a scope before
+    // cancelling it. The RPC waits for every selected job to become terminal,
+    // providing a writer barrier before it returns; it does not permanently
+    // close the scope against future submissions.
+    rpc CancelTransfer(CancelTransferRequest) returns (CancelTransferResponse);
+
+    // --- Artifact (batched async) transfer RPCs ---
+    //
+    // PushFilesAsync / PullFilesAsync are the multi-file artifact
+    // entry points: one RPC ensures a replica of a whole multi-file
+    // artifact. vol-mgr records the artifact — subject, entries, and
+    // (when encryption is set) the wrapped DEK — as ONE job keyed on the
+    // caller-minted `artifact_id` before any upload runs, then uploads
+    // the entries concurrently (each idempotent). It owns the DEK
+    // lifecycle: credmgr IssueDek once at submit time on the push side,
+    // wrap persisted in the job and returned; the caller records it in
+    // its own durable store (e.g. cluster-api's sidecar) and supplies it
+    // back on the pull side. The caller never sees the plaintext DEK.
+    //
+    // Because the wrap is persisted before any upload and recoverable by
+    // `artifact_id`, recovery never depends on the wrap coming back only
+    // in the RPC response. Per-entry AAD (sandbox + role) keeps entries
+    // non-interchangeable within an artifact; per-DEK isolation (one
+    // fresh `IssueDek` per artifact) keeps them non-interchangeable
+    // across artifacts in the same sandbox. These RPCs are
+    // transitional toward a general
+    // StorageArtifact/EnsureReplica surface; new transfer shapes should
+    // grow that model rather than another bespoke batch RPC.
+    //
+    // No `raw` flag on either RPC — artifacts always go through the
+    // standard compress + optional encrypt pipeline. Template-manager's
+    // raw-byte pulls keep using single-file `PullFile`.
+
+    // Ensure an artifact's replica exists at the destination. When
+    // `encryption` is set, vol-mgr issues one DEK via credmgr at submit
+    // time, persists it in the artifact job, and returns it. Returns the
+    // single job_id plus the wrap to persist for restore. Idempotent in
+    // `artifact_id`.
+    rpc PushFilesAsync(PushFilesAsyncRequest) returns (PushFilesAsyncResponse);
+
+    // Restore an artifact's entries to local paths. Caller supplies the
+    // same `artifact_id` and the wrap from the matching `PushFilesAsync`
+    // (via cluster-api's sidecar) so every entry decrypts under the same
+    // DEK and reproduces the per-entry AAD.
+    rpc PullFilesAsync(PullFilesAsyncRequest) returns (PullFilesAsyncResponse);
+}
+
+// Describes an S3-backed volume to attach to a sandbox.
+message VolumeSpec {
+    // Mount name visible in guest (e.g., "data"). Must be unique per sandbox.
+    string name = 1;
+    // S3 bucket name.
+    string s3_bucket = 2;
+    // Optional path prefix within the bucket (e.g., "org-1/datasets/").
+    string s3_prefix = 3;
+    // AWS region (e.g., "us-east-1").
+    string s3_region = 4;
+    // When true the guest may only read; writes are rejected.
+    bool read_only = 5;
+    // Optional credential key reference for BYOK encryption.
+    optional string byok_key_id = 6;
+}
+
+message AttachVolumeRequest {
+    string sandbox_id = 1;
+    string user_email = 2;
+    VolumeSpec volume = 3;
+}
+
+message AttachVolumeResponse {}
+
+message DetachVolumeRequest {
+    string sandbox_id = 1;
+    string volume_name = 2;
+}
+
+message DetachVolumeResponse {}
+
+message ListVolumesRequest {
+    string sandbox_id = 1;
+}
+
+message ListVolumesResponse {
+    repeated VolumeSpec volumes = 1;
+}
+
+message VolumeReadDirRequest {
+    string sandbox_id = 1;
+    string volume_name = 2;
+    // Relative path within the volume (e.g., "reports/").
+    string path = 3;
+}
+
+message VolumeReadDirEntry {
+    string name = 1;
+    uint64 size = 2;
+    string last_modified = 3;
+    bool is_directory = 4;
+}
+
+message VolumeReadDirResponse {
+    repeated VolumeReadDirEntry entries = 1;
+}
+
+message VolumeStatRequest {
+    string sandbox_id = 1;
+    string volume_name = 2;
+    string path = 3;
+}
+
+message VolumeStatResponse {
+    uint64 size = 1;
+    string last_modified = 2;
+    string content_type = 3;
+    bool is_directory = 4;
+}
+
+message VolumeReadRequest {
+    string sandbox_id = 1;
+    string volume_name = 2;
+    string path = 3;
+    uint64 offset = 4;
+    // 0 means read to end of file.
+    uint64 length = 5;
+}
+
+message VolumeReadResponse {
+    bytes data = 1;
+}
+
+// Upload a file from the worker node's local filesystem to S3.
+//
+// `subject_id` names the principal the transfer is performed on behalf of and
+// is used both for tracing/logging and for scoping the credmgr token exchange.
+// Wire form is `"<kind>:<id>"`, e.g. `"sandbox:<uuid>"` or `"template:<name>"`.
+message PushFileRequest {
+    // Principal on whose behalf the transfer runs ("sandbox:<uuid>" or
+    // "template:<name>"). Parsed at the volume-manager boundary.
+    string subject_id = 1;
+    // Absolute path on the worker node (source file).
+    string local_path = 2;
+    // S3 destination as an s3:// URI, e.g.
+    // "s3://my-bucket/artifacts/abc/file?region=us-east-1"
+    // Supported query params: region (required), endpoint, path_style.
+    string s3_uri = 3;
+}
+
+message PushFileResponse {
+    uint64 bytes_uploaded = 1;
+}
+
+// Semantic identity of a suspend-snapshot file. This is independent of local
+// filenames and encrypted-batch roles, which remain transport details.
+enum SnapshotArtifact {
+    // Absent for legacy callers and transfers that are not snapshot files.
+    SNAPSHOT_ARTIFACT_UNSPECIFIED = 0;
+    SNAPSHOT_ARTIFACT_ROOTFS = 1;
+    SNAPSHOT_ARTIFACT_ROOTFS_BTRFS_SEND = 2;
+    SNAPSHOT_ARTIFACT_MEMORY = 3;
+    SNAPSHOT_ARTIFACT_VM_STATE = 4;
+    SNAPSHOT_ARTIFACT_ENCRYPTED_SNAPSHOT_VOLUME = 5;
+    SNAPSHOT_ARTIFACT_ENCRYPTED_ROOTFS_COW = 6;
+    SNAPSHOT_ARTIFACT_METADATA = 7;
+}
+
+// Download a file from S3 to the worker node's local filesystem.
+//
+// `subject_id` follows the same form and purpose as in PushFileRequest.
+message PullFileRequest {
+    // Principal on whose behalf the transfer runs ("sandbox:<uuid>" or
+    // "template:<name>"). Parsed at the volume-manager boundary.
+    string subject_id = 1;
+    // S3 source as an s3:// URI (same format as PushFileRequest.s3_uri).
+    string s3_uri = 2;
+    // Absolute path on the worker node (destination file).
+    string local_path = 3;
+    // When true, write exactly the bytes S3 served — no transparent zstd
+    // decompression. Callers that already know an artifact is zstd and
+    // want to run their own (e.g. SHA-validating) decoder over the wire
+    // bytes set this. Default false preserves the symmetric-transfer
+    // contract where vol-mgr decompresses zstd objects in place so the
+    // caller gets back exactly what it uploaded plain.
+    bool raw = 4;
+    // Optional Unix file mode to apply after a successful pull. Omitted keeps
+    // the mode the filesystem assigns when volume-manager creates the file.
+    optional uint32 file_mode = 5;
+    // Controls when an already-present destination file can satisfy the pull.
+    // Omitted/default keeps the legacy path-exists shortcut. Restore/reconnect
+    // callers that need an idempotent "ensure this S3 object is materialized"
+    // operation should select VERIFIED_REPLICA.
+    ExistingFilePolicy existing_file_policy = 6;
+    // Higher values run before lower values when transfers compete for the
+    // same worker capacity. Zero is the default priority.
+    int32 priority = 7;
+    // Semantic snapshot identity. Older callers may leave this unspecified;
+    // volume-manager then falls back to recognizing canonical local names.
+    SnapshotArtifact snapshot_artifact = 8;
+    // UUID identifying the restore attempt that owns this destination.
+    optional string transfer_scope_id = 9;
+}
+
+enum ExistingFilePolicy {
+    // Preserve the historical PullFile behavior: if a local file exists and
+    // does not look like a half-decompressed artifact, one S3 HEAD is enough to
+    // skip the download.
+    EXISTING_FILE_POLICY_LEGACY_SKIP_PRESENT = 0;
+    // Only skip when volume-manager can verify its own recorded replica
+    // provenance against the current S3 object metadata and transfer contract.
+    EXISTING_FILE_POLICY_VERIFIED_REPLICA = 1;
+}
+
+message PullFileResponse {
+    uint64 bytes_downloaded = 1;
+}
+
+// Batch upload request. The files form ONE durable artifact: vol-mgr
+// records the whole set — subject, entries, and (when `encryption` is
+// set) the wrapped DEK — as a single job keyed on `artifact_id` before
+// any upload runs, then uploads the entries concurrently (each
+// idempotent). A retry with the same `artifact_id` recovers the same
+// job and the same wrap rather than minting a new DEK, so recovery
+// never depends on the wrap coming back only in this RPC's response.
+//
+// `subject_id` is the same `kind:id` form the single-file RPCs accept.
+// Encrypted batches require a sandbox subject: the artifact-level wrap
+// AAD is `(org, sandbox, artifact_id)` and each entry's per-chunk AEAD
+// AAD extends it with the entry's `role`, so files are not
+// cryptographically interchangeable.
+message PushFilesAsyncRequest {
+    string subject_id = 1;
+    // Per-file entries of the artifact.
+    repeated PushFileBatchEntry files = 2;
+    // Optional encryption config. When set, vol-mgr calls credmgr
+    // IssueDek once at submit time, persists the wrap in the artifact
+    // job, and returns it so the caller can record it in its own durable
+    // store (e.g. cluster-api's sidecar) for `PullFilesAsync`. Absent =
+    // plaintext (or zstd-only) batch.
+    optional BatchEncryptionConfig encryption = 3;
+    // Caller-minted stable identity of this artifact (UUID). Serves as
+    // the job dedup key so retries are idempotent and recover the same
+    // persisted wrap. Not bound into the wrap AAD — cross-artifact
+    // non-interchangeability comes from per-DEK isolation (one fresh
+    // `IssueDek` per artifact), so callers don't need to persist
+    // `artifact_id` alongside the wrap. Required.
+    string artifact_id = 4;
+}
+
+// One entry (file) of a `PushFilesAsync` artifact. Shape mirrors
+// `PushFileRequest` minus `subject_id` (batch-scoped) and plus a
+// `role`.
+message PushFileBatchEntry {
+    // Absolute path on the worker node (source file).
+    string local_path = 1;
+    // S3 destination URI for this file (`s3://bucket/key?region=…`).
+    // Caller composes the per-file URI from its own layout policy;
+    // vol-mgr stays free of "how objects are arranged in S3" knowledge.
+    string s3_uri = 2;
+    // Role/identity of this entry within the artifact (e.g. "memfile",
+    // "rootfs", "metadata.json"). Bound into the entry's per-chunk
+    // AEAD AAD so two entries sharing the artifact DEK are not
+    // cryptographically interchangeable. Required for encrypted
+    // batches; opaque to vol-mgr otherwise.
+    string role = 3;
+    // Semantic snapshot-artifact identity, independent of `role`. Older
+    // callers may leave this unspecified; new snapshot callers should set it
+    // so materialization policy never depends on the AEAD role.
+    SnapshotArtifact snapshot_artifact = 4;
+}
+
+// Identifying info for the KEK that wraps the per-batch DEK.
+// `wrapped_dek` is *not* a field on push (vol-mgr issues the DEK on
+// the way in); it appears on the pull-side `BatchDecryptionConfig`.
+message BatchEncryptionConfig {
+    string organization_id = 1;
+    string provider = 2;
+    string master_key_identifier = 3;
+}
+
+message PushFilesAsyncResponse {
+    // Id of the single artifact job covering every entry. Stable for a
+    // given `artifact_id` across retries.
+    string job_id = 1;
+    // Opaque wrapped DEK persisted in the artifact job, for the caller
+    // to record for the pull side. Absent if the request omitted
+    // `encryption`. On a retry of an already-submitted artifact this is
+    // the *same* wrap the original submission minted.
+    optional bytes wrapped_dek = 2;
+}
+
+// Symmetric pull. Caller supplies (for encrypted artifacts) the wrap
+// recorded from `PushFilesAsync` so every entry decrypts under the same
+// DEK. The per-entry AAD reproduces from `(org, sandbox) + role` —
+// nothing artifact-scoped needs to round-trip.
+message PullFilesAsyncRequest {
+    string subject_id = 1;
+    repeated PullFileBatchEntry files = 2;
+    optional BatchDecryptionConfig encryption = 3;
+    // Caller-minted stable identity of this artifact. Used here ONLY as
+    // the job dedup key so retries land on the existing job; not bound
+    // into the wrap AAD, so a caller that lost the original
+    // `artifact_id` can still decrypt under any fresh `artifact_id`
+    // with the matching wrap. Required.
+    string artifact_id = 4;
+}
+
+// One entry (file) of a `PullFilesAsync` artifact. No `raw` field —
+// batches always run through the standard transparent-decompress path;
+// raw-byte pulls keep using single-file `PullFile`.
+message PullFileBatchEntry {
+    string s3_uri = 1;
+    string local_path = 2;
+    optional uint32 file_mode = 3;
+    // Role of this entry within the artifact; must match the role used
+    // on the paired `PushFilesAsync` so the per-chunk AEAD AAD
+    // reproduces. Required for encrypted batches.
+    string role = 4;
+    // Semantic snapshot-artifact identity, independent of `role`. Older
+    // callers may leave this unspecified.
+    SnapshotArtifact snapshot_artifact = 5;
+}
+
+message BatchDecryptionConfig {
+    string organization_id = 1;
+    string provider = 2;
+    string master_key_identifier = 3;
+    bytes wrapped_dek = 4;
+}
+
+message PullFilesAsyncResponse {
+    // Id of the single artifact job covering every entry.
+    string job_id = 1;
+}
+
+// --- Async transfer messages ---
+
+message SubmitTransferResponse {
+    string job_id = 1;
+}
+
+enum TransferJobStatus {
+    TRANSFER_JOB_STATUS_UNSPECIFIED = 0;
+    TRANSFER_JOB_STATUS_PENDING     = 1;
+    TRANSFER_JOB_STATUS_RUNNING     = 2;
+    TRANSFER_JOB_STATUS_COMPLETED   = 3;
+    TRANSFER_JOB_STATUS_FAILED      = 4;
+    TRANSFER_JOB_STATUS_CANCELLING  = 5;
+    TRANSFER_JOB_STATUS_CANCELLED   = 6;
+}
+
+message TransferJob {
+    string            job_id            = 1;
+    TransferJobStatus status            = 2;
+    string            kind              = 3;  // "push" or "pull"
+    // Principal on whose behalf the transfer runs; see PushFileRequest.
+    string            subject_id        = 4;
+    string            local_path        = 5;
+    string            s3_uri            = 6;
+    uint64            bytes_transferred = 7;
+    optional string   error             = 8;
+    string            created_at        = 9;
+    optional string   started_at        = 10;
+    optional string   completed_at      = 11;
+    optional string   transfer_scope_id = 12;
+}
+
+message GetTransferJobRequest {
+    string job_id = 1;
+}
+
+message GetTransferJobResponse {
+    TransferJob job = 1;
+}
+
+message ListTransferJobsRequest {
+    // Filter by subject ("sandbox:<uuid>" or "template:<name>"); see
+    // PushFileRequest.subject_id.
+    optional string            subject_id    = 1;
+    optional TransferJobStatus status_filter = 2;
+    // Maximum number of jobs to return. 0 means server default (100).
+    uint32                     limit         = 3;
+}
+
+message ListTransferJobsResponse {
+    repeated TransferJob jobs = 1;
+}
+
+message CancelTransferRequest {
+    oneof selector {
+        // The job must be a pull or pull-artifact transfer.
+        string job_id = 1;
+        // Cancels active pulls owned by this restore-attempt scope.
+        string transfer_scope_id = 2;
+    }
+}
+
+message CancelTransferResponse {
+    repeated TransferJob jobs = 1;
+}

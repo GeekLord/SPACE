@@ -1,0 +1,11 @@
+syntax = "proto3";
+package space.spaced.bridge.host.v1;
+
+import "spaced/activity/v1/activity.proto";
+
+// Guest→host bridge hosted by spaced-host-svc.
+service Meta {
+  rpc SetActivityState(space.spaced.activity.v1.SetActivityStateRequest) returns (space.spaced.activity.v1.SetActivityStateResponse);
+  rpc RequestActiveFor(space.spaced.activity.v1.RequestActiveForRequest) returns (space.spaced.activity.v1.RequestActiveForResponse);
+  rpc RequestShutdown(space.spaced.activity.v1.RequestShutdownRequest) returns (space.spaced.activity.v1.RequestShutdownResponse);
+}

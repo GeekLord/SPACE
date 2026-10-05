@@ -1,0 +1,27 @@
+# Set by addons/postgresql.tf. The defaults here are only what a bare
+# `helm template` needs to render.
+
+# Changes whenever a file in this chart does, so the helm provider sees a diff.
+# Unused by the templates.
+chartChecksum: ""
+
+# Required; addons/variables.tf pins it.
+image: ""
+
+credentials:
+  user: space
+  database: space
+  # Required; passed with set_sensitive.
+  password: ""
+
+nodeSelector: {}
+
+storage:
+  size: 20Gi
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 1Gi

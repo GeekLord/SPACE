@@ -1,0 +1,20 @@
+# StorageClass parameters are immutable, so a change here fails the upgrade;
+# add a class under a new name instead.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ include "postgresql.storageClassName" . }}
+  labels:
+    {{- include "postgresql.labels" . | nindent 4 }}
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  # No kmsKeyId: the account's default EBS key, which is `aws/ebs` unless an
+  # admin changed it. The role boundary's KMS statement is scoped to reach
+  # that key through EC2; a customer-managed default key would also need a key
+  # policy that grants the driver's role, or every claim fails to provision.
+  encrypted: "true"
+# Created in the AZ of the node the pod is scheduled to, not an arbitrary one.
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Delete

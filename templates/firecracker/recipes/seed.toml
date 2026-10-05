@@ -1,0 +1,27 @@
+# Seed template recipe.
+#
+# Unlike higher-level templates such as code-runtime, seed starts from scratch:
+# it downloads a base Ubuntu minimal cloud squashfs, customizes it into a
+# Firecracker-friendly rootfs, and registers the resulting template locally.
+#
+# Usage:
+#   space-admin-cli template build seed
+
+[metadata]
+name = "seed"
+description = "Minimal Ubuntu Firecracker seed"
+from = "scratch"
+
+# The Falcon sensor's bpf backend needs the BPF/tracing support the stock
+# guest kernel compiles out, so the shared lineage carries the published
+# BPF kernel rather than a Falcon-specific seed. Every node that can run a
+# template from this lineage must already stage this exact kernel.
+[guest_kernel]
+version = "vmlinux-6.1.155-bpf-modsig"
+digest = "sha256:15ea4431a450eedbfcb4b4d3d85dd8e941b829a0606db6cd0e0167530421f933"
+
+[source]
+type = "ubuntu-minimal-cloud-squashfs"
+release = "resolute"
+version = "26.04"
+date = "release-20260908"

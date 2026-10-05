@@ -1,0 +1,30 @@
+# syntax=docker/dockerfile:1.7
+
+ARG SPACE_RUST_BUILD_IMAGE=space-rust-build-data-plane:local
+FROM ${SPACE_RUST_BUILD_IMAGE} AS rust-build
+
+FROM public.ecr.aws/docker/library/debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --system --gid 954 space-data-plane \
+    && useradd --system --uid 954 --gid 954 --create-home --home-dir /space space-data-plane
+
+WORKDIR /space
+
+LABEL org.opencontainers.image.title="space-data-plane"
+LABEL org.opencontainers.image.description="Deployable SPACE public data-plane stream gateway."
+
+COPY --from=rust-build /artifacts/bin/space-data-plane-svc /space/bin/space-data-plane-svc
+
+RUN chown -R space-data-plane:space-data-plane /space
+
+ARG SPACE_GIT_SHA=unknown
+LABEL org.opencontainers.image.revision="${SPACE_GIT_SHA}"
+RUN mkdir -p /etc/space && printf '%s\n' "${SPACE_GIT_SHA}" > /etc/space/build-git-sha
+
+USER space-data-plane
+
+EXPOSE 8090

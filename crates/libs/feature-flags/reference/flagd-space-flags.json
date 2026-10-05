@@ -1,0 +1,89 @@
+{
+  "$schema": "https://flagd.dev/schema/v0/flags.json",
+  "_comment": "Worked flagd definitions for every flag SPACE reads. Defaults here reproduce the behaviour of an unconfigured deployment, so serving this file unchanged changes nothing. See ../README.md for the subject shape and targeting attributes each flag expects. Guarded against drift by tests/flagd_reference.rs.",
+  "flags": {
+    "space-cluster-rate-limiter": {
+      "state": "ENABLED",
+      "defaultVariant": "on",
+      "variants": {
+        "on": true,
+        "off": false
+      },
+      "targeting": {}
+    },
+    "space-api-client-concurrency-limiter": {
+      "state": "ENABLED",
+      "defaultVariant": "on",
+      "variants": {
+        "on": true,
+        "off": false
+      },
+      "targeting": {}
+    },
+    "space-api-client-concurrency-quotas": {
+      "state": "ENABLED",
+      "defaultVariant": "env",
+      "_comment": "An empty object leaves every cap at its env/Helm value. Both fields are optional; an entry under `overrides` also allowlists that client id.",
+      "variants": {
+        "env": {},
+        "example": {
+          "unspecified": 8,
+          "overrides": {
+            "example-client": 32
+          }
+        }
+      },
+      "targeting": {}
+    },
+    "space-net-gateway-known-egress-domains": {
+      "state": "ENABLED",
+      "defaultVariant": "none",
+      "_comment": "The object form, not a bare array: OpenFeature resolves JSON as a structure, so no OpenFeature backend can return a top-level array. The inert default is {\"domains\": []} rather than the bare {} the other JSON flags use, because this flag's reader requires the key — an object without it is a malformed assignment and logs a warning on every gateway launch. flagd stringifies the nested array; the reader decodes it.",
+      "variants": {
+        "none": {
+          "domains": []
+        },
+        "example": {
+          "domains": ["egress-proxy.example.test"]
+        }
+      },
+      "targeting": {}
+    },
+    "space-cluster-api-client-side-balancing": {
+      "state": "ENABLED",
+      "defaultVariant": "off",
+      "variants": {
+        "on": true,
+        "off": false
+      },
+      "_comment": "Subjects arrive prefixed (`sandbox:`, `session:`, `org:`) and `cluster_id` is supplied as an attribute, so one definition can ramp a single cluster while leaving the rest on the Service client.",
+      "targeting": {
+        "if": [
+          {
+            "==": [{ "var": "cluster_id" }, "replace-me-or-delete-this-rule"]
+          },
+          {
+            "fractional": [
+              ["on", 0],
+              ["off", 100]
+            ]
+          },
+          null
+        ]
+      }
+    },
+    "space-snapshot-retention-config": {
+      "state": "ENABLED",
+      "defaultVariant": "env",
+      "_comment": "Evaluated with the cluster id as the subject, so each cluster can be retuned on its own. Absent fields keep their env values; the sweeper validates the whole assignment before applying either field, and rejects one out of range rather than clamping it.",
+      "variants": {
+        "env": {},
+        "example": {
+          "max_per_tick": 200,
+          "max_concurrent_deletes": 8
+        }
+      },
+      "targeting": {}
+    }
+  }
+}
