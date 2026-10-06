@@ -3859,6 +3859,7 @@ async fn finalize(
                 target_state: target as i32,
                 bytes_uploaded: bytes,
                 failure_reason: None,
+                artifact_digests: Vec::new(),
             },
             TEST_WORKER_IP,
         ))
@@ -3977,6 +3978,7 @@ async fn finalize_artifact_backup_from_node(
                 target_state: SuspendSnapshotTerminalState::Ready as i32,
                 bytes_uploaded: 42,
                 failure_reason: None,
+                artifact_digests: Vec::new(),
             },
             node_ip,
         ))
@@ -5212,6 +5214,7 @@ async fn finalize_failed_persists_failure_reason() -> TestResult {
                 target_state: SuspendSnapshotTerminalState::Failed as i32,
                 bytes_uploaded: 0,
                 failure_reason: Some(reason.to_string()),
+                artifact_digests: Vec::new(),
             },
             TEST_WORKER_IP,
         ))
@@ -5280,6 +5283,7 @@ async fn finalize_failed_blank_reason_is_treated_as_absent() -> TestResult {
                 target_state: SuspendSnapshotTerminalState::Failed as i32,
                 bytes_uploaded: 0,
                 failure_reason: Some("   \t  ".to_string()),
+                artifact_digests: Vec::new(),
             },
             TEST_WORKER_IP,
         ))
@@ -6412,5 +6416,209 @@ async fn ecw_route_resolve_enforces_key_surface_and_organization() -> TestResult
         .await
         .expect_err("a key from another organization must be rejected");
     assert_eq!(other_org.code(), Code::Unauthenticated);
+    Ok(())
+}
+
+fn test_artifact_digests() -> Vec<crate::proto::SnapshotArtifactDigest> {
+    vec![
+        crate::proto::SnapshotArtifactDigest {
+            artifact: "memfile".to_string(),
+            digest: format!("sha256:{}", "22".repeat(32)),
+            size_bytes: 1 << 30,
+        },
+        crate::proto::SnapshotArtifactDigest {
+            artifact: "binfile".to_string(),
+            digest: format!("sha256:{}", "11".repeat(32)),
+            size_bytes: 4096,
+        },
+    ]
+}
+
+async fn finalize_ready_with_digests(
+    service: &ClusterApiService,
+    backup_attempt_id: SnapshotId,
+    artifact_digests: Vec<crate::proto::SnapshotArtifactDigest>,
+) -> Result<(), tonic::Status> {
+    service
+        .finalize_artifact_backup(request_from_node(
+            FinalizeArtifactBackupRequest {
+                backup_attempt_id: backup_attempt_id.to_string(),
+                target_state: SuspendSnapshotTerminalState::Ready as i32,
+                bytes_uploaded: 4096 + (1 << 30),
+                failure_reason: None,
+                artifact_digests,
+            },
+            TEST_WORKER_IP,
+        ))
+        .await
+        .map(|_| ())
+}
+
+/// Digests the source node reports at finalize travel with the backup to
+/// both restore lookups, ordered by artifact file name.
+#[tokio::test(flavor = "current_thread")]
+async fn finalize_to_ready_publishes_artifact_digests_to_restore_lookups() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let sandbox_id = seed_sandbox(&fixture.service.pool).await?;
+    let local_artifact_id = LocalArtifactId::new();
+    let backup_attempt_id = SnapshotId::new();
+    begin_artifact_backup(
+        &fixture.service,
+        sandbox_id,
+        local_artifact_id,
+        backup_attempt_id,
+        pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+        pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
+    )
+    .await?;
+    finalize_ready_with_digests(&fixture.service, backup_attempt_id, test_artifact_digests())
+        .await?;
+
+    let mut expected = test_artifact_digests();
+    expected.sort_by(|a, b| a.artifact.cmp(&b.artifact));
+    let artifact = get_artifact_location(
+        &fixture.service,
+        sandbox_id,
+        local_artifact_id,
+        pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+    )
+    .await?;
+    assert_eq!(artifact.artifact_digests, expected);
+    let suspend = get_location(&fixture.service, sandbox_id).await?;
+    assert_eq!(suspend.snapshot_id, backup_attempt_id.to_string());
+    assert_eq!(suspend.artifact_digests, expected);
+    Ok(())
+}
+
+/// Malformed digests are refused at the wire boundary and leave the attempt
+/// open for a well-formed retry.
+#[tokio::test(flavor = "current_thread")]
+async fn finalize_rejects_malformed_artifact_digests() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let sandbox_id = seed_sandbox(&fixture.service.pool).await?;
+    let backup_attempt_id = SnapshotId::new();
+    begin_artifact_backup(
+        &fixture.service,
+        sandbox_id,
+        LocalArtifactId::new(),
+        backup_attempt_id,
+        pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+        pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
+    )
+    .await?;
+
+    let good = test_artifact_digests();
+    let mut unknown_artifact = good.clone();
+    unknown_artifact[0].artifact = "../memfile".to_string();
+    let mut malformed_digest = good.clone();
+    malformed_digest[0].digest = "sha256:not-hex".to_string();
+    let mut duplicate_artifact = good.clone();
+    duplicate_artifact[1].artifact = "memfile".to_string();
+    for artifact_digests in [unknown_artifact, malformed_digest, duplicate_artifact] {
+        let err =
+            finalize_ready_with_digests(&fixture.service, backup_attempt_id, artifact_digests)
+                .await
+                .expect_err("malformed digests must be refused");
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+    let state: String = sqlx::query_scalar("SELECT state FROM snapshots WHERE id = $1")
+        .bind(backup_attempt_id)
+        .fetch_one(&fixture.service.pool)
+        .await?;
+    assert_eq!(state, "creating");
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn restore_locations_keep_digests_during_catalog_deletion() -> TestResult {
+    let Some(fixture) = cluster_fixture_with_max_connections(4).await? else {
+        return Ok(());
+    };
+    let mut results = Vec::new();
+    for use_artifact_lookup in [false, true] {
+        let sandbox_id = seed_sandbox(&fixture.service.pool).await?;
+        let local_artifact_id = LocalArtifactId::new();
+        let attempt = SnapshotId::new();
+        begin_artifact_backup(
+            &fixture.service,
+            sandbox_id,
+            local_artifact_id,
+            attempt,
+            pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+            pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
+        )
+        .await?;
+        finalize_ready_with_digests(&fixture.service, attempt, test_artifact_digests()).await?;
+
+        // Stop the digest read after the location read, then perform real
+        // teardown. Object bytes outlive the catalog until the orphan sweep.
+        let mut deletion = fixture.service.pool.begin().await?;
+        sqlx::query(sql!(
+            "LOCK TABLE snapshot_artifact_digests IN ACCESS EXCLUSIVE MODE"
+        ))
+        .execute(&mut *deletion)
+        .await?;
+        let blocker: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
+            .fetch_one(&mut *deletion)
+            .await?;
+        let lookup = async {
+            if use_artifact_lookup {
+                get_artifact_location(
+                    &fixture.service,
+                    sandbox_id,
+                    local_artifact_id,
+                    pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+                )
+                .await
+                .map(|location| location.artifact_digests)
+            } else {
+                get_location(&fixture.service, sandbox_id)
+                    .await
+                    .map(|location| location.artifact_digests)
+            }
+        };
+        let remove = async {
+            loop {
+                let blocked: bool = sqlx::query_scalar(sql!(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM pg_stat_activity
+                         WHERE datname = current_database()
+                           AND $1 = ANY(pg_blocking_pids(pid)))"
+                ))
+                .bind(blocker)
+                .fetch_one(&fixture.service.pool)
+                .await?;
+                if blocked {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            pplx_space_sandbox_teardown::finalize_sandbox_db_delete_tx(&mut deletion, sandbox_id)
+                .await?;
+            deletion.commit().await
+        };
+        let (result, removed) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(lookup, remove)
+        })
+        .await?;
+        removed?;
+        results.push((use_artifact_lookup, result));
+    }
+
+    let mut expected = test_artifact_digests();
+    expected.sort_by(|a, b| a.artifact.cmp(&b.artifact));
+    for (use_artifact_lookup, result) in results {
+        match result {
+            Ok(digests) => assert_eq!(
+                digests, expected,
+                "a selected location must retain its digests (artifact lookup: {use_artifact_lookup})"
+            ),
+            Err(status) => assert_eq!(status.code(), Code::NotFound),
+        }
+    }
     Ok(())
 }
