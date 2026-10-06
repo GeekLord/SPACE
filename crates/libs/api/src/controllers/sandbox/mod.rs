@@ -1024,6 +1024,8 @@ pub enum AdmissionPoolPlan {
 #[derive(Clone)]
 pub struct SandboxController {
     falcon_us2_egress: Option<crate::falcon_egress::FalconUs2Egress>,
+    tls_interception_exemptions:
+        Option<crate::tls_interception_exemptions::TlsInterceptionExemptions>,
     federated_grant_audience: pplx_space_common_core::types::FederatedGrantAudience,
     substrate: Substrate,
     cluster_admission: Option<std::sync::Arc<crate::cluster_admission::ClusterSandboxAdmission>>,
@@ -1041,6 +1043,10 @@ pub type SpacedProcessEventStream = tonic::Streaming<SpacedProcessEvent>;
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxControllerInitError {
     #[error(transparent)]
+    TlsInterceptionExemptions(
+        #[from] crate::tls_interception_exemptions::TlsInterceptionExemptionsConfigError,
+    ),
+    #[error(transparent)]
     FalconEgress(#[from] crate::falcon_egress::FalconEgressConfigError),
     #[error(transparent)]
     Substrate(#[from] super::substrate::SubstrateError),
@@ -1049,6 +1055,14 @@ pub enum SandboxControllerInitError {
 }
 
 impl SandboxController {
+    pub fn with_tls_interception_exemptions(
+        mut self,
+        exemptions: Option<crate::tls_interception_exemptions::TlsInterceptionExemptions>,
+    ) -> Self {
+        self.tls_interception_exemptions = exemptions;
+        self
+    }
+
     pub(crate) fn with_falcon_us2_egress(
         mut self,
         egress: Option<crate::falcon_egress::FalconUs2Egress>,
@@ -1068,6 +1082,7 @@ impl SandboxController {
     pub fn new(substrate: Substrate) -> Self {
         Self {
             falcon_us2_egress: None,
+            tls_interception_exemptions: None,
             federated_grant_audience: crate::federated_identity::FederatedIdentityPolicy::default()
                 .grant_audience,
             substrate,
@@ -1082,6 +1097,7 @@ impl SandboxController {
     ) -> Self {
         Self {
             falcon_us2_egress: None,
+            tls_interception_exemptions: None,
             federated_grant_audience: crate::federated_identity::FederatedIdentityPolicy::default()
                 .grant_audience,
             substrate,
