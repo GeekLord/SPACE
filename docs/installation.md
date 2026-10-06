@@ -499,3 +499,65 @@ The shared-identity vulnerability remains until volume-manager stops running as
 UID 950. Retain legacy authorization during the supported rollback window,
 then remove the UID-950 volume-manager executable allowance and storage-actor
 mapping in a follow-up.
+
+### Retained-state migration commands
+
+The volume-manager executable provides two explicit deployment commands:
+
+- `--check-volume-credentials` checks the configured listener using invalid
+  requests under a 20-second timeout. Run it with the target service identity,
+  groups, and endpoint. It verifies privileged-method denial and transfer-key
+  method admission; real token exchange and key round trips remain separate
+  deployment gates.
+- `--prepare-volume-identity legacy|separate` is a Linux, root-only retained-state
+  handoff. It requires `openat2`, acquires the existing volume-manager service
+  lock, and preserves its inode and the database, journals, and staged upload
+  bytes. `--service-mutex-timeout-secs` bounds lock acquisition. Custom database,
+  socket, and staging paths and simultaneous probe mode are rejected.
+  `--expected-volume-identity legacy` additionally refuses a different retained
+  identity or an in-progress identity change while holding the lock.
+
+Neither command runs during normal service startup or changes the launcher's
+selected identity automatically.
+
+The helper records checked inodes and both identities in the root-only
+`/space/run/.volume-manager-identity` directory before changing ownership.
+An interrupted handoff can be retried with either identity. Preserve this
+record, the database and its journals, staging files, and `service.mutex`;
+never delete the lock or use recursive ownership repair. Unknown or unsafe
+entries are rejected before directory access changes. A path replaced during
+handoff fails closed and requires inspection of the retained original.
+
+The installation root may be one administrator-owned symlink with an absolute
+target. Its ancestor chain must be protected from service users and groups;
+additional symlinks and access ACLs are rejected. Private retained paths must
+not cross mounts. Both shared cache parents must be root-owned and protected
+against service renames: if group- or world-writable, they must already have the
+sticky bit. Existing unprotected cache namespaces require a provenance audit or
+node replacement; adding permissions now cannot authenticate retained files.
+Existing root-owned service locks without a recovery record
+require an administrator to verify their provenance and correct ownership
+without replacing their inode.
+
+Deployment preparation must install the compatible executable and ownership
+initializer while the selected identity remains `legacy`. Keep that same
+initializer and helper image in the rollback release; rolling back to recursive
+ownership changes can bypass journal and retained-state checks.
+
+For an identity transition, require all of the following:
+
+1. Verify the restricted listener and compatible sandbox-manager on each target
+   node, including replacement nodes, using real credential calls and file access.
+2. Stop new transfer admission and drain old queued pulls: their destination
+   directories may still be writable only by the legacy identity.
+3. Stop volume-manager before acquiring its preserved service lock. Use a
+   delete-first deployment; a new initializer waiting on a live predecessor can
+   deadlock with a rollout waiting for the new process to become ready.
+4. Change retained-state ownership, service identity, groups, and credential
+   endpoint together. Select the switch explicitly for the prepared pool and
+   validate one canary before widening it.
+5. Exercise retained transfers, encrypted and unencrypted restore, and fork.
+   Verify both services' umask and downloaded-file access.
+6. For rollback, stop the separate-identity process and use the same helper in
+   `legacy` mode under the same lock before starting the old identity. Preserve
+   compatible receiver services throughout the rollback window.
