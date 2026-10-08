@@ -233,6 +233,8 @@ pub struct CredentialManagerService {
     /// instances with database access (the control-plane deployment);
     /// node-local instances refuse those RPCs with FAILED_PRECONDITION.
     kek_store: Option<Arc<dyn KekStore>>,
+    /// Shared authority pool used for TCP caller node-registration checks.
+    pub(crate) database_pool: Option<sqlx::PgPool>,
     /// Sandbox-owner reads for volume encryption.
     /// Present only on instances with database access.
     credential_store: Option<Arc<dyn CredentialStore>>,
@@ -315,6 +317,7 @@ impl CredentialManagerService {
             storage_vend_role: None,
             key_wrapper,
             kek_store: None,
+            database_pool: None,
             credential_store: None,
             storage_vend_store: None,
             volume_wrap_store: None,
@@ -900,10 +903,8 @@ impl CredentialManager for CredentialManagerService {
 
     /// Certify a node's intermediate CA public key under the SPACE root.
     ///
-    /// Authorizes callers to hold a node CA key, at ServiceAccount granularity:
-    /// every node's credential manager presents the
-    /// same ServiceAccount, so this authorizes *a* node and not *which one*. A
-    /// stolen agent token mints intermediates fleet-wide until that narrows.
+    /// The TCP layer verifies the caller pod, node registration, and connection
+    /// peer before this handler's service-level authorization runs.
     async fn issue_intermediate_certificate(
         &self,
         request: Request<IssueIntermediateCertificateRequest>,
