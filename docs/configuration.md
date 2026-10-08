@@ -8,7 +8,10 @@ the service fail at startup when missing.
 Settings that exist only so tests can shorten a timer or flip a scenario are
 test hooks. They are read only by binaries built with the `test-hooks` Cargo
 feature (`pplx-space-common-core/test-hooks`), which the local kind image
-enables and release images never do. They are intentionally undocumented.
+enables and release images never do. They are intentionally undocumented, and
+`scripts/source_guards/env_test_hook_boundary.py` fails CI if code names a
+variable listed here in a test-hook read, directly or through a string constant
+from the same crate.
 
 Secrets are passed as files: set the `*_PATH` variable to a mounted file. The
 inline forms (`SPACE_ECW_CREDENTIAL_KEY`, `SPACE_ECW_CREDENTIAL_PREVIOUS_KEY`,
@@ -37,8 +40,8 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_SNAPSHOT_STORAGE_SWEEPER_ENABLED` | on | Does nothing without `SPACE_SNAPSHOT_BUCKET`. |
 | `SPACE_ORPHANED_SANDBOX_RECONCILER_ENABLED` | on | |
 | `SPACE_API_RECONCILER_DRY_RUN` | true | The orphaned-sandbox reconciler classifies and logs only until set to false. |
-| `SPACE_API_RECONCILER_MAX_CLASSIFICATIONS_PER_MINUTE` | built-in | |
-| `SPACE_API_RECONCILER_MAX_ACTIVE_QUARANTINES`, `SPACE_API_RECONCILER_MAX_NEW_QUARANTINES_PER_SWEEP`, `SPACE_API_RECONCILER_MAX_QUARANTINE_PERCENTAGE` | 50, 20, 25 | Safety ceilings; `0` stops new quarantines. |
+| `SPACE_API_RECONCILER_MAX_CLASSIFICATIONS_PER_MINUTE` | 60 | A larger value clamps to 300; `0` or a non-number keeps the default. |
+| `SPACE_API_RECONCILER_MAX_ACTIVE_QUARANTINES`, `SPACE_API_RECONCILER_MAX_NEW_QUARANTINES_PER_SWEEP`, `SPACE_API_RECONCILER_MAX_QUARANTINE_PERCENTAGE` | 50, 20, 25 | Safety ceilings; `0` stops new quarantines. A larger value clamps to 500, 200 and 75 respectively. |
 | `SPACE_GONE_NODE_QUEUE_GC_ENABLED` | on | |
 | `SPACE_GONE_NODE_QUEUE_GC_DRY_RUN` | true | |
 | `SPACE_TRANSIENT_LIFECYCLE_SWEEPER_ENABLED` | off | |
@@ -121,6 +124,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_API_CLIENT_CLASSES` | empty | JSON map; invalid JSON fails startup. |
 | `SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED` | on | Fails open (with a warning) when `SPACE_REDIS_URL` is unset. |
 | `SPACE_CLUSTER_ACTIVATION_ADMISSION_REFILL_RPS` | 60 | |
+| `SPACE_PUBLIC_OPERATION_DISPATCHER_EXECUTION_CONCURRENCY` | 16 | Operations the dispatcher runs at once. A larger value clamps to 128; `0` or a non-number keeps the default without a warning. Each execution holds its slot for the whole operation, and freed slots refill on the next 200 ms claim tick, at most 64 per tick. So throughput is roughly this divided by mean execution time, up to 320 operations a second. Executions draw on the cluster controller's `space_user` Postgres pool, which most other reconcilers share (`POSTGRES_POOL_MAX_CONNECTIONS`, default 25). Raising this adds contention for that pool, and an execution whose claim renewal or final status write can't get a connection within the pool's acquire timeout is abandoned and runs again once its claim goes stale, repeating any work it had already done. |
 | `SPACE_NATIVE_CREATE_POOL_CLAIM_ENABLED` | off | Env master for claiming a ready warm-pool slot when `POST /v1/sandboxes` admits a create, under the `space-native-create-pool-claim` flag (falls back off). Every `space-cluster-controller` replica must understand claim-carrying create payloads before this is turned on. |
 | `SPACE_REDIS_URL` | unset | |
 | `SPACE_SHARED_VALKEY_URL` | unset | Unset disables the consumer. |
