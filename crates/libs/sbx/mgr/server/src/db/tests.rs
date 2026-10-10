@@ -8069,6 +8069,25 @@ fn acquiring_a_claim_refuses_every_changed_precondition() {
 // a reason.
 // ---------------------------------------------------------------------------
 
+/// The `db` module's source as one text, for the source-shape guards below:
+/// `db.rs` and every module it glob re-exports.
+const DB_MODULE_SOURCE: &str = concat!(
+    include_str!("../db.rs"),
+    include_str!("auto_lifecycle.rs"),
+    include_str!("cleanup_episodes.rs"),
+    include_str!("eviction.rs"),
+    include_str!("local_artifacts.rs"),
+    include_str!("network_policy.rs"),
+    include_str!("pool.rs"),
+    include_str!("quarantine.rs"),
+    include_str!("quarantine_recovery.rs"),
+    include_str!("restore_transfer_scopes.rs"),
+    include_str!("sandboxes.rs"),
+    include_str!("startup_recovery.rs"),
+    include_str!("state_transitions.rs"),
+    include_str!("teardown_suspend.rs")
+);
+
 /// Does this line begin a statement that writes `sandbox_quarantine_state`?
 ///
 /// Shared deliberately. The sibling test used to re-implement this expression
@@ -8305,7 +8324,7 @@ fn every_recovery_table_writer_is_fenced_or_explicitly_exempt() {
         ),
     ];
 
-    let source = include_str!("../db.rs");
+    let source = DB_MODULE_SOURCE;
     let mut current_fn: Option<&str> = None;
     // Statements are attributed to their enclosing function, and a function is
     // considered fenced if it constructs an ExactClaimFence anywhere in its body.
@@ -8591,7 +8610,7 @@ fn a_cleanup_owner_arriving_after_the_claim_is_still_recorded() {
 /// which table they write, so a fenced statement against any table is covered.
 #[test]
 fn every_fence_construction_site_is_in_the_statement_inventory() {
-    let source = include_str!("../db.rs");
+    let source = DB_MODULE_SOURCE;
     let mut enclosing = None;
     let mut sites: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for line in source.lines() {
@@ -8810,7 +8829,7 @@ fn every_clause_of_the_acquire_cas_blocks_a_claim_on_its_own() {
 /// together without either matrix having to know about the other.
 #[test]
 fn the_acquire_cas_pins_every_column_the_fence_pins() {
-    let source = include_str!("../db.rs");
+    let source = DB_MODULE_SOURCE;
 
     // The fence's identity columns, read off the predicate builder.
     let predicate = {
@@ -8928,7 +8947,7 @@ fn the_contention_release_records_the_reason_it_was_given() {
 /// (`every_fence_construction_site_is_in_the_statement_inventory`).
 #[test]
 fn no_two_fenced_writers_share_a_column_set_under_different_guards() {
-    let source = include_str!("../db.rs");
+    let source = DB_MODULE_SOURCE;
 
     /// The table written, the columns assigned, and the three relaxations, read out of
     /// one function's body.
