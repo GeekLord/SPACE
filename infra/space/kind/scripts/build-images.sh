@@ -76,29 +76,22 @@ build_space_data_plane() {
   build_rust_runtime space-data-plane docker/Dockerfile.data-plane
 }
 
+# Kind-only: the intermediate-key broker fixture the credential-manager
+# authority uses as its external key provider (charts/space-kind-key-broker).
+build_space_kind_key_broker() {
+  build_rust_runtime space-kind-key-broker docker/Dockerfile.kind-key-broker
+}
+
 build_space_cluster_controller() {
   build_rust_runtime space-cluster-controller docker/Dockerfile.cluster-controller
 }
 
-# node-stack = the production worker image (docker/Dockerfile.worker — same
-# binaries, cargo features, identities, nftables policies as the prod EKS
-# worker DaemonSets) plus the kind entrypoint layer. LTO stays off locally.
-build_space_node_stack() {
-  build_rust_artifacts
-
-  log "building production worker image: space-worker:local"
-  docker build --provenance=false --sbom=false -t space-worker:local \
-    -f docker/Dockerfile.worker \
-    --build-arg "SPACE_RUST_BUILD_IMAGE=${RUST_ARTIFACT_IMAGE}" \
-    .
-
-  log "building runtime image: space-node-stack:local"
-  docker build --provenance=false --sbom=false -t space-node-stack:local \
-    -f docker/Dockerfile.node-stack \
-    --build-arg "SPACE_WORKER_IMAGE=space-worker:local" \
-    .
-
-  kind_load space-node-stack:local
+# The production worker image (docker/Dockerfile.worker — the binaries, cargo
+# features, identities, init scripts and nftables policies of the production
+# node DaemonSets), which every node-service chart, the operator shell and
+# space-internal-api run unchanged. LTO stays off locally.
+build_space_worker() {
+  build_rust_runtime space-worker docker/Dockerfile.worker
 }
 
 # seed-publish carries the locally built production seed (see build-seed.sh)
@@ -138,9 +131,10 @@ ALL_IMAGES=(
   space-api
   space-data-plane
   space-cluster-controller
-  space-node-stack
+  space-worker
   space-seed-publish
   space-ui
+  space-kind-key-broker
 )
 
 dispatch() {
@@ -148,8 +142,9 @@ dispatch() {
     space-api)                    build_space_api ;;
     space-data-plane)             build_space_data_plane ;;
     space-cluster-controller)     build_space_cluster_controller ;;
-    space-node-stack)             build_space_node_stack ;;
+    space-worker)                 build_space_worker ;;
     space-seed-publish)           build_space_seed_publish ;;
+    space-kind-key-broker)        build_space_kind_key_broker ;;
     space-ui)                     build_space_ui ;;
     *)
       printf 'unknown image: %s\nknown: %s\n' "$1" "${ALL_IMAGES[*]}" >&2

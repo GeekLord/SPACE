@@ -206,6 +206,14 @@ jobs:
           name: ${{ needs.rust_artifacts.outputs.artifact_name }}
           path: ${{ runner.temp }}/kind-rust
 
+      # The sandbox worker and builder nodes boot this image, which bakes in the
+      # node layer (btrfs /space/cache, cgroup subtree, loop devices). Main CI
+      # publishes each content-addressed tag; until then, or if the pull fails,
+      # this builds it from the mirrored base. The bring-up would do the same,
+      # but here its cost and source show up as a step of their own.
+      - name: Provide the SPACE Kind node image
+        run: bash infra/space/kind/scripts/kind-node-image.sh ensure
+
       - name: Load and verify the shared Rust artifact image
         run: |
           set -euo pipefail
@@ -289,22 +297,24 @@ jobs:
           k 30s get pods -A -o wide || true
           timeout 30s tilt get uiresources -o yaml || true
           timeout 30s tilt logs --tail=200 || true
-          # Startup can fail before the supervisor forwards service logs.
-          # Keep the earlier attempt visible when a replacement pod retried.
-          for pod in $(k 30s -n space get pods -l space.pplx.net/chart=space-node-stack -o name); do
-            k 30s -n space logs "$pod" -c node-stack --previous --tail=100 || true
-            k 30s -n space exec "$pod" -c node-stack -- \
-              bash -c 'for log in /space/logs/previous-*/*.log; do
-                if [[ -f "$log" ]]; then tail -n 100 -v "$log"; fi
-              done' || true
+          # One DaemonSet per node service: keep each pod's earlier attempt
+          # visible when its container restarted, init containers included.
+          for pod in $(k 30s -n space get pods -l app.kubernetes.io/part-of=space-node -o name); do
+            echo "::group::${pod}"
+            k 30s -n space logs "$pod" --all-containers --previous --prefix --tail=100 || true
+            k 30s -n space logs "$pod" --all-containers --prefix --tail=100 || true
+            echo "::endgroup::"
           done
 
       # A sandbox pod stuck Terminating is held on its node: the kubelet's
       # StopPodSandbox runs through containerd into the SPACE shim, which waits
       # for node-local sbx-manager. Only the node journals (the shim logs to
-      # containerd's stderr) and the node-stack logs name the refused call, and
-      # they vanish with the runner. The Kind nodes are fresh per job, so each
-      # journal covers exactly this run.
+      # containerd's stderr) and the node-service logs name the refused call,
+      # and they vanish with the runner. The Kind nodes are fresh per job, so
+      # each journal covers exactly this run. The node units' journals
+      # (runtime-supervisor, which runs every Firecracker VM, and the node
+      # layer) and each node's mount table, with propagation, show what the
+      # node itself held.
       - name: Collect Kind node teardown evidence
         if: failure()
         timeout-minutes: 8
@@ -315,14 +325,28 @@ jobs:
           # Preserve the first admission/recovery error, not only its final retry.
           k 45s -n space logs deployment/space-api --all-containers=true --timestamps \
             >"${dir}/space-api.log" 2>&1 || true
+          # The credential-manager authority every node agent forwards to.
+          k 45s -n space logs deployment/space-credmgr-authority --all-containers=true --timestamps \
+            >"${dir}/space-credmgr-authority.log" 2>&1 || true
+          # Its Kind key broker fixture.
+          k 45s -n space logs deployment/space-kind-key-broker --all-containers=true --timestamps \
+            >"${dir}/space-kind-key-broker.log" 2>&1 || true
           for node in $(timeout 30s kind get nodes --name space-local 2>/dev/null); do
             timeout 45s docker exec "${node}" journalctl -u kubelet -u containerd --no-pager -o short-iso \
               >"${dir}/${node}.journal.log" 2>&1 || true
             timeout 15s docker exec "${node}" crictl pods >"${dir}/${node}.crictl-pods.txt" 2>&1 || true
+            timeout 45s docker exec "${node}" journalctl -u 'space-*' --no-pager -o short-iso \
+              >"${dir}/${node}.space-units.journal.log" 2>&1 || true
+            timeout 15s docker exec "${node}" systemctl status 'space-*' --no-pager \
+              >"${dir}/${node}.space-units.status.txt" 2>&1 || true
+            timeout 15s docker exec "${node}" findmnt -o TARGET,FSTYPE,PROPAGATION \
+              >"${dir}/${node}.findmnt.txt" 2>&1 || true
           done
-          for pod in $(k 30s -n space get pods -l space.pplx.net/chart=space-node-stack -o name); do
-            k 45s -n space exec "${pod}" -c node-stack -- \
-              tar -C /space/logs -cf - . >"${dir}/${pod#pod/}.space-logs.tar" 2>/dev/null || true
+          for pod in $(k 30s -n space get pods -l app.kubernetes.io/part-of=space-node -o name); do
+            k 45s -n space logs "${pod}" --all-containers --previous --prefix --timestamps \
+              >"${dir}/${pod#pod/}.previous.log" 2>&1 || true
+            k 45s -n space logs "${pod}" --all-containers --prefix --timestamps \
+              >"${dir}/${pod#pod/}.log" 2>&1 || true
           done
           k 30s -n space get pods -l app.kubernetes.io/name=space-sandbox -o json \
             | jq -r '.items[] | select(.metadata.deletionTimestamp) | .metadata.name' \

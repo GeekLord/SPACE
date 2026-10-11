@@ -56,15 +56,10 @@ are compiled in only for these images, and release images never enable the
 feature. Follow build progress at `http://localhost:10350`.
 `tilt down && kind delete cluster --name space-local` tears it down.
 
-The single-worker DirectSubstrate bench is opt-in: create that cluster with
-`kind-cluster-3486.yaml` and set `SPACE_KIND_CLUSTER=space-local-3486
-SPACE_LOCAL_MINIMAL=1` before `tilt up`. Use it only for tests specifically
-targeting DirectSubstrate.
-
 If startup reports that the Tilt server on `:10350` could not be verified as
 `kind-space-local`, inspect `tilt get cluster default --port 10350 -o yaml`.
-A watcher for the old `space-local-3486` bench must be stopped in its owning
-session before starting the full stack. An initializing watcher can be retried
+A watcher for another cluster must be stopped in its owning session before
+starting this stack. An initializing watcher can be retried
 once its cluster context is available. Bootstrap leaves a responsive unverified
 watcher running rather than terminating it.
 
@@ -93,19 +88,19 @@ worker identities is denied. The seed-publish Job has its own operator-only
 ServiceAccount. Inventory reports and sandbox creation cannot publish templates,
 releases, or tags; this is unconditional and has no compatibility switch.
 
-Kind does not model the full publisher isolation boundary. The builder node-stack
-shares one ServiceAccount and a readable projected token among build-manager,
-node-api, template-manager, sandbox-manager, and node-ctl. All those services
-therefore carry operator and tenant publisher authority. Separately, the Kind
-node-api and build-manager listeners still accept the shared static token as
-trusted build authority: a worker can submit an operator build through that
-route even though ClusterApi rejects direct worker publication.
+Each node service runs under its own DaemonSet's ServiceAccount and projects its
+own ClusterApi token, and only build-manager's builder account
+(`space-builder-build-manager`) carries operator and tenant publisher authority
+(`clusterApiAuth` in the internal-api chart). The Kind node-api and build-manager
+listeners still accept the shared static token as trusted build authority: a
+worker can submit an operator build through that route even though ClusterApi
+rejects direct worker publication.
 
 The direct-registration tests prove ClusterApi's publisher checks, not end-to-end
-worker isolation. That requires a separate build-manager ServiceAccount and
-Kubernetes authentication on the builder listeners, with each system-build caller
-explicitly reviewed. Kind's shared identity and static build credentials are
-local development limitations and must not be used as a secure deployment model.
+worker isolation. That also requires Kubernetes authentication on the builder
+listeners, with each system-build caller explicitly reviewed. Kind's static build
+credentials are a local development limitation and must not be used as a secure
+deployment model.
 
 ## CI smoke partitions
 
@@ -207,14 +202,17 @@ in-cluster (see "Seed template" below).
 
 `bootstrap.sh` auto-invokes `install-fc-vendor.sh` if the vendor tree is
 missing (so step 2 is optional in practice), and is otherwise idempotent: it
-creates the kind cluster (if missing), labels nodes, advertises the
-`space.pplx.net/network-slots` extended resource, installs the local
-observability backends in the default `otel` mode, installs the containerd
-shim on the sandbox workers, applies the `space` Namespace + `RuntimeClass`,
+creates the kind cluster (if missing) with the SPACE Kind node image on the
+sandbox workers and builders (see [The node layer](#the-node-layer)), labels
+nodes, advertises the `space.pplx.net/network-slots` extended resource,
+installs the local observability backends in the default `otel` mode, installs
+the containerd shim on the sandbox workers, applies the `space` Namespace +
+`RuntimeClass`,
 builds every image and `kind load`s it (first run is the long step; the
 incremental build reuses its target dir and the Docker build is
-cargo-chef-cached after that), and applies every chart with
-`helm template | kubectl apply`.
+cargo-chef-cached after that), applies every chart with
+`helm template | kubectl apply`, and waits for every node-service DaemonSet
+to roll out and every SPACE node to be published and schedulable.
 
 ### Metrics (default local backend)
 
@@ -669,109 +667,335 @@ Tear it down with `bash infra/space/kind/scripts/teardown.sh`.
 kind cluster: space-local (kind-cluster.yaml.tmpl — 6 nodes)
 ├── control-plane                       (k8s API server, scheduler, etcd)
 ├── worker  [pool=sandbox, space-enabled=true]
+│   ├── space-*.service node layer      (btrfs /space/cache etc., baked into the node image)
+│   ├── space-runtime-supervisor.service (systemd; installed by node-manager's init
+│   │                                     container; runs every Firecracker VM and
+│   │                                     each sandbox's space-netgtw-svc)
 │   ├── containerd-shim-space-v2        (installed into containerd by install-shim.sh)
-│   ├── space-node-stack DaemonSet pod (hostNetwork, host_ip:9800, label component=node-api)
-│   │   ├── space-runtime-supervisor-svc                 (root)
-│   │   ├── space-nodemgr-svc            → Firecracker   (root)
-│   │   ├── space-rtmgr-svc              (read-only list) (space-rtmgr)
-│   │   ├── space-volmgr-svc             → object store  (space-sbxmgr)
-│   │   ├── space-credmgr-svc                            (space-sbxmgr)
-│   │   ├── space-tmplmgr-svc                            (space-tmplmgr)
-│   │   ├── space-sbxmgr-svc                             (space-sbxmgr)
-│   │   ├── space-nodectl-svc            → internal-api  (space-nodectl)
-│   │   └── space-node-api-svc  (worker role, :9800)     (space-nodeapi)
-│   └── per-sandbox pods (pause:3.10 hijacked into Firecracker microVMs;
-│       sbxmgr launches each sandbox's space-netgtw-svc through nodemgr)
+│   ├── one pod per node-service DaemonSet (release `space`):
+│   │   ├── space-node-manager        → host supervisor (root, privileged)
+│   │   ├── space-runtime-manager     (read-only list)  (space-rtmgr)
+│   │   ├── space-volume-manager      → object store    (space-sbxmgr)
+│   │   ├── space-credential-manager                    (space-sbxmgr)
+│   │   ├── space-template-manager                      (space-tmplmgr)
+│   │   ├── space-sandbox-manager                       (space-sbxmgr)
+│   │   ├── space-node-ctl            → internal-api    (space-nodectl)
+│   │   └── space-node-api            (hostNetwork, host_ip:9800, component=node-api) (space-nodeapi)
+│   ├── space-node-debug              (Kind-only operator shell, root)
+│   └── per-sandbox pods (pause:3.10 hijacked into Firecracker microVMs)
 ├── worker2 [pool=sandbox, space-enabled=true]
-│   └── identical to worker, second DaemonSet pod
+│   └── identical to worker
 ├── worker3 [pool=infra,    space.pplx.net/infra=true]
 │   ├── space-postgres        (StatefulSet)
 │   ├── space-object-store    (versitygw S3 gateway + bucket-init Job)
 │   ├── space-api             (Deployment; SPACE_K8S_CONTROL_PLANE=true)
 │   ├── space-internal-api    (Deployment; ClusterApi — node registration + template releases)
+│   ├── space-credmgr-authority (Deployment, 2 replicas; credential-manager authority — credential tables + platform KEK)
+│   ├── space-kind-key-broker (Deployment; Kind-only intermediate-key broker fixture behind the platform KEK)
 │   ├── space-data-plane      (Deployment)
 │   ├── space-cluster-controller (Deployment; materializes per-sandbox pods)
 │   ├── space-seed-publish    (Job; publishes the locally built seed)
 │   └── space-ui              (Deployment)
 ├── worker4 [pool=builder]
-│   └── space-builder-node-stack DaemonSet pod (hostNetwork, label space-builder)
-│       ├── runtime/node/volume/credential/template/sandbox managers
-│       ├── space-nodectl-svc            (builder role → internal-api)
-│       ├── space-buildmgr-svc            (recipe VM + publish → object-store templates bucket)
-│       └── space-node-api-svc            (builder role, :9800)
-│           └── Service space-builder-node-api:9800 (stable API dispatch target)
+│   ├── the same node layer and space-runtime-supervisor.service
+│   ├── the same node-service DaemonSets (release `space-builder`, node.role=builder)
+│   │   plus space-builder-build-manager (recipe VM + publish → templates bucket; root)
+│   ├── space-node-debug
+│   └── Service space-builder-node-api:9800 → the builders' node-api pods
 └── worker5 [pool=builder]
-    └── identical to worker4, second builder DaemonSet pod
+    └── identical to worker4
 ```
 
 Sandbox-scoped traffic (`CreateSandbox`, `Exec`, `SpacedWrite`, …) flows
 api-server → per-sandbox pod IP at `:9800`. Node-scoped traffic (`NodeInfo`,
-`ListNodeTemplates`, network ops) flows api-server → each DaemonSet pod's
+`ListNodeTemplates`, network ops) flows api-server → each node-api pod's
 `host_ip:9800`.
 
 ## How the node registers itself
 
-The node-stack chart passes `SPACE_NODE_ID` as the raw
-kube node name (fieldRef `spec.nodeName`) plus its worker or builder
-`SPACE_NODE_ROLE` and `SPACE_INTERNAL_API_ENDPOINT=http://space-internal-api:9800`.
-node-ctl's
+Every node-service chart passes `SPACE_NODE_ID` as the raw kube node name
+(fieldRef `spec.nodeName`) plus its worker or builder `SPACE_NODE_ROLE`;
+the services that call ClusterApi also get
+`SPACE_INTERNAL_API_ENDPOINT=http://space-internal-api:9800` and their own
+projected token. node-ctl's
 outbound reconcilers call `ClusterApi.PublishNodeState`, and the internal
 API derives the node UUID from `(node name, role)` via `space_k8s_node_id`
 and upserts `nodes` / `node_k8s` / `node_status_snapshots` /
 `node_template_inventory`. The cluster-controller's `kube_node_sync`
-reconciler covers kube-Node inventory. **Nothing writes Postgres from the
-node**; node status uses the normal 30-second freshness window.
+reconciler covers kube-Node inventory. **Nothing on the node touches
+Postgres**: credential state belongs to the control-plane credential-manager
+authority (below). Node status uses the normal 30-second freshness window. Both bring-up paths end by waiting until
+the admin node list (`GET /admin/api/v1/nodes`) reports every sandbox and
+builder node reachable, with scheduling status `ready`, and observed within the
+five node-ctl ticks the API trusts a census for
+(`scripts/wait-node-publication.sh`): ready pods alone are not a registered
+node. The wait does not require `stale: false`: node-ctl publishes every 60
+seconds, so an idle healthy node reads stale about half the time.
 
-(The `space-local-3486` DirectSubstrate bench is the one exception: that
-substrate schedules off `node_direct` rows and has no registration RPC, so
-the chart's `directSubstrate.enabled` opt-in re-enables the legacy SQL
-registration in the entrypoint. Never enabled on this stack.)
+## Node services
+
+Production runs one DaemonSet per node service on nodes whose image provides
+the node layer. So does this harness: each service has a chart under
+`charts/space-<service>-local`, built on the `space-node-service` library
+chart, rendered once per role — release `space` on the sandbox workers and
+release `space-builder` (`--set node.role=builder` plus the chart's
+`values-builder.yaml`) on the builders, which also run build-manager. The list
+lives in `lib/node-services.sh`, which `bootstrap.sh`, Tilt and the smoke
+bring-up read. Every pod runs the production worker image
+(`docker/Dockerfile.worker`) unchanged, with its service's production launch
+path, under the identity `infra/space/identity/node-identities.sh` assigns (the
+library reads that file through each chart's `identity/` link). Pods carry
+`app.kubernetes.io/name=space-<role>`, `app.kubernetes.io/component=<service>`
+(the names the cluster-controller's node-service readiness and the API's
+reflector use) and `app.kubernetes.io/part-of=space-node`.
+
+| Service | Identity | Pod shape | Why (public code) |
+|---|---|---|---|
+| node-manager | root | privileged, hostNetwork, hostPID; `/space/cache` and `/var/run/netns` Bidirectional; `/sys/fs/cgroup`, `/space/bin`, `/space/etc`, `/space/vendor`, `/dev/kvm`; projected token for the credential-manager authority | mounts jail rootfs and late snapshot-memory binds that must reach the host jailer, netns binds the host jailer and sidecar launcher open, loop and device-mapper devices, cgroup limits, root-namespace veth/nft/ip_forward, pidfds on host processes (`crates/libs/node/mgr/server`); init container `node-manager-init.sh` writes the node's systemd unit via `nsenter --target 1` |
+| runtime-supervisor | root | host systemd unit, no pod | `scripts/k8s/node-manager-init.sh`, `node-manager-runtime-supervisor.sh` |
+| runtime-manager | space-rtmgr + space-rtmgrclients | non-root, no capabilities, read-only rootfs; `/space/vendor`, `/space/bin`, `/space/cache` read-only | lists runtimes and kernels |
+| volume-manager | space-sbxmgr + SPACE_VOLUME_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/cache` HostToContainer | file transfers only (`crates/libs/vol/mgr/server`); keeps the legacy identity `docs/installation.md` describes |
+| credential-manager | space-sbxmgr + SPACE_CREDENTIAL_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/run` only; projected token for the authority | the node credential agent (`--role=agent`): sockets only, forwarding to `space-credmgr-authority`; no database, KEK or AWS credential; its peer-process check (`SPACE_UDS_PEER_PROCESS_CHECK`) is off, so no host PID namespace |
+| template-manager | space-tmplmgr + SPACE_TEMPLATE_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs, hostNetwork; `/space/cache` HostToContainer | btrfs work delegated to node-manager (`btrfs_via_nodemgr.rs`); host network because its template-release reads are scoped by source address (below) |
+| sandbox-manager | space-sbxmgr + SPACE_SANDBOX_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs, hostPID, hostNetwork; `/space/cache` HostToContainer, `/space/etc` read-only | gateway callers are authorized by their host pid, and Firecracker pids go to the node's shim (`service/gateway_identity.rs`, `network_runtime.rs`); host network for its node-bound ClusterApi RPCs |
+| node-ctl | space-nodectl + SPACE_NODECTL_GROUPS | non-root, no capabilities, read-only rootfs, hostNetwork; its own ServiceAccount with Node RBAC, fenced by `node-fence.yaml` | the Kubernetes node-local controller; host network for its node-bound ClusterApi RPCs |
+| node-api | space-nodeapi + worker/builder groups | non-root, no capabilities, read-only rootfs, hostNetwork, port `grpc` 9800 | the API dials `host_ip:9800` and reads the `grpc` port; on builders it reaches build-manager through the node-local `space-builder-build-manager` Service and sleeps 5 s in preStop (below) |
+| build-manager | root | privileged, hostPID, pod network behind the node-local `space-builder-build-manager` Service (`internalTrafficPolicy: Local`); `/var/run/netns` HostToContainer, `/space/cache` without propagation, the node's containerd | loop and bind mounts for OCI assembly, `nsenter --net` into build VMs through netns handles node-manager mounts after it starts, `ctr` against the node's containerd (`crates/libs/build/mgr/src`); host PID to watch the build VM's host Firecracker pid exit (`vm.rs`); no host network: SSH into build VMs runs inside `nsenter --net` |
+| space-node-debug (Kind only) | root | privileged; `/space/run`, `/space/cache` HostToContainer, `/space/bin`, `/space/vendor`, `/run/containerd` | the operator shell; see below |
+
+internal-api binds every node-bound ClusterApi RPC — `PublishNodeState`, the
+node desired-state and reconcile calls (node-ctl), quarantine recovery plans and
+artifact backups (sandbox-manager) — to the node's registered address, the
+Kubernetes Node's InternalIP that cluster-controller's node sync writes, and
+refuses a call from any other source address
+(`validate_origin_remote_addr` in `crates/libs/internal/api/server/src/lib.rs`).
+The check reads neither the credential nor the transport: it applies alike to
+the static token and to TokenReview-authenticated projected tokens, and internal
+RPC TLS, being server-auth only, does not change it. So node-ctl and
+sandbox-manager run in the node's network namespace. template-manager makes no
+node-bound call, but under TokenReview authentication its template-release reads
+are scoped to the node whose registered address is the caller's source address
+(`template_read_scope`, `crates/libs/internal/api/server/src/adapter.rs`), and
+nothing maps a pod IP to its node. From the pod network an org's private
+templates do not resolve: sandbox creates from them and private-base builds
+fail, which a pod-network trial confirmed, so template-manager runs on the host
+network too. build-manager's only source-scoped read checks for an existing
+upload, and an org-private base is resolved by template-manager, so it runs on
+the pod network; node-api reaches it through the node-local
+`space-builder-build-manager` Service, named as its TLS leaf.
+
+Services whose `/space/run` directory the node image does not bake (volume-manager,
+node-ctl, runtime-manager) create it in a `prepare-run-dir` init container with
+only CHOWN and FOWNER; build-manager, which does not migrate its SQLite database
+itself, applies its schema in a `migrate-sqlite` init container. Every other
+service migrates its own store after taking its service mutex.
+
+**Startup and probes.** Nothing orders the services. Each tolerates a peer that
+is not ready yet by failing its own startup or retrying, and the kubelet restarts
+that pod alone (sandbox-manager, for example, exits until node-manager answers;
+node-api retries sandbox-manager's capability check). Services with an
+instance-local health socket (`--health-socket=/run/health/<service>.sock` on a
+pod-private emptyDir) are probed on it: liveness answers once the socket is bound,
+readiness is SERVING while a successor waits passively for the service mutex and
+follows the production socket once active
+(`crates/libs/common/svc/src/local_health.rs`). runtime-manager is probed on its
+service socket and build-manager on its gRPC health service.
+
+**Rollouts and termination.** Services that hold a node-wide service mutex
+(`/space/run/<service>/service.mutex`) roll with `maxSurge: 1, maxUnavailable: 0`:
+the successor starts beside the predecessor, reports ready while passive, and
+takes over, sockets replaced by rename, when the predecessor drains and releases
+the lock. That covers node-manager, volume-manager, credential-manager,
+template-manager, sandbox-manager and node-ctl. runtime-manager, node-api and
+build-manager delete first. runtime-manager holds no mutex, so a successor would
+take its socket by rename at once, beside a predecessor its probes can no longer
+reach, and its kernel installer empties shared staging on open, which is only
+safe when nothing in staging is live. node-api's declared port is a host port the
+scheduler will not place twice on a node. build-manager has no mutex and recovers
+jobs before binding its listener. Termination grace follows each service's drain: 60 s for
+the 25 s drains the shared lifecycle defaults are sized against, 120 s for
+volume-manager's 100 s transfer drain plus 10 s server drain, 180 s for
+node-api's 150 s shutdown grace, and 7500 s for build-manager's 7200 s build
+drain. Each chart's values carry the comment and the citation. Builder node-api
+pods also sleep 5 s in preStop: on SIGTERM node-api closes its listener and
+answers new calls "draining" at once, while the API reaches builders through the
+`space-builder-node-api` Service and does not retry a draining build start, so
+the delay lets the pod leave the Service's endpoints first.
+
+**The runtime-supervisor.** node-manager's init container runs the production
+`node-manager-init.sh` unchanged: it stages the host binaries under
+`/space/bin/releases/<tag>`, switches the `/space/bin` links, stages the guest
+kernel, and installs, starts or schedules the restart of
+`space-runtime-supervisor.service` on the node through `nsenter --target 1` and
+systemctl. A changed supervisor binary or compatibility file touches
+`/space/run/runtime-supervisor/restart-required`; while the old node-manager runs,
+the restart is deferred, and the successor node-manager performs it once it
+holds its mutex (`SPACE_NODEMGR_ACTIVATE_RUNTIME_SUPERVISOR_ON_START=true`,
+`node-manager-runtime-supervisor.sh activate`). Production keys the release
+directory by its image tag; every Kind build is tagged `local`, so the chart
+passes the digest of the staged binaries and the compatibility file as
+`SPACE_IMAGE_TAG`. Firecracker jails therefore live in the node's mount
+namespace and outlive every service pod. Inspect it with
+`docker exec <node> systemctl status space-runtime-supervisor` and
+`docker exec <node> journalctl -u space-runtime-supervisor`.
+
+**The operator shell.** The smoke harness's on-node checks and fault injection —
+the node-local CLIs (`space-sbxmgr`, `space-tmplmgr`, `space-rtmgr`,
+`space-volmgr`), `btrfs`, `dmsetup`, `cryptsetup`, `ctr` and files under
+`/space/cache` — run in the Kind-only `space-node-debug` DaemonSet on each
+sandbox worker and builder, a root shell standing in for an operator's shell on
+the node host. Logs and environment are read from the pod of the service that
+owns them. This keeps every service container to the identity, tools and
+privileges its own code needs; the shell holds no ServiceAccount token and no
+`component` label, so neither the API nor node-service readiness ever sees it.
+
+Look at one service with
+`kubectl --context kind-space-local -n space logs ds/space-<service>` (builder:
+`ds/space-builder-<service>`), and at all of a node's pods with
+`kubectl --context kind-space-local -n space get pods -o wide -l app.kubernetes.io/part-of=space-node --field-selector spec.nodeName=<node>`.
+
+## Upgrading from the node-stack layout
+
+A cluster created before the per-service DaemonSets runs one `space-node-stack`
+pod per node, with runtime-supervisor and every Firecracker VM inside that pod.
+Those VMs cannot move to the node's supervisor, and the two layouts must not run
+on one node, so such a cluster is recreated once rather than upgraded.
+`bootstrap.sh`, the smoke suites' `scripts/tests/lib/bootstrap-kind-stack.sh`
+and the `Tiltfile` run `infra/space/kind/scripts/check-node-layout.sh` against
+an existing cluster before they apply anything; when it still has resources of
+the old `space-node-stack` chart, they list them and stop without changing
+anything (the scripts exit 1; Tilt reports a Tiltfile load error). Recreating
+deletes the cluster's sandboxes, snapshots and templates and keeps the
+containerd image caches:
+
+```bash
+bash infra/space/kind/scripts/teardown.sh
+bash infra/space/kind/scripts/bootstrap.sh   # then `tilt up`, for the Tilt loop
+```
+
+A cluster already on the per-service layout takes the move to internal RPC TLS
+in place: the next bring-up or Tilt reload issues the TLS Secrets and every
+listener and caller rolls onto TLS. While they roll, a plaintext caller and a TLS
+listener refuse each other, and the services' own restarts carry them until both
+sides have moved.
+
+Organizations enrolled for BYOK before the authority used the key broker keep
+an `in-memory` master-key row that no authority serves any more, so their
+encrypted sandboxes and fields stay unreadable, as they already were after any
+restart of the old single authority. Recreate the cluster to start them clean.
+
+The single-worker DirectSubstrate bench (`space-local-3486`, Tilt
+`SPACE_LOCAL_MINIMAL=1`) was retired with that layout: its node side was the old
+entrypoint's SQL registration of the node, Postgres access from the node that
+nothing else needs, and no suite ran on it.
+Delete a leftover cluster with `kind delete cluster --name space-local-3486`.
 
 ## Service identities
 
-The node-stack uses `docker/Dockerfile.worker` plus the Kind entrypoint, which
-starts services under the Unix accounts and supplementary groups declared in
-the systemd units and EKS charts
-(`infra/space/identity/node-identities.sh`): sbxmgr/credmgr as
-`space-sbxmgr`, tmplmgr as `space-tmplmgr`, node-ctl as `space-nodectl`,
-node-api as `space-nodeapi`, the runtime manager as `space-rtmgr`;
-runtime-supervisor, nodemgr, volmgr, and the
-builder's build-manager stay root. The per-sandbox
-net-gateway is launched through nodemgr with that sandbox's runtime identity.
-Directory ownership matches
-packer `07-sysctl.sh` and the DaemonSet init containers, so **UDS peer authorization
-(SO_PEERCRED) is live in this harness** — e.g. warm-pool fills are
-authorized as `Service(space-tmplmgr)`, not silently as root.
+Each node service runs under the Unix account and supplementary groups the
+systemd units and EKS charts declare (`infra/space/identity/node-identities.sh`):
+sandbox-manager, volume-manager and credential-manager as `space-sbxmgr`,
+template-manager as `space-tmplmgr`, node-ctl as `space-nodectl`, node-api as
+`space-nodeapi`, the runtime manager as `space-rtmgr`; runtime-supervisor,
+node-manager and the builder's build-manager stay root. The per-sandbox
+net-gateway is launched by the host runtime-supervisor with that sandbox's
+gateway identity. Directory ownership matches packer `07-sysctl.sh` and the
+DaemonSet init containers, so **UDS peer authorization (SO_PEERCRED) is live in
+this harness** — e.g. warm-pool fills are authorized as `Service(space-tmplmgr)`,
+not silently as root.
 
 The runtime manager only lists the node's Firecracker releases and kernels
-(`space-rtmgr list`); nothing depends on it yet. The entrypoint restarts it on
-its own rather than through the service-set supervisor, so its exit never
-restarts the other services. The baseline Kind smoke checks its JSON listing on
-both a worker and a builder, requiring a complete scan with a valid vendor
-runtime and a staged cache kernel. These checks do not gate node readiness.
+(`space-rtmgr list`); nothing depends on it yet, and it restarts on its own like
+every other service. The baseline Kind smoke checks its JSON listing on both a
+worker and a builder, requiring a complete scan with a valid vendor runtime and a
+staged cache kernel. These checks do not gate node readiness.
 
-Kind explicitly sets `SPACE_INTERNAL_RPC_INSECURE_DEV=true` for its internal
-ClusterApi/NodeApi HTTP connections. Deployed services default to authenticated
-TLS; see [Internal RPC TLS](../../../docs/internal-rpc-tls.md) for certificate
-configuration and the coordinated migration requirements.
+**Credential-manager.** The authority runs on the control plane as the
+`space-credmgr-authority` Deployment (`charts/space-credmgr-authority-local`,
+named as in the EKS module): `--role=authority --no-uds` on TCP port 9810, with
+the control-plane database, the platform KEK and the optional `space-aws-creds`
+for its AWS integrations. It authenticates callers by TokenReview of their
+projected ServiceAccount tokens (audience `space-credential-manager`), maps each
+ServiceAccount to its client service, and never accepts the static internal
+token. On every request it also requires the token's pod to be current and
+Running in its namespace, with the connection's source address among that
+pod's IPs, and the token's node to be registered under that name and UID; its
+Role lists and watches the namespace's pods for this. Builder nodes fail the
+node check: internal-api registers a node without its UID, which only the
+node inventory sync, listing the sandbox-selector nodes, or a sandbox pod
+placed on the node records
+(`crates/libs/api/src/controllers/substrate/kubernetes/node_sync.rs`), so the
+authority refuses builder callers with `node_identity_mismatch`. Kind's
+builders do not need it: their build-manager and volume-manager read the
+object store's static keys instead of exchanging tokens. Each node's
+credential-manager runs `--role=agent`: it holds the node's credential sockets
+under its service mutex and forwards every call upstream as the node credential
+agent, with no database, KEK or AWS credential. node-manager
+calls the authority directly for sandbox volume DEKs, which the authority grants
+only to node-manager. The platform KEK takes the production provider path, the
+intermediate-key broker: the authority mints each org's intermediate key there
+on first use, keeps only the opaque wrapped key in Postgres and unwraps it
+through the broker. Kind's broker is the in-repo fixture
+(`charts/space-kind-key-broker`, Kind-only image `docker/Dockerfile.kind-key-broker`),
+reached over plaintext because the fixture has no TLS listener. It derives keys
+from the tenant reference and keeps no state, so keys survive restarts of the
+broker and the authority and every replica serves every org, and so Kind's keys
+protect nothing. The authority runs two replicas and rolls one at a time. Agents
+started before the authority exit and are restarted until it answers.
+
+**Internal RPC TLS.** Kind runs ClusterApi, NodeApi, BuildManager,
+IngressActivationApi and the credential-manager authority over authenticated
+TLS, as deployed services do
+([Internal RPC TLS](../../../docs/internal-rpc-tls.md));
+`SPACE_INTERNAL_RPC_INSECURE_DEV` is not set anywhere. Both bring-up paths run
+[`scripts/internal-rpc-tls.sh`](scripts/internal-rpc-tls.sh) before any
+workload, which keeps the cluster's material in Secrets named as on EKS
+(`internal_rpc_tls.tf`, `credmgr_authority_tls.tf`): a per-cluster ECDSA P-256
+CA (`space-internal-rpc-ca`, mounted by every caller at `/etc/space-rpc-ca`),
+one-year leaves reissued within 60 days of expiry for internal-api
+(`space-cluster-api-tls`: `space-internal-api`, `space-cluster-api`), every
+node-api (`space-node-api-tls`: `space-node-api`), build-manager
+(`space-build-manager-tls`: `space-builder-build-manager`) and the api's
+ingress activation listener (`space-ingress-activation-tls`: `space-api`, the
+Service internal-api dials; the EKS module names no Secret for it, so this
+name is Kind's own), each mounted only by
+its listener at `/etc/space-rpc-tls` with the key readable by the listener's own
+identity, and the authority's self-signed end-entity certificate
+(`space-credmgr-authority-tls`, trusted by its clients through
+`space-credmgr-authority-trust`). The leaves carry service names only, so
+callers that dial node-api by node IP set `SPACE_NODE_API_TLS_SERVER_NAME=space-node-api`,
+while builder node-api dials build-manager by the leaf's own name, through the
+node-local `space-builder-build-manager` Service. The CA's key
+stays in the Kind-only `space-internal-rpc-ca-signing` Secret, which no workload
+mounts. The script restarts a listener whose identity it reissued, and every
+workload if the CA itself changed, because neither reloads them while running.
+TLS here is server-authenticated: bearer tokens still authorize callers, and
+internal-api's node-address check is unchanged. The api's ingress activation
+listener admits only internal-api's ServiceAccount, by TokenReview of its
+projected `space-cluster-api` token with no static fallback, as
+[Ingress activation delegation](../../../docs/internal-rpc-tls.md#ingress-activation-delegation)
+asks of the hosting deployment.
 
 ## Differences from the EKS deployment modules
 
 | EKS modules                                               | Local kind                                                                    |
 |-----------------------------------------------------------|-------------------------------------------------------------------------------|
-| One DaemonSet per node service, systemd watchdogs via k8s probes | All node services in one `space-node-stack` pod, supervised by the entrypoint (same binaries, identities, sockets) |
-| `/space/cache` is btrfs on instance-store NVMe            | btrfs loopback image, bound from the kind node at `/var/lib/space-cache.img` so it outlives pod restarts like the NVMe does (same code paths, less I/O headroom). Workers mount it inside the pod; on builders the `mount-cache` init container mounts it on the kind node's `/space/cache`, as the host does on EKS, and the services receive it `HostToContainer`, so the mounts they make under it stay in the pod |
+| One DaemonSet per node service, systemd watchdogs via k8s probes | One DaemonSet per node service and role from the Kind charts (`charts/space-<service>-local`), probed on each service's health socket; runtime-supervisor is the same host systemd unit node-manager's init container installs |
+| Node image (packer) provides `/space/cache`, the cgroup subtree, loop devices, device permissions, SPACE accounts and the `/space` skeleton before any pod starts | Sandbox workers and builders boot the SPACE Kind node image, which bakes in the same as systemd units that run before kubelet on every node start (see [The node layer](#the-node-layer)) |
+| `/space/cache` is btrfs on instance-store NVMe            | btrfs on a sparse loopback image at `/var/lib/space-cache.img` on the kind node (40 GiB, same code paths, less I/O headroom), mounted on the node's `/space/cache` by `space-cache.service`, so it outlives pod restarts like the NVMe does |
 | Postgres on RDS, secrets via ExternalSecrets / AWS Secrets Manager | In-cluster `space-postgres` StatefulSet, static Kubernetes Secrets             |
 | S3 for snapshots + template artifacts                     | In-cluster versitygw (real S3 protocol, sigv4, path-style)                    |
+| `space-credmgr-authority` Deployment whose platform KEK comes from an external intermediate-key broker, with TLS from its own certificate (`credmgr_authority_tls.tf`; the direct KMS backend is gone, `credmgr_authority_kms.tf`) | two replicas on the same broker path against the in-repo broker fixture (`space-kind-key-broker`), which derives keys instead of protecting them; TLS from a self-signed certificate `internal-rpc-tls.sh` issues per cluster |
+| Internal RPC CA and listener leaves issued by Terraform and synced by External Secrets (`internal_rpc_tls.tf`) | the same Secrets issued per cluster by `scripts/internal-rpc-tls.sh` |
 | volume-manager credentials via credmgr STS/IRSA           | static `SPACE_OBJECT_STORE_STATIC_*` creds (the documented local escape hatch) |
 | build-manager gets S3 credentials via credential-manager backed by cloud identity | the same directly injected static object-store credentials; credential-manager's storage exchange endpoint is explicitly disabled |
-| `/dev/kvm` access via the AMI's kvm group                 | `chmod 0666 /dev/kvm` at pod start (kind-only; never replicate on a worker)   |
-| Loop devices from the AMI's `max_loop=10000` on a real devtmpfs | 8 nodes inherited in the pod's tmpfs `/dev`; the entrypoint mknods the rest and sets autoclear on the cache device (`scripts/lib/space-loop-devices.sh`) |
-| vhost-vsock jail nodes provided by the AMI                | jail watcher in the entrypoint mknods them as jails appear                    |
+| `/dev/kvm` access via the AMI's kvm group                 | `space-kind-devices.service` makes `/dev/kvm`, `/dev/vhost-vsock` and `/dev/vhost-net` mode 0666 on the node (kind-only; never replicate on a worker) |
+| Loop devices from the AMI's `max_loop=10000` on a real devtmpfs | The node's tmpfs `/dev` starts with 8 nodes; `space-loop-nodes.service` mknods the rest before kubelet, pods copy the node's `/dev`, and node-manager raises its pod's pool further. The cache device has autoclear set, so a node stop releases it (`scripts/lib/space-loop-devices.sh`) |
+| vhost-vsock jail nodes provided by the AMI                | the Kind-only `space-kind-vsock-jails.service` mknods them into each jail under `/space/cache/firecracker/jails` as it appears (kind-only) |
 | Sandbox SSH key generated by Packer per AMI               | generated per host by `build-seed.sh` under `~/.space-devbox/kind/ssh` |
 | ALB ingress in front of api / data-plane / ui             | NodePort + `kubectl port-forward` (started in background by bootstrap.sh)     |
 | The runtime manager uses writable `/space/vendor/{firecracker,kernels}` and `/space/vendor/runtime-manager/state` | `/space/vendor` is a read-only host bind: install roots report unprotected and state absent; listing and cache checks still work |
-| Builder services use separate DaemonSets | The same service set shares a dedicated builder node-stack pod and a stable `space-builder-node-api` Service |
+| Operators run node-local CLIs from the node host's shell   | the same CLIs run in the Kind-only `space-node-debug` root shell DaemonSet     |
 | Build sizing, concurrency, and multipart sizes are configurable | 20 GiB default build disk, one concurrent build, and smaller multipart parts fit the 40 GiB local btrfs cache |
 
 `space-seed-publish` remains the bootstrap for `seed:latest`; it is not a
@@ -795,10 +1019,10 @@ worker cannot disrupt control-plane components:
 | Node                          | Pool label  | Purpose                                                                                 |
 |-------------------------------|-------------|-----------------------------------------------------------------------------------------|
 | `space-local-control-plane`   | —           | k8s control-plane only                                                                  |
-| `space-local-worker`          | `sandbox`   | Runs space-node-stack DaemonSet + receives SPACE sandbox pods                            |
+| `space-local-worker`          | `sandbox`   | Runs the worker node-service DaemonSets + receives SPACE sandbox pods                    |
 | `space-local-worker2`         | `sandbox`   | Same, second worker                                                                      |
 | `space-local-worker3`         | `infra`     | Runs Postgres, object store, space-api, internal-api, data-plane, cluster-controller, UI    |
-| `space-local-worker4`         | `builder`   | Runs the builder node-stack, including build-manager and builder node-api                 |
+| `space-local-worker4`         | `builder`   | Runs the builder node-service DaemonSets, including build-manager and builder node-api    |
 | `space-local-worker5`         | `builder`   | Same, second builder                                                                       |
 
 Sandbox pods carry `nodeSelector: node.kubernetes.io/space-enabled=true`,
@@ -812,6 +1036,96 @@ The two sandbox workers also advertise an extended resource
 `space.pplx.net/network-slots: 100` so the kube scheduler can satisfy each
 sandbox pod's `space.pplx.net/network-slots: 1` request. Bootstrap advertises
 a static pool in place of node-controller's dynamic capacity updates.
+
+## The node layer
+
+A production worker or builder boots from a node image that already holds its
+node layer (`infra/space/packer`): the packages, scripts and enabled systemd
+units that give it a btrfs `/space/cache`, a cgroup subtree, loop-device
+headroom, device permissions, SPACE accounts and the `/space` skeleton before
+any SPACE pod starts. Kind does the same with the **SPACE Kind node image**,
+[`node/Dockerfile`](node/Dockerfile): `kindest/node:v1.34.0` (the default of
+the pinned kind v0.30.0, pinned by digest) plus `btrfs-progs`,
+[`node/space-kind-node.sh`](node/space-kind-node.sh) with its libraries, and
+these units, enabled in the image:
+
+| Unit | Does | Production counterpart |
+|---|---|---|
+| `space-loop-nodes.service` | mknods loop-device nodes in the node's `/dev` (64, raised past any index in use); pods copy the node's `/dev` when they start | `max_loop=10000` (07-sysctl.sh) |
+| `space-kind-devices.service` | mode 0666 on `/dev/kvm`, `/dev/vhost-vsock`, `/dev/vhost-net` | the `kvm` group; Kind-only, never on a worker |
+| `space-cgroup.service` | `/sys/fs/cgroup/space` with `+cpu +memory +io +pids` delegated | `space-cgroup.service` (07-sysctl.sh) |
+| `space-layout.service` | the SPACE groups and service accounts; the `/space/run` skeleton and dependency-drain gates; `/space/bin/{firecracker,jailer}` links onto the vendor tree; `/space/etc/sandbox.toml`; `/var/run/netns` | 07-sysctl.sh accounts and directory skeleton, 04-firecracker.sh links |
+| `space-cache.service` | formats `/var/lib/space-cache.img` on first boot (sparse, 40 GiB), mounts it on `/space/cache` with loop autoclear and shared propagation, then creates the cache skeleton | 01-partitions.sh / 11-nvme-cache.sh |
+| `space-kind-vsock-jails.service` | long-running: mknods `/dev/vhost-vsock` into each Firecracker jail under `/space/cache/firecracker/jails` as it appears (the jailer does not) | the node image provides it; Kind-only |
+
+They are ordered `Before=kubelet` and run on every boot of the node container,
+including after `docker restart`, which gives it a fresh `/dev`, mount table
+and cgroups; all but the vhost-vsock unit are oneshots. Nothing is installed
+when the cluster comes up. The sandbox workers and builders run this image
+(`kind-cluster.yaml.tmpl`); the control-plane and infra nodes run its
+base unchanged, as production's non-SPACE nodes carry no SPACE node layer, so
+every node runs the same Kubernetes version. The cache image sits on the node's
+`/var`, which kind keeps on a Docker volume, so the cache survives pod and node
+restarts. Defaults are baked like the rest of the layer; a node's
+`/etc/space/kind-node.env` can override `SPACE_CACHE_SIZE_MB` and
+`SPACE_LOOP_DEVICE_TARGET` for its next boot.
+
+**Distribution.** [`kind-node-image.sh`](scripts/kind-node-image.sh) follows
+`ci/scripts/ci-image.sh`. The tag is the SHA-256 of the image's inputs (the
+Dockerfile and every file it copies), and the build context holds exactly those
+files. `ensure` uses a local image with that tag, else pulls it from
+`ghcr.io/perplexityai/space-kind-node`, else builds it (about ten seconds on a
+warm Docker cache). Both bring-up paths run it before `kind create`, and the
+renderer writes the tag into the cluster config. Main CI publishes each new tag
+once; Kind CI jobs pull it and fall back to a build. Builds take the
+`kindest/node` base from the third-party image mirror (`ci/mirrored-images.txt`)
+when `SPACE_CI_IMAGE_MIRROR` is set, and from the source otherwise. A package
+administrator has to make the `space-kind-node` package public for bring-ups
+outside CI to pull it; until then they build it, with the same result.
+
+Firecracker, its jails and the per-sandbox sidecars run on the node under
+`space-runtime-supervisor.service`, so the jails live in the node's mount
+namespace, a slave of the node's shared `/space/cache`. node-manager mounts the
+cache `Bidirectional`: the bind mounts it makes into a jail — the instance
+rootfs before launch, the snapshot memory file after Firecracker is already
+running on restore — propagate to the node and from there into the jail. Every
+other pod receives the cache `HostToContainer` (`shared,slave` inside the pod):
+it sees the node's cache, its remounts and node-manager's mounts, and the
+mounts it makes itself (build-manager's OCI rootfs and assembly mounts) stay in
+the pod and never reach the node's mount table. Check a node's view with
+`docker exec <node> findmnt -o TARGET,FSTYPE,PROPAGATION`.
+
+Diagnose a node with `docker exec <node> systemctl status 'space-*'` and
+`docker exec <node> journalctl -u space-cache`. To start a node's cache clean or
+at a new size, delete the node-service DaemonSets of that node's role, run
+`systemctl stop space-runtime-supervisor && umount /space/cache && rm
+/var/lib/space-cache.img` on the node (adding `SPACE_CACHE_SIZE_MB=<MiB>` to
+`/etc/space/kind-node.env` for a new size), then `systemctl restart
+space-cache` and re-apply the charts. Recreating the cluster
+also starts clean.
+
+**Clusters created before this image, or from an older build of it, must be
+recreated.** A kind node keeps the image it was created from, so such a
+cluster's SPACE nodes lack the layer or carry a stale one. Every bring-up path
+(`bootstrap.sh`, the smoke suites' bring-up, and Tilt's `check-kind-node-image`
+resource) runs
+[`check-kind-node-image.sh`](scripts/check-kind-node-image.sh), which compares
+each SPACE node's image label with the tag this tree builds and, on a mismatch,
+stops with the command to run:
+
+```bash
+kind delete cluster --name space-local   # keeps the containerd image caches
+bash infra/space/kind/scripts/bootstrap.sh   # or `tilt up` via the smoke bring-up
+```
+
+Recreating rather than patching nodes in place is the production model: a new
+node image reaches a fleet by replacing nodes, not by installing onto running
+ones. Keeping an in-place path would have meant a second delivery mechanism
+(installing packages and units into live node containers) that has to track
+every change to the image and is exercised only on old clusters, which is where
+it would drift. Recreation costs a few minutes because the containerd image
+caches stay on disk; it does delete the cluster's sandboxes, snapshots and
+published templates.
 
 ## Smoke test
 
@@ -913,28 +1227,23 @@ the public data plane, where the API route token is available.
 All commands below pin the kind context explicitly:
 
 ```bash
-kubectl --context kind-space-local -n space get ds,po,svc -o wide
-kubectl --context kind-space-local -n space describe ds/space-builder-node-stack
-kubectl --context kind-space-local -n space logs ds/space-builder-node-stack --tail=200
-
-BUILDER_POD=$(kubectl --context kind-space-local -n space get pod \
-  -l 'app.kubernetes.io/name=space-builder' -o jsonpath='{.items[0].metadata.name}')
-kubectl --context kind-space-local -n space exec "$BUILDER_POD" -- \
-  tail -n 200 /space/logs/buildmgr.log
-kubectl --context kind-space-local -n space exec "$BUILDER_POD" -- \
-  tail -n 200 /space/logs/node-api.log
+kubectl --context kind-space-local -n space get ds,po,svc -o wide \
+  -l app.kubernetes.io/name=space-builder
+kubectl --context kind-space-local -n space describe ds/space-builder-build-manager
+kubectl --context kind-space-local -n space logs ds/space-builder-build-manager --tail=200
+kubectl --context kind-space-local -n space logs ds/space-builder-node-api --tail=200
+kubectl --context kind-space-local -n space logs ds/space-builder-template-manager --tail=200
 
 aws --endpoint-url http://127.0.0.1:8333 s3 ls s3://templates/ --recursive
 ```
 
-The builder DaemonSet is Ready only when both node-api `:9800` and
-build-manager `:9900` pass gRPC health checks. A Pending pod usually means the
-`pool=builder` node or `/dev/kvm` mount is missing; a running but unready pod
-should be diagnosed from `buildmgr.log`, `tmplmgr.log`, and `node-api.log`.
-Service logs survive container retries within the same pod: previous attempts
-are kept under `/space/logs/previous-000001/`, `previous-000002/`, and so on.
-Pod replacement starts a fresh log volume. PID files remain container-local
-under `/run/space-node-stack`; they must not survive a container retry.
+`ds/<name>` picks one of the two builders' pods; name a pod to read a specific
+builder. build-manager is Ready once its `:9900` gRPC health service serves,
+and node-api once its health socket reports ready. A Pending pod usually means
+the `pool=builder` node is missing; a running but unready pod should be
+diagnosed from its own log and, after a restart, from
+`kubectl logs <pod> --previous`. The build VM's commands log through
+build-manager, which the Datadog Agent and the Alloy log stack exclude.
 
 **Current pass/fail map** (as of this revision):
 - `smoke-kind-e2e.sh` — **PASS** (create → real Firecracker boot of the
@@ -951,10 +1260,12 @@ never firing) if reintroduced:
 - **Mount propagation**: the Firecracker jailer unshares a mount
   namespace, and node-manager bind-mounts the snapshot memory file into
   the jail *after* FC is running. On a prod host the systemd-`rshared`
-  root propagates that mount into the jail; in a pod the default-private
-  mount tree doesn't, and FC opens the 0-byte bind target ("Total sum of
-  memory regions exceeds largest possible file offset"). The entrypoint
-  runs `mount --make-rshared /` to restore host semantics.
+  root propagates that mount into the jail; from a pod it propagates only
+  if the pod's mount is `Bidirectional` and the node's `/space/cache` is
+  shared, and otherwise FC opens the 0-byte bind target ("Total sum of
+  memory regions exceeds largest possible file offset"). node-manager's
+  chart mounts the cache `Bidirectional`; `space-cache.service` makes the
+  node's mount shared.
 - **Object store layout**: versitygw's POSIX backend stores each bucket as a
   directory and each object as a file under the infra node's
   `/var/lib/space-object-store`, with ETags and user metadata in `user.*`
@@ -973,7 +1284,7 @@ local states, so a sandbox whose local state reached `failed` wedges
 (every retry FailedPreconditions, DELETE stays blocked on the in-flight
 upload). Only reachable after a real restore failure.
 
-## Real S3 snapshot + template path (object store + node-stack)
+## Real S3 snapshot + template path (object store + volume-manager)
 
 `space-object-store` runs versitygw, an S3-compatible gateway, on the infra node, with
 a one-shot Job that creates the `snapshots` and `templates` buckets. The S3
