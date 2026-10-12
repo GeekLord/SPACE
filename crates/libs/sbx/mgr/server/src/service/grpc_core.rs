@@ -197,13 +197,15 @@ impl SandboxManagerService {
 
             // Resolve template to content-addressed paths via template-manager.
             // If caller pinned a content_hash, use it; otherwise resolve newest.
-            let resolved_template =
-                resolve_template_paths(pplx_space_template_mgr_client::proto::TemplateRef {
+            let resolved_template = resolve_template_paths(
+                self.template_resolver.as_ref(),
+                pplx_space_template_mgr_client::proto::TemplateRef {
                     name: template.to_string(),
                     content_hash: req.content_hash.clone(),
                     tag: None,
-                })
-                .await?;
+                },
+            )
+            .await?;
             if let Some(policy) = template_network_policy_from_proto(
                 req.template_network_policy.as_ref(),
                 req.template_network_policy_generation,
@@ -1010,7 +1012,7 @@ impl SandboxManagerService {
 
         let mut usage_bytes = std::collections::HashMap::new();
         if !resolved_ids.is_empty() {
-            let mut client = connect_node()
+            let mut client = connect_node(&self.node_manager)
                 .await
                 .map_err(|e| Status::unavailable(format!("cannot connect to node-manager: {e}")))?;
             let response = client
@@ -1176,5 +1178,7 @@ fn project_template_catalog(
         .collect()
 }
 
+#[cfg(test)]
+mod create_template_lookup_tests;
 #[cfg(test)]
 mod tests;

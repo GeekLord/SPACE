@@ -513,6 +513,8 @@ async fn prepare_suspend_restore_dir(
                 execution_fence,
                 storage_uri,
                 transfer_scope_id,
+                &service.node_manager,
+                service.template_resolver.as_ref(),
             )
             .await
         }
@@ -521,6 +523,8 @@ async fn prepare_suspend_restore_dir(
                 &sandbox_id,
                 execution_fence,
                 transfer_scope_id,
+                &service.node_manager,
+                service.template_resolver.as_ref(),
             )
             .await
         }
@@ -750,7 +754,7 @@ impl SandboxManagerService {
         &self,
         requested_memory_mib: u32,
     ) -> Result<ResolvedSandboxMemoryPolicy, Status> {
-        let mut node_client = connect_node()
+        let mut node_client = connect_node(&self.node_manager)
             .await
             .map_err(|e| Status::internal(format!("cannot connect to node-manager: {e}")))?;
         let node_memory_policy = Self::node_sandbox_memory_policy(&mut node_client).await?;
@@ -1361,6 +1365,7 @@ impl SandboxManagerService {
 
         if !vmstate_path.exists() {
             let resolved_template = resolve_template_paths_for_start(
+                self.template_resolver.as_ref(),
                 pplx_space_template_mgr_client::proto::TemplateRef {
                     name: sandbox.template.clone(),
                     content_hash: sandbox.template_hash.clone(),
@@ -1643,7 +1648,7 @@ impl SandboxManagerService {
             "fresh.template_prepare_source",
             START_TEMPLATE_RESOLUTION_TIMEOUT,
             &sandbox.id,
-            template_source_for_sandbox_prepare(&sandbox),
+            template_source_for_sandbox_prepare(self.template_resolver.as_ref(), &sandbox),
         )
         .await?;
         let selection_mode = if prepare_source.existing_artifact {
@@ -1659,7 +1664,11 @@ impl SandboxManagerService {
             START_TEMPLATE_RESOLUTION_TIMEOUT,
             &sandbox.id,
             TemplateRuntimeDefaults::default(),
-            template_runtime_defaults_for_sandbox_start(&sandbox, prepare_template_dir.as_deref()),
+            template_runtime_defaults_for_sandbox_start(
+                self.template_resolver.as_ref(),
+                &sandbox,
+                prepare_template_dir.as_deref(),
+            ),
         )
         .await;
 
@@ -1780,7 +1789,7 @@ impl SandboxManagerService {
             START_NODE_METADATA_TIMEOUT,
             id,
             async {
-                connect_node()
+                connect_node(&self.node_manager)
                     .await
                     .map_err(|e| Status::internal(format!("cannot connect to node-manager: {e}")))
             },
@@ -2119,12 +2128,17 @@ impl SandboxManagerService {
         // one node-local round-trip for the warm-pool composite *shape* below
         // — a device-layout choice, not an encryption decision.
         let rootfs_block_device_path = if sandbox.volume_encryption {
-            match crate::rootfs_encryption::prepare_encrypted_rootfs(id, execution_fence, None)
-                .instrument(tracing::info_span!(
-                    "sbxmgr.start.encrypted_rootfs_prepare",
-                    sandbox_id = %id
-                ))
-                .await
+            match crate::rootfs_encryption::prepare_encrypted_rootfs(
+                id,
+                execution_fence,
+                None,
+                &self.node_manager,
+            )
+            .instrument(tracing::info_span!(
+                "sbxmgr.start.encrypted_rootfs_prepare",
+                sandbox_id = %id
+            ))
+            .await
             {
                 Ok(path) => Some(path),
                 Err(e) => {
@@ -2161,12 +2175,16 @@ impl SandboxManagerService {
             // it; booting it past an existing COW (cow.plain, or cow.luks
             // from an unstamped re-home) silently rolls back every write the
             // guest made through it.
-            match crate::rootfs_encryption::prepare_snapshot_rootfs(id, execution_fence)
-                .instrument(tracing::info_span!(
-                    "sbxmgr.start.pool_snapshot_rootfs_prepare",
-                    sandbox_id = %id
-                ))
-                .await
+            match crate::rootfs_encryption::prepare_snapshot_rootfs(
+                id,
+                execution_fence,
+                &self.node_manager,
+            )
+            .instrument(tracing::info_span!(
+                "sbxmgr.start.pool_snapshot_rootfs_prepare",
+                sandbox_id = %id
+            ))
+            .await
             {
                 Ok(path) => Some(path),
                 Err(e)

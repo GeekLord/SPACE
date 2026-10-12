@@ -240,6 +240,9 @@ mod cancelled_cleanup_rpc_tests;
 mod local_backup_inventory_tests;
 
 #[cfg(test)]
+pub(crate) mod node_manager_transport_tests;
+
+#[cfg(test)]
 pub(crate) mod service_tests {
     use super::start_support::*;
     use super::*;
@@ -5406,10 +5409,14 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         insert_orphaned_test_sandbox(&conn, &sandbox_id, SandboxState::Failed);
         let row = crate::db::get_sandbox(&conn, &sandbox_id).unwrap().unwrap();
+        let templates = crate::template_resolver::fake::FakeTemplateResolver::refusing(
+            Status::not_found("orphaned sandboxes must not look up templates"),
+        );
 
-        let error = template_source_for_sandbox_prepare(&row)
+        let error = template_source_for_sandbox_prepare(&templates, &row)
             .await
             .expect_err("orphaned sandbox without rootfs is not startable");
+        assert!(templates.requests().is_empty());
 
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert!(error.message().contains("cannot start orphaned sandbox"));
@@ -10951,39 +10958,6 @@ pub(crate) mod service_tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn fatal_kill_signal_failure_still_schedules_admitted_cleanup() {
-        let conn = crate::db::test_conn();
-        let sandbox_id = SandboxId::new();
-        let sandbox_id_string = sandbox_id.to_string();
-        insert_test_sandbox(&conn, &sandbox_id_string, SandboxState::Started);
-        let service = service_for_teardown_test(conn);
-        service
-            .update_runtime_fields(
-                sandbox_id,
-                runtime_fields(ExecutionGeneration::new(1).unwrap(), 7),
-            )
-            .unwrap();
-
-        let error = service
-            .kill(internal_request(KillRequest {
-                sandbox_id: sandbox_id_string.clone(),
-                signal: 9,
-                blocking: false,
-            }))
-            .await
-            .expect_err("the unavailable node-manager must fail fatal signal dispatch");
-        assert_eq!(error.code(), tonic::Code::Internal);
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while service.cleanup_executor.active.is_empty() {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("fatal signal failure must still hand admitted cleanup to a runner");
-    }
-
     #[tokio::test]
     async fn unpersisted_delete_clears_activity_without_replacing_live_lock_identity() {
         let service = SandboxManagerService::new(rusqlite::Connection::open_in_memory().unwrap());
@@ -12431,6 +12405,8 @@ pub(crate) mod service_tests {
             node_role: None,
             node_managed_by: None,
             route_ed25519_verification_bundle: None,
+            node_manager: crate::node_manager_transport::NodeManagerConnector::host(),
+            template_resolver: Arc::new(crate::template_resolver::HostTemplateManager),
         }
     }
 
