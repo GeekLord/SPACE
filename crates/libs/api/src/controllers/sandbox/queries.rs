@@ -17,6 +17,7 @@ use pplx_space_common_svc::types::ReconcileReason;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
+use pplx_space_net_common::TlsInterception;
 use pplx_space_public_api::OperationId;
 use std::collections::BTreeMap;
 use std::sync::{
@@ -718,6 +719,23 @@ fn parse_kubernetes_pool_assignment(
     })
 }
 
+/// The TLS interception mode a create resolves to: a sandbox override takes
+/// precedence over the resolved template default.
+fn effective_tls_interception(
+    network_policy_override: Option<&NetworkPolicyV1>,
+    template_network_policy: &NetworkPolicyV1,
+) -> TlsInterception {
+    network_policy_override
+        .unwrap_or(template_network_policy)
+        .tls_interception
+}
+
+impl PooledCreateInput<'_> {
+    fn tls_interception(&self) -> TlsInterception {
+        effective_tls_interception(self.network_policy_override, self.template_network_policy)
+    }
+}
+
 fn emit_create_sandbox_event(
     sandbox_id: SandboxId,
     event_type: SandboxEventType,
@@ -735,6 +753,7 @@ struct SandboxCreateEventContext<'a> {
     resources: &'a SandboxResources,
     federated_owner: Option<&'a crate::federated_identity::FederatedOwner>,
     volume_encryption: bool,
+    tls_interception: TlsInterception,
 }
 
 impl SandboxCreateEventContext<'_> {
@@ -757,7 +776,8 @@ impl SandboxCreateEventContext<'_> {
             .template_id(self.template)
             .template_content_hash(self.content_hash)
             .runtime(self.runtime)
-            .boot_type(self.boot_mode.as_str());
+            .boot_type(self.boot_mode.as_str())
+            .tls_interception(self.tls_interception.as_str());
 
         if let Some(owner) = self.federated_owner {
             details = details
@@ -1184,12 +1204,9 @@ impl SandboxController {
             network_policy_override,
             Some(&template_network_policy),
         );
-        // A sandbox override takes precedence over the resolved template default.
-        let tls_interception_on = !network_policy_override
-            .as_ref()
-            .unwrap_or(&template_network_policy)
-            .tls_interception
-            .is_off();
+        let tls_interception =
+            effective_tls_interception(network_policy_override.as_ref(), &template_network_policy);
+        let tls_interception_on = !tls_interception.is_off();
         let network_policy_override_json = network_policy_override
             .as_ref()
             .map(serde_json::to_value)
@@ -1470,6 +1487,7 @@ impl SandboxController {
             resources: &resources,
             federated_owner,
             volume_encryption,
+            tls_interception,
         };
         let create_event_details = || create_event_context.details();
         emit_create_sandbox_event(
@@ -1992,6 +2010,7 @@ impl SandboxController {
                             resources: &pool_attempt_resources(claim_attempt.pool_shape),
                             federated_owner: input.federated_owner,
                             volume_encryption: input.volume_encryption,
+                            tls_interception: input.tls_interception(),
                         }
                         .details()
                         .result("miss"),
@@ -2081,6 +2100,7 @@ impl SandboxController {
                 resources: &resources,
                 federated_owner: input.federated_owner,
                 volume_encryption: input.volume_encryption,
+                tls_interception: input.tls_interception(),
             };
             let create_event_details = || create_event_context.details();
             emit_create_sandbox_event(
@@ -2457,6 +2477,7 @@ impl SandboxController {
             resources: &resources,
             federated_owner: input.federated_owner,
             volume_encryption: input.volume_encryption,
+            tls_interception: input.tls_interception(),
         };
         let create_event_details = || create_event_context.details();
         emit_create_sandbox_event(
