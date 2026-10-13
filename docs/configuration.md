@@ -142,11 +142,13 @@ because disabling it by mistake would leave every create queued forever.
 
 ## Templates and builds
 
+Prefetch requires the catalog to confirm generic-only release resolution from the same database snapshot as its storage locations. Cached visibility alone does not authorize a download. Upgrade the catalog before template-manager; an older catalog cannot acknowledge this restriction, so prefetch pauses until it is upgraded. On-demand pulls retain their existing authorization.
+
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `SPACE_TEMPLATE_PREFETCH_ENABLED` | on | |
 | `SPACE_TEMPLATE_PREFETCH_TAGS` | `seed:latest`, `code-runtime:latest` | |
-| `SPACE_TEMPLATE_PREFETCH_VISIBILITY_ENFORCEMENT` | off | |
+| `SPACE_TEMPLATE_PREFETCH_VISIBILITY_ENFORCEMENT` | retired | Ignored; prefetch requires confirmed generic visibility. |
 | `SPACE_TEMPLATE_CACHE_BUDGET_BYTES` | 100 GiB | 0 or an invalid value disables cache GC. |
 | `SPACE_TEMPLATE_BUILD_DISK_MIB` | build-manager default | JSON. |
 | `SPACE_TRUSTED_TEMPLATE_STORAGE_BUCKETS` | empty = any bucket | |
