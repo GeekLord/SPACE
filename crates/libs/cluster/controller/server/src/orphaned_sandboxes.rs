@@ -1941,4 +1941,6 @@ pub async fn run(
 }
 
 #[cfg(test)]
+mod lifecycle_writer_tests;
+#[cfg(test)]
 mod tests;
