@@ -2792,7 +2792,9 @@ impl SandboxManagerService {
                     sandbox_id,
                     SandboxEventType::StopGuestFlushFailed,
                     SandboxEventSource::SbxManager,
-                    SandboxEventDetails::default().error(error.to_string().as_str()),
+                    SandboxEventDetails::default()
+                        .error(error.to_string().as_str())
+                        .logged_by_caller(),
                 );
             }
         }
