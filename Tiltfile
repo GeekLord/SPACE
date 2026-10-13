@@ -314,9 +314,26 @@ custom_build(
 # Namespace + RuntimeClass live in infra/space/kind/manifests/ so the scripted
 # bootstrap (infra/space/kind/scripts/bootstrap.sh) and tilt up share one
 # source of truth. NAMESPACE above must stay "space" — the manifest file
-# hardcodes that name and the charts default to it.
+# hardcodes that name and the charts default to it. The same file creates
+# `sandboxes`, the charts' k8s.sandboxNamespace, where the API creates the
+# per-sandbox pods.
 k8s_yaml("infra/space/kind/manifests/namespace.yaml")
 k8s_yaml("infra/space/kind/manifests/runtimeclass.yaml")
+
+# The sandbox namespace's NetworkPolicies: a default-deny plus the traffic a
+# sandbox pod carries (the chart cites the code behind each rule). The API
+# waits for them, so no sandbox pod runs before its namespace is confined.
+# internal-rpc-tls applies the Namespace manifest first.
+k8s_yaml(helm("infra/space/kind/charts/space-sandbox-network-policy", name = "space", namespace = NAMESPACE))
+k8s_resource(
+    new_name = "space-sandbox-network-policy",
+    objects = [
+        "space-sandbox-default-deny:networkpolicy:sandboxes",
+        "space-sandbox-allow:networkpolicy:sandboxes",
+    ],
+    labels = ["bootstrap"],
+    resource_deps = ["internal-rpc-tls"],
+)
 
 # Label sandbox workers so the api-server's K8s scheduler can place sandbox
 # pods there. Targets only nodes with node-pool=sandbox (set in kind-cluster.yaml.tmpl)
@@ -478,7 +495,7 @@ k8s_resource(
 # lands.
 SPACE_API_DEPS = ["space-postgres", "label-kind-workers", "label-kind-infra",
                   "advertise-kind-worker-network-slots", "install-space-shim",
-                  "internal-rpc-tls"]
+                  "internal-rpc-tls", "space-sandbox-network-policy"]
 k8s_yaml(helm_release("space", "infra/space/kind/charts/space-api-local"))
 k8s_resource(
     "space-api",
