@@ -404,6 +404,7 @@ impl SandboxManagerService {
                 "auto-pause failed",
                 guest_preparation_budget,
                 &self.node_manager,
+                self.config.balloon_hint_timeout_ms,
             )
             .await;
             if pause_state != SandboxState::Paused {

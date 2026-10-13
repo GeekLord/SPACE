@@ -2005,6 +2005,7 @@ async fn confirmed_node_pause_reports_paused_and_carries_the_execution_fence() {
         "pause failed",
         GuestSnapshotPreparationBudget::Standard,
         &connector,
+        None,
     )
     .await;
 

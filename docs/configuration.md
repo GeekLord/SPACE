@@ -186,6 +186,39 @@ jobs that could not be drained: jobs without a grant cannot publish through a
 dual-authority account after the rollout. System-only deployment publishers
 retain their existing publication authority.
 
+### Template balloon device
+
+A template can opt its sandboxes into a Firecracker
+[balloon device](https://github.com/firecracker-microvm/firecracker/blob/main/docs/ballooning.md)
+through `balloon` in its recipe's `[metadata]`, which the build records in the
+template's `metadata.json`:
+
+```toml
+[metadata]
+memory_mib = 8192
+# One of:
+balloon = { mode = "inflate", amount_mib = 1024, deflate_on_oom = true }
+balloon = { mode = "report" }  # free-page reporting
+balloon = { mode = "hint" }    # free-page hinting
+```
+
+`stats_polling_interval_s` (default 0, off) enables balloon statistics in any
+mode. `amount_mib` and `deflate_on_oom` are required for `inflate` and rejected
+otherwise; `amount_mib` must be below the sandbox's memory. Unknown modes and
+fields are rejected. Without `balloon`, the VM configuration is unchanged.
+
+The device is rendered only when a sandbox cold-boots from the template build,
+which includes creating the template's base snapshot. Sandboxes restored from a
+snapshot keep the device that snapshot captured, so changing the setting takes
+effect only after rebuilding the template and its base snapshot. The REST build
+API does not accept the setting yet.
+
+Hint mode also needs `balloon_hint_timeout_ms` (at most 30000) in the node's
+`/space/etc/sandbox.toml`. Before each suspend snapshot, a VM whose balloon has
+free-page hinting then runs one hinting pass bounded by this time; timeouts and
+errors are logged and the snapshot proceeds. Unset, suspend makes no balloon
+calls.
+
 ## Object storage and snapshots
 
 | Variable | Default | Notes |

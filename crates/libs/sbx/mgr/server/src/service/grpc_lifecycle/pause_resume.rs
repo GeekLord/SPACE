@@ -53,6 +53,10 @@ async fn reconcile_state_after_unconfirmed_pause(
     outcome
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent pause input; the node-manager client and connector are injected"
+)]
 pub(super) async fn pause_with_reconciliation(
     node_client: &mut NodeManagerGrpcClient,
     execution_fence: Option<pplx_space_node_mgr_client::proto::ExecutionFence>,
@@ -61,6 +65,7 @@ pub(super) async fn pause_with_reconciliation(
     reason_context: &str,
     guest_preparation_budget: GuestSnapshotPreparationBudget,
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
+    balloon_hint_timeout_ms: Option<std::num::NonZeroU32>,
 ) -> SandboxState {
     let sandbox_id_string = sandbox_id.to_string();
     let mut last_reason = None;
@@ -69,6 +74,11 @@ pub(super) async fn pause_with_reconciliation(
             .pause_sandbox(PauseSandboxRequest {
                 execution_fence: execution_fence.clone(),
                 sandbox_id: sandbox_id_string.clone(),
+                // A retry follows a failed or unconfirmed pause and must not
+                // spend the hinting budget again.
+                balloon_hint_timeout_ms: balloon_hint_timeout_ms
+                    .filter(|_| attempt == 0)
+                    .map(std::num::NonZeroU32::get),
             })
             .await
         {
@@ -208,6 +218,7 @@ impl SandboxManagerService {
             "pause failed",
             GuestSnapshotPreparationBudget::Standard,
             &self.node_manager,
+            None,
         )
         .await;
         if pause_state != SandboxState::Paused {
