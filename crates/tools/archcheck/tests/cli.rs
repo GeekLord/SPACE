@@ -5,10 +5,10 @@
 use std::{fs, path::Path, process::Command};
 
 use pplx_space_archcheck::{
-    Context, check,
+    BaseBaseline, Baseline, Context, check,
     context::count_code_lines,
     report::{Format, render},
-    write_baseline,
+    skipped, write_baseline,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -20,10 +20,27 @@ fn code(lines: usize) -> String {
     "let x = 1;\n".repeat(lines)
 }
 
-fn config(no_crossing: &str, listed_no_growth: &str, stale_entries: &str) -> String {
+const ADVISORY: [&str; 5] = ["advisory"; 5];
+
+/// The summary's line when no base baseline is given.
+const SKIPPED: &str = "archcheck: file_size.no_new_entries and file_size.no_raised_caps skipped \
+                       (no --base-baseline given)\n";
+
+/// `modes` of no_crossing, no_new_entries, no_raised_caps, listed_no_growth
+/// and stale_entries.
+fn config(modes: [&str; 5]) -> String {
+    let [
+        no_crossing,
+        no_new_entries,
+        no_raised_caps,
+        listed_no_growth,
+        stale_entries,
+    ] = modes;
     format!(
         "[rules.file_size]\nlimit = {LIMIT}\n\
          [rules.file_size.no_crossing]\nmode = \"{no_crossing}\"\n\
+         [rules.file_size.no_new_entries]\nmode = \"{no_new_entries}\"\n\
+         [rules.file_size.no_raised_caps]\nmode = \"{no_raised_caps}\"\n\
          [rules.file_size.listed_no_growth]\nmode = \"{listed_no_growth}\"\n\
          [rules.file_size.stale_entries]\nmode = \"{stale_entries}\"\n"
     )
@@ -48,10 +65,7 @@ fn workspace(files: &[(&str, String)]) -> TempDir {
         ),
         ("crates/a/Cargo.toml", "[package]\n".to_owned()),
         ("crates/b/Cargo.toml", "[package]\n".to_owned()),
-        (
-            "ARCHITECTURE.toml",
-            config("advisory", "advisory", "advisory"),
-        ),
+        ("ARCHITECTURE.toml", config(ADVISORY)),
         ("architecture-baseline.toml", baseline(&[])),
     ];
     for (path, contents) in defaults.iter().chain(files) {
@@ -62,17 +76,32 @@ fn workspace(files: &[(&str, String)]) -> TempDir {
     dir
 }
 
+/// The workspace's context, with `base` written to `base-baseline.toml` and
+/// read as the base branch's baseline.
+fn load(root: &Path, base: Option<&str>) -> Context {
+    let mut ctx = Context::load(root).expect("the workspace loads");
+    if let Some(text) = base {
+        let path = root.join("base-baseline.toml");
+        fs::write(&path, text).expect("write the base baseline");
+        ctx.base_baseline = Baseline::load_base(&path).expect("the base baseline is readable");
+    }
+    ctx
+}
+
 /// `(behaviour, message)` of every finding, in reporting order.
 fn findings(root: &Path) -> Vec<(&'static str, String)> {
-    let ctx = Context::load(root).expect("the workspace loads");
-    check(&ctx)
+    findings_against(root, None)
+}
+
+fn findings_against(root: &Path, base: Option<&str>) -> Vec<(&'static str, String)> {
+    check(&load(root, base))
         .into_iter()
         .map(|finding| (finding.behaviour, finding.message()))
         .collect()
 }
 
-fn rdjson(root: &Path) -> Value {
-    let ctx = Context::load(root).expect("the workspace loads");
+fn rdjson(root: &Path, base: Option<&str>) -> Value {
+    let ctx = load(root, base);
     let text = render(Format::Rdjson, &check(&ctx), ctx.files.len());
     serde_json::from_str(&text).expect("one JSON document")
 }
@@ -188,17 +217,25 @@ fn inventory() {
     assert_eq!(checked, expected);
 }
 
-/// One row per situation: baseline entries, file sizes, and the expected
+/// One row per situation: the base branch's baseline entries (`None`
+/// without `--base-baseline`), baseline entries, file sizes, and the expected
 /// `(behaviour, start of message)` of each finding.
 #[test]
 fn behaviours() {
     const LISTED: &str = "crates/a/src/listed.rs";
     const NEW: &str = "crates/b/src/new.rs";
     type Sizes<'a> = &'a [(&'a str, usize)];
-    type Case<'a> = (&'a str, Sizes<'a>, Sizes<'a>, &'a [(&'a str, &'a str)]);
+    type Case<'a> = (
+        &'a str,
+        Option<Sizes<'a>>,
+        Sizes<'a>,
+        Sizes<'a>,
+        &'a [(&'a str, &'a str)],
+    );
     let cases: &[Case] = &[
         (
             "a new file over the limit",
+            None,
             &[],
             &[(NEW, LIMIT + 1)],
             &[(
@@ -207,9 +244,10 @@ fn behaviours() {
                  lines are not counted). Split it into submodules by responsibility.",
             )],
         ),
-        ("a new file at the limit", &[], &[(NEW, LIMIT)], &[]),
+        ("a new file at the limit", None, &[], &[(NEW, LIMIT)], &[]),
         (
             "a listed file grew",
+            None,
             &[(LISTED, 6)],
             &[(LISTED, 7)],
             &[(
@@ -220,12 +258,14 @@ fn behaviours() {
         ),
         (
             "a listed file at its cap",
+            None,
             &[(LISTED, 6)],
             &[(LISTED, 6)],
             &[],
         ),
         (
             "a listed file shrank",
+            None,
             &[(LISTED, 8)],
             &[(LISTED, 7)],
             &[(
@@ -236,6 +276,7 @@ fn behaviours() {
         ),
         (
             "a listed file fell to the limit",
+            None,
             &[(LISTED, 8)],
             &[(LISTED, LIMIT)],
             &[(
@@ -246,6 +287,7 @@ fn behaviours() {
         ),
         (
             "a listed file is gone",
+            None,
             &[(LISTED, 8)],
             &[],
             &[(
@@ -257,6 +299,7 @@ fn behaviours() {
         ),
         (
             "a listed file was renamed",
+            None,
             &[(LISTED, 8)],
             &[(NEW, 8)],
             &[
@@ -266,6 +309,7 @@ fn behaviours() {
         ),
         (
             "a key that names no production file",
+            None,
             &[("./crates/a/src/listed.rs", 8)],
             &[(LISTED, 8)],
             &[
@@ -273,8 +317,89 @@ fn behaviours() {
                 ("stale_entries", "./crates/a/src/listed.rs: listed in"),
             ],
         ),
+        (
+            "an entry was added",
+            Some(&[]),
+            &[(NEW, 6)],
+            &[(NEW, 6)],
+            &[(
+                "no_new_entries",
+                "crates/b/src/new.rs is in architecture-baseline.toml but not in the base branch's \
+                 copy; files over the 5-line limit can't be added (a renamed file counts as \
+                 added). Split the file instead.",
+            )],
+        ),
+        (
+            "an entry was added without --base-baseline",
+            None,
+            &[(NEW, 6)],
+            &[(NEW, 6)],
+            &[],
+        ),
+        (
+            "a listed file was renamed and its entry with it",
+            Some(&[(LISTED, 8)]),
+            &[(NEW, 8)],
+            &[(NEW, 8)],
+            &[(
+                "no_new_entries",
+                "crates/b/src/new.rs is in architecture-baseline.toml but",
+            )],
+        ),
+        (
+            "an entry was removed",
+            Some(&[(LISTED, 8), (NEW, 6)]),
+            &[(NEW, 6)],
+            &[(LISTED, LIMIT), (NEW, 6)],
+            &[],
+        ),
+        (
+            "a cap was lowered",
+            Some(&[(LISTED, 8)]),
+            &[(LISTED, 7)],
+            &[(LISTED, 7)],
+            &[],
+        ),
+        (
+            "a cap was raised",
+            Some(&[(LISTED, 6)]),
+            &[(LISTED, 7)],
+            &[(LISTED, 7)],
+            &[(
+                "no_raised_caps",
+                "crates/a/src/listed.rs: cap raised from 6 to 7 in architecture-baseline.toml; \
+                 caps should only go down. Split the file instead.",
+            )],
+        ),
+        (
+            "an entry was added and a cap raised",
+            Some(&[(LISTED, 6)]),
+            &[(LISTED, 7), (NEW, 6)],
+            &[(LISTED, 7), (NEW, 6)],
+            &[
+                ("no_new_entries", "crates/b/src/new.rs is in"),
+                (
+                    "no_raised_caps",
+                    "crates/a/src/listed.rs: cap raised from 6 to 7",
+                ),
+            ],
+        ),
+        (
+            "a cap was raised without --base-baseline",
+            None,
+            &[(LISTED, 7)],
+            &[(LISTED, 7)],
+            &[],
+        ),
+        (
+            "a cap was lowered and another entry removed",
+            Some(&[(LISTED, 8), (NEW, 9)]),
+            &[(LISTED, 7)],
+            &[(LISTED, 7), (NEW, LIMIT)],
+            &[],
+        ),
     ];
-    for (name, entries, sizes, expected) in cases {
+    for (name, base, entries, sizes, expected) in cases {
         let mut files: Vec<(&str, String)> = sizes
             .iter()
             .map(|(path, lines)| (*path, code(*lines)))
@@ -282,7 +407,7 @@ fn behaviours() {
         files.push(("architecture-baseline.toml", baseline(entries)));
         let ws = workspace(&files);
 
-        let found = findings(ws.path());
+        let found = findings_against(ws.path(), base.map(baseline).as_deref());
 
         assert_eq!(found.len(), expected.len(), "{name}: {found:#?}");
         for ((behaviour, message), (want_behaviour, want_message)) in found.iter().zip(*expected) {
@@ -292,31 +417,135 @@ fn behaviours() {
     }
 }
 
-/// One finding per behaviour, each reported in its own mode; only required
-/// findings exit 1.
+/// The base branch's copy is read leniently: only `[file_size]` matters, and
+/// a copy that does not parse skips the comparison with a one-line warning.
+/// The baseline lists `crates/a/src/listed.rs` (cap 8) and `crates/b/src/new.rs`.
 #[test]
-fn modes_and_exit_codes() {
-    let files = |modes: [&str; 3]| {
-        vec![
-            ("ARCHITECTURE.toml", config(modes[0], modes[1], modes[2])),
+fn lenient_base_baseline() {
+    let cases: &[(&str, &str, &[&str], Option<&str>)] = &[
+        (
+            "an unknown table and key",
+            "version = 2\n[file_size]\n\"crates/a/src/listed.rs\" = 8\n[crate_names]\nx = \"y\"\n",
+            &["no_new_entries"],
+            None,
+        ),
+        (
+            "no [file_size] table",
+            "[crate_names]\n",
+            &["no_new_entries", "no_new_entries"],
+            None,
+        ),
+        (
+            "an empty file",
+            "",
+            &["no_new_entries", "no_new_entries"],
+            None,
+        ),
+        ("invalid TOML", "[file_size\n", &[], Some("at line 1")),
+        (
+            "a non-integer cap",
+            "[file_size]\n\"crates/a/src/listed.rs\" = 8\n\"crates/b/src/new.rs\" = \"9\"\n",
+            &[],
+            Some("at line 3"),
+        ),
+        (
+            "a negative cap",
+            "[file_size]\n\"x\" = -1\n",
+            &[],
+            Some("at line 2"),
+        ),
+        (
+            "[file_size] is not a table",
+            "file_size = 3\n",
+            &[],
+            Some("at line 1"),
+        ),
+    ];
+    for (name, base, expected, problem) in cases {
+        let ws = workspace(&[
             (
                 "architecture-baseline.toml",
-                baseline(&[("crates/a/src/gone.rs", 9), ("crates/a/src/grew.rs", 6)]),
+                baseline(&[("crates/a/src/listed.rs", 8), ("crates/b/src/new.rs", 6)]),
             ),
+            ("crates/a/src/listed.rs", code(8)),
+            ("crates/b/src/new.rs", code(6)),
+        ]);
+
+        let ctx = load(ws.path(), Some(base));
+
+        let found: Vec<_> = check(&ctx)
+            .iter()
+            .map(|finding| finding.behaviour)
+            .collect();
+        assert_eq!(found, *expected, "{name}");
+        let skipped = skipped(&ctx);
+        match problem {
+            None => {
+                assert!(
+                    matches!(ctx.base_baseline, BaseBaseline::Loaded(_)),
+                    "{name}"
+                );
+                assert_eq!(skipped, Vec::<String>::new(), "{name}");
+            }
+            Some(at) => {
+                let path = ws.path().join("base-baseline.toml");
+                let [line] = skipped.as_slice() else {
+                    panic!("{name}: {skipped:?}");
+                };
+                let start = format!("warning: could not parse {} {at}: ", path.display());
+                let end = "; file_size.no_new_entries and file_size.no_raised_caps skipped";
+                assert!(
+                    line.starts_with(&start) && line.ends_with(end) && !line.contains('\n'),
+                    "{name}: {line}"
+                );
+            }
+        }
+    }
+}
+
+/// One finding per behaviour, each reported in its own mode; only required
+/// findings exit 1. Without `--base-baseline`, no_new_entries is skipped and
+/// the summary says so.
+#[test]
+fn modes_and_exit_codes() {
+    let files = |modes: [&str; 5]| {
+        vec![
+            ("ARCHITECTURE.toml", config(modes)),
+            (
+                "architecture-baseline.toml",
+                baseline(&[
+                    ("crates/a/src/added.rs", 6),
+                    ("crates/a/src/gone.rs", 9),
+                    ("crates/a/src/grew.rs", 6),
+                    ("crates/a/src/raised.rs", 7),
+                ]),
+            ),
+            (
+                "base-baseline.toml",
+                baseline(&[
+                    ("crates/a/src/gone.rs", 9),
+                    ("crates/a/src/grew.rs", 6),
+                    ("crates/a/src/raised.rs", 6),
+                ]),
+            ),
+            ("crates/a/src/added.rs", code(6)),
             ("crates/a/src/grew.rs", code(7)),
+            ("crates/a/src/raised.rs", code(7)),
             ("crates/b/src/new.rs", code(6)),
         ]
     };
-    let cases: &[([&str; 3], i32)] = &[
-        (["advisory", "advisory", "advisory"], 0),
-        (["required", "advisory", "advisory"], 1),
-        (["advisory", "required", "advisory"], 1),
-        (["advisory", "advisory", "required"], 1),
-    ];
-    for (modes, expected) in cases {
+    let cases: &[([&str; 5], i32)] = &[(ADVISORY, 0)];
+    let required = (0..5).map(|index| {
+        let mut modes = ADVISORY;
+        modes[index] = "required";
+        (modes, 1)
+    });
+    let cases: Vec<_> = cases.iter().copied().chain(required).collect();
+    for (modes, expected) in &cases {
         let ws = workspace(&files(*modes));
+        let base = ws.path().join("base-baseline.toml");
 
-        let run = run(ws.path(), &[]);
+        let run = run(ws.path(), &["--base-baseline", base.to_str().unwrap()]);
 
         assert_eq!(
             run.code, *expected,
@@ -332,13 +561,17 @@ fn modes_and_exit_codes() {
             headings,
             [
                 format!("file_size.no_crossing ({}):", modes[0]),
-                format!("file_size.listed_no_growth ({}):", modes[1]),
-                format!("file_size.stale_entries ({}):", modes[2]),
+                format!("file_size.no_new_entries ({}):", modes[1]),
+                format!("file_size.no_raised_caps ({}):", modes[2]),
+                format!("file_size.listed_no_growth ({}):", modes[3]),
+                format!("file_size.stale_entries ({}):", modes[4]),
             ],
         );
     }
 
-    let ws = workspace(&files(["advisory", "required", "advisory"]));
+    let ws = workspace(&files([
+        "advisory", "advisory", "advisory", "required", "advisory",
+    ]));
     let growth = "crates/a/src/grew.rs grew from 6 to 7 code lines. Split the file before adding \
                   to it.";
     assert!(
@@ -347,16 +580,31 @@ fn modes_and_exit_codes() {
             .any(|(_, message)| message == growth)
     );
 
-    let clean = workspace(&[(
-        "ARCHITECTURE.toml",
-        config("required", "required", "required"),
-    )]);
-    let run = run(clean.path(), &[]);
-    assert_eq!(run.code, 0, "{}", run.stderr);
-    assert_eq!(
-        run.stdout,
-        "archcheck: no findings (0 production Rust files checked)\n"
-    );
+    // Without --base-baseline, both are skipped even when required.
+    let ws = workspace(&files([
+        "advisory", "required", "required", "advisory", "advisory",
+    ]));
+    let run_without_base = run(ws.path(), &[]);
+    assert_eq!(run_without_base.code, 0, "{}", run_without_base.stderr);
+    assert!(!run_without_base.stdout.contains("no_new_entries ("));
+    assert!(!run_without_base.stdout.contains("no_raised_caps ("));
+    assert!(run_without_base.stdout.ends_with(SKIPPED));
+
+    let clean = workspace(&[("ARCHITECTURE.toml", config(["required"; 5]))]);
+    let skipped = SKIPPED;
+    let summary = "archcheck: no findings (0 production Rust files checked)\n";
+    let base = clean.path().join("architecture-baseline.toml");
+    for (args, stdout) in [
+        (vec![], format!("{summary}{skipped}")),
+        (
+            vec!["--base-baseline", base.to_str().unwrap()],
+            summary.to_owned(),
+        ),
+    ] {
+        let run = run(clean.path(), &args);
+        assert_eq!(run.code, 0, "{}", run.stderr);
+        assert_eq!(run.stdout, stdout);
+    }
 }
 
 #[test]
@@ -383,6 +631,8 @@ fn human_report() {
          the file before adding to it.\n\
          \n\
          archcheck: 2 findings (2 advisory, 0 required; 2 production Rust files checked)\n"
+            .to_owned()
+            + SKIPPED
     );
 }
 
@@ -392,7 +642,7 @@ fn messages_group_the_limit() {
     let ws = workspace(&[
         (
             "ARCHITECTURE.toml",
-            config("advisory", "advisory", "advisory").replace("limit = 5", "limit = 1000"),
+            config(ADVISORY).replace("limit = 5", "limit = 1000"),
         ),
         (
             "architecture-baseline.toml",
@@ -428,7 +678,7 @@ fn configuration_errors() {
     const CONFIG: &str = "ARCHITECTURE.toml";
     const BASELINE: &str = "architecture-baseline.toml";
     const MANIFEST: &str = "Cargo.toml";
-    let advisory = config("advisory", "advisory", "advisory");
+    let advisory = config(ADVISORY);
     let text = |value: &str| Some(value.to_owned());
     let members = |member: &str| {
         text(&format!(
@@ -600,33 +850,59 @@ fn a_rust_file_name_that_is_not_utf8_exits_2() {
     );
 }
 
-/// The baseline is rewritten from the tree, whatever the old file held.
+/// `--write-baseline` keeps the entries still over the limit at their
+/// current size and removes the rest; a file without an entry is listed, not
+/// added.
 #[test]
 fn write_baseline_output() {
-    let cases: &[(&[(&str, usize)], &str)] = &[
+    type Sizes<'a> = &'a [(&'a str, usize)];
+    let not_added = |path: &str, lines: usize| {
+        format!(
+            "not added: {path} ({lines} code lines); split it, or add an entry by hand if this \
+             is a deliberate exception"
+        )
+    };
+    let cases: &[(Sizes, Sizes, &str, Vec<String>)] = &[
         (
             &[
-                ("crates/b/src/lib.rs", LIMIT + 3),
-                ("crates/a/src/z.rs", LIMIT + 1),
-                ("crates/a/src/a/b.rs", LIMIT + 2),
+                ("crates/a/src/grew.rs", LIMIT + 1),
+                ("crates/a/src/shrank.rs", LIMIT + 4),
+                ("crates/a/src/same.rs", LIMIT + 2),
+                ("crates/a/src/fell.rs", LIMIT + 3),
+                ("crates/a/src/gone.rs", LIMIT + 3),
+                ("./crates/a/src/same.rs", LIMIT + 2),
+            ],
+            &[
+                ("crates/a/src/grew.rs", LIMIT + 3),
+                ("crates/a/src/shrank.rs", LIMIT + 1),
+                ("crates/a/src/same.rs", LIMIT + 2),
+                ("crates/a/src/fell.rs", LIMIT),
+                ("crates/b/src/new.rs", LIMIT + 7),
                 ("crates/a/src/ok.rs", LIMIT),
                 ("crates/a/src/tests.rs", LIMIT + 9),
             ],
-            "[file_size]\n\"crates/a/src/a/b.rs\" = 7\n\"crates/a/src/z.rs\" = 6\n\
-             \"crates/b/src/lib.rs\" = 8\n",
+            "[file_size]\n\"crates/a/src/grew.rs\" = 8\n\"crates/a/src/same.rs\" = 7\n\
+             \"crates/a/src/shrank.rs\" = 6\n",
+            vec![not_added("crates/b/src/new.rs", 12)],
         ),
-        (&[("crates/a/src/ok.rs", LIMIT)], "[file_size]\n"),
+        (
+            &[],
+            &[("crates/a/src/ok.rs", LIMIT)],
+            "[file_size]\n",
+            vec![],
+        ),
     ];
-    for (sizes, expected) in cases {
+    for (entries, sizes, expected, expected_not_added) in cases {
         let mut files: Vec<(&str, String)> = sizes
             .iter()
             .map(|(path, lines)| (*path, code(*lines)))
             .collect();
-        files.push(("architecture-baseline.toml", "not toml".to_owned()));
+        files.push(("architecture-baseline.toml", baseline(entries)));
         let ws = workspace(&files);
 
-        write_baseline(ws.path()).unwrap();
+        let written = write_baseline(ws.path()).unwrap();
 
+        assert_eq!(written.not_added, *expected_not_added);
         let written = fs::read_to_string(ws.path().join("architecture-baseline.toml")).unwrap();
         assert!(written.starts_with("# Existing violations"), "{written}");
         let body: String = written
@@ -635,36 +911,119 @@ fn write_baseline_output() {
             .map(|line| format!("{line}\n"))
             .collect();
         assert_eq!(body, *expected);
-        assert_eq!(findings(ws.path()), []);
+        let left: Vec<_> = findings(ws.path())
+            .into_iter()
+            .map(|(behaviour, _)| behaviour)
+            .collect();
+        let expected_left = vec!["no_crossing"; expected_not_added.len()];
+        assert_eq!(left, expected_left);
     }
 
-    let ws = workspace(&[("crates/a/src/big.rs", code(LIMIT + 1))]);
+    // The old baseline is read, so one that does not parse is left alone.
+    let ws = workspace(&[("architecture-baseline.toml", "not toml".to_owned())]);
+    let error = write_baseline(ws.path()).unwrap_err().to_string();
+    assert!(error.contains("could not parse"), "{error}");
+    let left = fs::read_to_string(ws.path().join("architecture-baseline.toml")).unwrap();
+    assert_eq!(left, "not toml");
+
+    let ws = workspace(&[
+        (
+            "architecture-baseline.toml",
+            baseline(&[("crates/a/src/listed.rs", LIMIT + 1)]),
+        ),
+        ("crates/a/src/listed.rs", code(LIMIT + 2)),
+        ("crates/a/src/big.rs", code(LIMIT + 1)),
+    ]);
     let run = run(ws.path(), &["--write-baseline"]);
     assert_eq!(run.code, 0, "{}", run.stderr);
+    let (listed, wrote) = run.stdout.split_once('\n').unwrap();
+    assert_eq!(listed, not_added("crates/a/src/big.rs", 6));
     assert!(
-        run.stdout
-            .starts_with("archcheck: wrote 1 file_size entries to "),
+        wrote.starts_with("archcheck: wrote 1 file_size entries to "),
         "{}",
         run.stdout
     );
 }
 
+/// A `--base-baseline` that cannot be read is an error; one that does not
+/// parse is a warning after the summary, with the comparison skipped.
+#[test]
+fn base_baseline_problems() {
+    let cases: &[(&str, &str, Option<&str>, i32, &str)] = &[
+        ("missing", "base.toml", None, 2, "could not read"),
+        ("a directory", "crates", None, 2, "could not read"),
+        (
+            "unparseable",
+            "base.toml",
+            Some("[file_size\n"),
+            0,
+            "could not parse",
+        ),
+        (
+            "non-integer cap",
+            "base.toml",
+            Some("[file_size]\n\"crates/a/src/lib.rs\" = \"9\"\n"),
+            0,
+            "could not parse",
+        ),
+    ];
+    for (name, file, contents, code, problem) in cases {
+        let ws = workspace(&[]);
+        let path = ws.path().join(file);
+        if let Some(contents) = contents {
+            fs::write(&path, contents).unwrap();
+        }
+        let path = path.to_str().unwrap();
+        for format in ["human", "rdjson"] {
+            let run = run(ws.path(), &["--format", format, "--base-baseline", path]);
+
+            assert_eq!(run.code, *code, "{name} {format}: {}", run.stderr);
+            if *code == 2 {
+                assert_eq!(run.stdout, "", "{name} {format}");
+                assert!(
+                    run.stderr.starts_with("archcheck: error: ")
+                        && run.stderr.contains(path)
+                        && run.stderr.contains(problem),
+                    "{name}: {}",
+                    run.stderr
+                );
+                continue;
+            }
+            let summary = if format == "human" {
+                run.stdout
+            } else {
+                serde_json::from_str::<Value>(&run.stdout).expect("one JSON document");
+                run.stderr
+            };
+            let warning = summary.lines().last().unwrap_or_default();
+            assert!(
+                warning.starts_with(&format!("archcheck: warning: {problem} {path} at line "))
+                    && warning.ends_with("file_size.no_raised_caps skipped"),
+                "{name} {format}: {summary}"
+            );
+        }
+    }
+}
+
 /// A finding is an `ERROR` in required mode and a `WARNING` in advisory
-/// mode, on line 1 of its file; a stale entry whose file is gone points at
-/// the entry's line in the baseline.
+/// mode, on line 1 of its file; a new entry, a raised cap, and a stale entry
+/// whose file is gone point at the entry's line in the baseline.
 #[test]
 fn rdjson_document() {
     let ws = workspace(&[
         (
             "ARCHITECTURE.toml",
-            config("required", "advisory", "advisory"),
+            config(["required", "advisory", "advisory", "advisory", "advisory"]),
         ),
         (
             "architecture-baseline.toml",
             "# A comment.\n\n[file_size]\n\"crates/a/src/grew.rs\" = 6\n\n\
-             'crates/a/src/gone.rs' = 9\n"
+             'crates/a/src/gone.rs' = 9\n\"crates/a/src/added.rs\" = 6\n\
+             \"crates/a/src/raised.rs\" = 7\n"
                 .to_owned(),
         ),
+        ("crates/a/src/added.rs", code(6)),
+        ("crates/a/src/raised.rs", code(7)),
         ("crates/a/src/grew.rs", code(7)),
         ("crates/b/src/new.rs", code(6)),
     ]);
@@ -677,8 +1036,13 @@ fn rdjson_document() {
         })
     };
 
+    let base = baseline(&[
+        ("crates/a/src/gone.rs", 9),
+        ("crates/a/src/grew.rs", 6),
+        ("crates/a/src/raised.rs", 6),
+    ]);
     assert_eq!(
-        rdjson(ws.path()),
+        rdjson(ws.path(), Some(&base)),
         json!({
             "source": {"name": "archcheck"},
             "diagnostics": [
@@ -686,6 +1050,17 @@ fn rdjson_document() {
                     "crates/b/src/new.rs: 6 code lines, over the 5-line limit (comments and blank \
                      lines are not counted). Split it into submodules by responsibility.",
                     "crates/b/src/new.rs", 1, "ERROR", "no_crossing",
+                ),
+                diagnostic(
+                    "crates/a/src/added.rs is in architecture-baseline.toml but not in the base \
+                     branch's copy; files over the 5-line limit can't be added (a renamed file \
+                     counts as added). Split the file instead.",
+                    "architecture-baseline.toml", 7, "WARNING", "no_new_entries",
+                ),
+                diagnostic(
+                    "crates/a/src/raised.rs: cap raised from 6 to 7 in architecture-baseline.toml; \
+                     caps should only go down. Split the file instead.",
+                    "architecture-baseline.toml", 8, "WARNING", "no_raised_caps",
                 ),
                 diagnostic(
                     "crates/a/src/grew.rs grew from 6 to 7 code lines. Once this rule is \
@@ -719,7 +1094,7 @@ fn rdjson_paths_are_exact() {
     ];
     let ws = workspace(&names.map(|name| (name, code(LIMIT + 1))));
 
-    let document = rdjson(ws.path());
+    let document = rdjson(ws.path(), None);
 
     let mut paths: Vec<&str> = document["diagnostics"]
         .as_array()
@@ -738,7 +1113,7 @@ fn rdjson_on_stdout_and_the_summary_on_stderr() {
     let ws = workspace(&[
         (
             "ARCHITECTURE.toml",
-            config("required", "advisory", "advisory"),
+            config(["required", "advisory", "advisory", "advisory", "advisory"]),
         ),
         ("crates/b/src/new.rs", code(6)),
     ]);
@@ -751,6 +1126,8 @@ fn rdjson_on_stdout_and_the_summary_on_stderr() {
     assert_eq!(
         run.stderr,
         "archcheck: 1 finding (0 advisory, 1 required; 1 production Rust files checked)\n"
+            .to_owned()
+            + SKIPPED
     );
 }
 
@@ -769,6 +1146,21 @@ fn arguments() {
         ),
         (&["--format", "github"], 2, "archcheck: unknown format"),
         (&["--format"], 2, "archcheck: --format needs a value"),
+        (
+            &["--base-baseline"],
+            2,
+            "archcheck: --base-baseline needs a value",
+        ),
+        (
+            &["--write-baseline", "--base-baseline", "base.toml"],
+            2,
+            "archcheck: --base-baseline cannot be combined with --write-baseline",
+        ),
+        (
+            &["--base-baseline=base.toml", "--write-baseline"],
+            2,
+            "archcheck: --base-baseline cannot be combined",
+        ),
         (
             &["--bogus"],
             2,
@@ -804,7 +1196,7 @@ fn arguments() {
         if matches!(args[0], "-h" | "--help") {
             assert!(
                 run.stdout.starts_with("usage: archcheck [--root <path>]")
-                    && run.stdout.ends_with("tree\n"),
+                    && run.stdout.ends_with("never adds one\n"),
                 "{args:?}: {}",
                 run.stdout
             );

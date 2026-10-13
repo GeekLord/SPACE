@@ -10,7 +10,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::{
-    baseline::{BASELINE_FILE, Baseline},
+    baseline::{BASELINE_FILE, BaseBaseline, Baseline},
     config::{ArchitectureConfig, CONFIG_FILE},
 };
 
@@ -67,6 +67,9 @@ pub struct ProductionFile {
 pub struct Context {
     pub config: ArchitectureConfig,
     pub baseline: Baseline,
+    /// Behaviours that compare with the base branch's baseline are skipped
+    /// unless it is [`BaseBaseline::Loaded`].
+    pub base_baseline: BaseBaseline,
     /// Every production Rust file of the root `Cargo.toml`'s workspace
     /// members, sorted by path.
     pub files: Vec<ProductionFile>,
@@ -85,6 +88,7 @@ impl Context {
         Ok(Self {
             config,
             baseline,
+            base_baseline: BaseBaseline::NotGiven,
             files,
         })
     }
@@ -136,7 +140,7 @@ pub fn count_code_lines(text: &str) -> usize {
         .count()
 }
 
-fn read(path: &Path) -> Result<String, LoadError> {
+pub(crate) fn read(path: &Path) -> Result<String, LoadError> {
     std::fs::read_to_string(path).map_err(|source| LoadError::Read {
         path: path.to_path_buf(),
         source,
