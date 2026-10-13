@@ -35,7 +35,7 @@ fn unpinned(job: Option<(Uuid, u64)>) -> LocalEvidence {
 #[test]
 fn decide_skips_without_ready_backup() {
     assert_eq!(
-        decide(None, &pinned(true), 0),
+        decide(None, &unpinned(Some((v7(1_000), 0))), 0),
         PreDecision::Skip(SkipReason::NoReadyBackup)
     );
 }
@@ -44,11 +44,7 @@ fn decide_skips_without_ready_backup() {
 #[test]
 fn decide_evicts_pinned_with_backup_marker() {
     assert_eq!(
-        decide(
-            Some(SnapshotId::from_uuid(v7(2_000))),
-            &pinned(true),
-            u64::MAX
-        ),
+        decide(None, &pinned(true), u64::MAX),
         PreDecision::Evict(EvictReason::LatestBackedIdle)
     );
 }
@@ -57,10 +53,7 @@ fn decide_evicts_pinned_with_backup_marker() {
 /// the cluster — never fall back to job/generation comparison.
 #[test]
 fn decide_demands_exact_proof_for_unmarked_pin() {
-    assert_eq!(
-        decide(Some(SnapshotId::from_uuid(v7(2_000))), &pinned(false), 0),
-        PreDecision::ProvePinned
-    );
+    assert_eq!(decide(None, &pinned(false), 0), PreDecision::ProvePinned);
 }
 
 /// **Reviewer regression**: current artifact unbacked (pin present,
@@ -1085,6 +1078,209 @@ fn gather_evidence_distinguishes_pinned_and_unpinned() {
         );
         assert_eq!(suspend_time_witness(&evidence), None, "{timestamp}");
     }
+}
+
+#[derive(Clone)]
+struct BackupProofServer {
+    requests: std::sync::Arc<
+        std::sync::Mutex<Vec<pplx_space_node_api_client::proto::GetArtifactBackupLocationRequest>>,
+    >,
+    reply: std::sync::Arc<
+        std::sync::Mutex<
+            Result<
+                pplx_space_node_api_client::proto::GetArtifactBackupLocationResponse,
+                tonic::Code,
+            >,
+        >,
+    >,
+}
+
+impl tonic::server::NamedService for BackupProofServer {
+    const NAME: &'static str = "space.node.api.v1.ClusterApi";
+}
+
+impl
+    tonic::server::UnaryService<pplx_space_node_api_client::proto::GetArtifactBackupLocationRequest>
+    for BackupProofServer
+{
+    type Response = pplx_space_node_api_client::proto::GetArtifactBackupLocationResponse;
+    type Future = std::future::Ready<Result<tonic::Response<Self::Response>, tonic::Status>>;
+
+    fn call(
+        &mut self,
+        request: tonic::Request<
+            pplx_space_node_api_client::proto::GetArtifactBackupLocationRequest,
+        >,
+    ) -> Self::Future {
+        self.requests.lock().unwrap().push(request.into_inner());
+        std::future::ready(match self.reply.lock().unwrap().clone() {
+            Ok(response) => Ok(tonic::Response::new(response)),
+            Err(code) => Err(tonic::Status::new(code, "synthetic proof failure")),
+        })
+    }
+}
+
+impl<B> tower::Service<http::Request<B>> for BackupProofServer
+where
+    B: http_body::Body + Send + 'static,
+    B::Error: Into<tonic::codegen::StdError> + Send + 'static,
+{
+    type Response = http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future = futures_util::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        // The suspend-location RPC is placement-scoped and off limits to a
+        // former host; proofs go only through readiness queries.
+        assert!(request.uri().path().ends_with("/GetArtifactBackupLocation"));
+        let service = self.clone();
+        Box::pin(async move {
+            let mut grpc = tonic::server::Grpc::new(tonic_prost::ProstCodec::default());
+            Ok(grpc.unary(service, request).await)
+        })
+    }
+}
+
+#[tokio::test]
+async fn eviction_proofs_use_known_identities_and_fail_closed() {
+    use pplx_space_node_api_client::proto::{
+        BackupReadinessQuery, GetArtifactBackupLocationRequest, GetArtifactBackupLocationResponse,
+        LocalArtifactBackupIdentity, backup_readiness_query::Artifact,
+    };
+    use std::ffi::OsStr;
+
+    if !pplx_space_test_env::enter_test_process(&[(
+        "SPACE_INTERNAL_RPC_INSECURE_DEV",
+        Some(OsStr::new("1")),
+    )]) {
+        return;
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let mock = BackupProofServer {
+        requests: Default::default(),
+        reply: std::sync::Arc::new(std::sync::Mutex::new(Err(tonic::Code::Internal))),
+    };
+    let stop = tokio_util::sync::CancellationToken::new();
+    let server = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(mock.clone())
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                stop.clone().cancelled_owned(),
+            ),
+    );
+    let mut client =
+        pplx_space_node_api_client::cluster::connect(endpoint, "synthetic-proof-token")
+            .await
+            .unwrap();
+    let sandbox_id = pplx_space_common_core::types::SandboxId::new().to_string();
+
+    for marker in [true, false] {
+        assert_eq!(
+            ready_unpinned_suspend_generation(&mut client, &sandbox_id, &pinned(marker)).await,
+            Ok(None)
+        );
+    }
+    assert!(
+        mock.requests.lock().unwrap().is_empty(),
+        "pinned caches must skip the latest-suspend query"
+    );
+
+    // The identity rides only inside `readiness`, so a server that predates
+    // it sees an empty artifact id. Only a bare acknowledgement is proof.
+    let readiness = |artifact| GetArtifactBackupLocationRequest {
+        sandbox_id: sandbox_id.clone(),
+        readiness: Some(BackupReadinessQuery {
+            artifact: Some(artifact),
+        }),
+        ..Default::default()
+    };
+    let bare = |ready| GetArtifactBackupLocationResponse {
+        ready,
+        ..Default::default()
+    };
+    let location = GetArtifactBackupLocationResponse {
+        backup_attempt_id: SnapshotId::new().to_string(),
+        storage_uri: "s3://synthetic-backups/attempt".to_string(),
+        ..Default::default()
+    };
+    for (reply, expected) in [
+        (Ok(bare(Some(true))), Ok(true)),
+        (Ok(bare(Some(false))), Ok(false)),
+        (Ok(bare(None)), Err(SkipReason::RpcError)),
+        (Ok(location.clone()), Err(SkipReason::RpcError)),
+        (
+            Ok(GetArtifactBackupLocationResponse {
+                ready: Some(true),
+                ..location.clone()
+            }),
+            Err(SkipReason::RpcError),
+        ),
+        // An older server rejects the empty artifact id; an even older one
+        // lacks the RPC. Neither retries as a location read.
+        (Err(tonic::Code::InvalidArgument), Err(SkipReason::RpcError)),
+        (Err(tonic::Code::Unimplemented), Err(SkipReason::RpcError)),
+        (
+            Err(tonic::Code::Unavailable),
+            Err(SkipReason::RpcTransportError),
+        ),
+    ] {
+        *mock.reply.lock().unwrap() = reply;
+        let conn = open_test_db();
+        let artifact_id = LocalArtifactId::new();
+        insert_sandbox(&conn, &sandbox_id, "suspended", 0);
+        insert_pinned_artifact(&conn, &sandbox_id, &artifact_id.to_string(), None);
+        let service = SandboxManagerService::for_test(conn);
+        let pin = PinnedArtifact {
+            artifact_id,
+            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            backup_marker: false,
+        };
+        let proof = prove_pinned_artifact(&mut client, &service, &sandbox_id, &pin).await;
+        assert_eq!(proof, expected);
+        let (evidence, _) = {
+            let conn = service.db_conn().unwrap();
+            gather_local_evidence(&conn, &sandbox_id).unwrap().unwrap()
+        };
+        assert!(
+            matches!(evidence, LocalEvidence::Pinned(PinnedArtifact { backup_marker, .. }) if backup_marker == (expected == Ok(true)))
+        );
+        assert_eq!(
+            mock.requests.lock().unwrap().pop().unwrap(),
+            readiness(Artifact::LocalArtifact(LocalArtifactBackupIdentity {
+                local_artifact_id: artifact_id.to_string(),
+                artifact_kind: pplx_space_sbx_mgr_client::proto::ArtifactKind::Full as i32,
+            }))
+        );
+
+        let generation = SnapshotId::from_uuid(v7(1_000));
+        let unpinned_cache = unpinned(Some((generation.as_uuid(), 0)));
+        assert_eq!(
+            ready_unpinned_suspend_generation(&mut client, &sandbox_id, &unpinned_cache).await,
+            expected.map(|ready| ready.then_some(generation))
+        );
+        assert_eq!(
+            mock.requests.lock().unwrap().pop().unwrap(),
+            readiness(Artifact::LatestReadySuspendSnapshotId(
+                generation.to_string()
+            ))
+        );
+    }
+    drop(client);
+    stop.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .expect("proof server did not stop")
+        .unwrap()
+        .unwrap();
 }
 
 #[test]
