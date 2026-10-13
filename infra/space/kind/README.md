@@ -345,7 +345,9 @@ alongside it.
 Rust workloads send metrics to
 `http://collector.space-metrics.svc.cluster.local:4317` and traces to
 `http://collector.space-traces.svc.cluster.local:4317` over plaintext
-OTLP/gRPC. To use other receivers, override `telemetry.otlpMetricsEndpoint`
+OTLP/gRPC. sandbox-manager is the exception: it forwards its endpoints to the
+net-gateway and spaced-host processes it launches on the node, outside cluster
+DNS, so it uses the shim's node-reachable addresses instead. To use other receivers, override `telemetry.otlpMetricsEndpoint`
 and `telemetry.otlpTracesEndpoint` in the workload Helm values. Endpoint and
 protocol environment variables are per-signal and emitted only for OTLP
 exporters. Logs stay on stdout for Alloy to collect; no log endpoint is needed.
@@ -360,8 +362,12 @@ Agent entirely for metrics and traces — it needs the Collectors installed,
 not an Agent. Pair them only when you want a side-by-side comparison.
 
 There is no dual-publish or non-counter mode. The `otel` mode uses `always_on`
-diagnostic trace sampling, not the production sampling policy. Logs remain
-structured JSON on stdout in every mode; there is no OTLP log exporter.
+diagnostic trace sampling, not the production sampling policy, and exports the
+Rust services' metrics cumulative rather than production's delta, so the
+metrics Collector has no idle stream to forget; the shim's stay delta
+([Collector requirements](../../../docs/observability.md#collector-requirements)).
+Logs remain structured JSON on stdout in every mode; there is no OTLP log
+exporter.
 
 `SPACE_KIND_DATADOG_MODE` defaults to `off`, even when `DD_API_KEY` is set.
 **`off` and stopping Tilt do not stop an existing Agent's export.** Use the
