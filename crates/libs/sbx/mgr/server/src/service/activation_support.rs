@@ -1211,9 +1211,9 @@ where
     // reconcile against the live gateway, so the gate need not — and must not,
     // to avoid a stale-ref mismatch failing the start — assert the latest ref
     // here.
-    let policy_task = readiness
-        .policy
-        .map(|policy| tokio_util::task::AbortOnDropHandle::new(tokio::spawn(policy)));
+    let policy_task = readiness.policy.map(|policy| {
+        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(policy.in_current_span()))
+    });
 
     // Bound the start on the guest-readiness deadline. If the guest fails (a
     // fast error or the ready_timeout), return without waiting for the policy
@@ -1534,25 +1534,33 @@ pub(super) fn spawn_resume_clock_sync(
     // Intentionally outside lifecycle drain: this five-second best-effort
     // notification invalidates host readiness and updates the guest clock,
     // but never writes manager lifecycle persistence. Shutdown may abandon it.
-    tokio::spawn(async move {
-        match notify_resume_clock_sync_best_effort(&sandbox_id, reason).await {
-            Ok(()) => {
-                tracing::debug!(
-                    sandbox_id,
-                    operation,
-                    "guest clock sync notification completed after resume"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    sandbox_id,
-                    operation,
-                    %error,
-                    "guest clock sync notification failed after resume"
-                );
+    let span_sandbox_id = sandbox_id.clone();
+    tokio::spawn(
+        async move {
+            match notify_resume_clock_sync_best_effort(&sandbox_id, reason).await {
+                Ok(()) => {
+                    tracing::debug!(
+                        sandbox_id,
+                        operation,
+                        "guest clock sync notification completed after resume"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        sandbox_id,
+                        operation,
+                        %error,
+                        "guest clock sync notification failed after resume"
+                    );
+                    super::drain::record_detached_failure(&error.to_string());
+                }
             }
         }
-    });
+        .instrument(super::drain::detached_trace_span(
+            "ResumeClockSync",
+            &span_sandbox_id,
+        )),
+    );
 }
 
 pub(super) struct StartStateTransition {
@@ -1578,7 +1586,8 @@ pub(super) fn spawn_wait_ready_state_transition(
         apply_network_policy,
         cleanup_id,
     } = transition;
-    spawn_guarded_start_state_transition(service, cleanup_guard, async move {
+    let span_sandbox_id = sandbox_id.clone();
+    spawn_guarded_start_state_transition(service, &span_sandbox_id, cleanup_guard, async move {
         let result = wait_ready_and_mark_started(
             db.clone(),
             &sandbox_id,
@@ -1598,13 +1607,17 @@ pub(super) fn spawn_wait_ready_state_transition(
 
 fn spawn_guarded_start_state_transition(
     service: &SandboxManagerService,
+    sandbox_id: &str,
     mut cleanup_guard: ActivationCleanupGuard,
     transition: impl std::future::Future<Output = Result<(), Status>> + Send + 'static,
 ) -> Result<(), Status> {
-    service.spawn_state_writer("StartFinalizer", async move {
+    service.spawn_detached_state_writer("StartFinalizer", sandbox_id, async move {
         match transition.await {
             Ok(()) => cleanup_guard.complete_success(),
-            Err(error) => cleanup_guard.record_failure(&error),
+            Err(error) => {
+                super::drain::record_detached_failure(error.message());
+                cleanup_guard.record_failure(&error);
+            }
         }
     })?;
     Ok(())
@@ -1621,7 +1634,8 @@ pub(super) fn spawn_restore_state_transition(
 ) -> Result<(), Status> {
     let db = Arc::clone(&service.db);
     let node_manager = service.node_manager.clone();
-    service.spawn_state_writer("RestoreFinalizer", async move {
+    let span_sandbox_id = sandbox_id.clone();
+    service.spawn_detached_state_writer("RestoreFinalizer", &span_sandbox_id, async move {
         match complete_restore_and_mark_final(
             db.clone(),
             &sandbox_id,
@@ -1639,6 +1653,7 @@ pub(super) fn spawn_restore_state_transition(
             }
             Err(error) => {
                 tracing::warn!(sandbox_id, state = %final_state, %error, "restore final-state transition failed");
+                super::drain::record_detached_failure(error.message());
                 cleanup_guard.record_failure(&error);
             }
         }
