@@ -4,14 +4,25 @@ from __future__ import annotations
 
 import time
 import uuid
+from dataclasses import dataclass, field
 
 from space_smoke.capabilities import KindEnvironment
 from space_smoke.runtime import ScenarioContext, SmokeConfigurationError
 
 
+@dataclass(frozen=True)
+class ByokIdentity:
+    """A run-owned BYOK member and the password-login it was created with."""
+
+    org_id: str
+    user_id: str
+    email: str
+    password: str = field(repr=False)
+
+
 def prepare_byok_identity(
     context: ScenarioContext, kind: KindEnvironment,
-) -> tuple[str, str]:
+) -> ByokIdentity:
     """Enroll an owned organization through the admin API; never toggle Local.
 
     Kind's credential authority lazily provisions the org's KEK through its
@@ -86,9 +97,10 @@ def prepare_byok_identity(
     org = kind.admin_request("PATCH", f"orgs/{org_id}", {"byok_enabled": True})
     if not isinstance(org, dict) or org.get("id") != org_id or org.get("byok_enabled") is not True:
         raise SmokeConfigurationError("BYOK enrollment was not confirmed")
+    password = uuid.uuid4().hex + "Aa1!"
     user_pending = True
     user = kind.admin_request("POST", f"orgs/{org_id}/users", {
-        "email": email, "password": uuid.uuid4().hex + "Aa1!",
+        "email": email, "password": password,
         "display_name": slug, "role": "member",
     })
     if not isinstance(user, dict) or not isinstance(user.get("id"), str):
@@ -96,4 +108,4 @@ def prepare_byok_identity(
     user_id = user["id"]
     user_pending = False
     evidence["user_id"] = user_id
-    return org_id, user_id
+    return ByokIdentity(org_id, user_id, email, password)
