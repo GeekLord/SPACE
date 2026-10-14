@@ -181,6 +181,7 @@ fn sample_hash() -> ContentHash {
 fn sample_template_request() -> RegisterRequest {
     RegisterRequest::Template(RegisterTemplateRequest {
         system_publication_grant_id: None,
+        tenant_publication_grant_id: None,
         name: sample_template().as_str().to_string(),
         description: None,
         org_id: None,
@@ -277,18 +278,33 @@ async fn publication_converges_on_tags_only_when_the_release_is_published_meanwh
 fn registration_requests_carry_publication_authority() {
     let org_id = "00000000-0000-0000-0000-000000000003";
     let grant_id = "018f0000-0000-7000-8000-000000000004";
-    for (publication, expected_org, expected_grant) in [
+    let tenant_grant_id = "018f0000-0000-7000-8000-000000000005";
+    for (publication, expected_org, expected_grant, expected_tenant_grant) in [
         (
-            TemplatePublication::Tenant(TemplateOrg::parse(org_id).unwrap()),
+            TemplatePublication::Tenant {
+                org: TemplateOrg::parse(org_id).unwrap(),
+                grant: Some(tenant_grant_id.parse().unwrap()),
+            },
             Some(org_id),
+            None,
+            Some(tenant_grant_id),
+        ),
+        (
+            TemplatePublication::Tenant {
+                org: TemplateOrg::parse(org_id).unwrap(),
+                grant: None,
+            },
+            Some(org_id),
+            None,
             None,
         ),
         (
             TemplatePublication::System(Some(grant_id.parse().unwrap())),
             None,
             Some(grant_id),
+            None,
         ),
-        (TemplatePublication::System(None), None, None),
+        (TemplatePublication::System(None), None, None, None),
     ] {
         let template = template_registration_request(&sample_template(), publication);
         let release = release_registration_request(
@@ -309,12 +325,21 @@ fn registration_requests_carry_publication_authority() {
             release.system_publication_grant_id.as_deref(),
             expected_grant
         );
+        assert_eq!(
+            template.tenant_publication_grant_id.as_deref(),
+            expected_tenant_grant
+        );
+        assert_eq!(
+            release.tenant_publication_grant_id.as_deref(),
+            expected_tenant_grant
+        );
     }
 }
 
 fn sample_release_request() -> RegisterRequest {
     RegisterRequest::Release(RegisterTemplateReleaseRequest {
         system_publication_grant_id: None,
+        tenant_publication_grant_id: None,
         template_name: sample_template().as_str().to_string(),
         runtime: RUNTIME_FIRECRACKER_ALIAS.to_string(),
         hash: sample_hash().to_string(),
@@ -476,4 +501,32 @@ fn storage_uri_keeps_explicit_path_style_override() {
 
     assert_eq!(parsed.endpoint.as_deref(), Some("https://minio.internal"));
     assert!(!parsed.path_style);
+}
+
+#[test]
+fn publication_retry_requires_explicit_no_commit_proof() {
+    for request in [sample_template_request(), sample_release_request()] {
+        for (code, marker, retry) in [
+            (Code::Unavailable, Some("1"), true),
+            (Code::Unavailable, None, false),
+            (Code::Unavailable, Some("unknown"), false),
+            (Code::Internal, Some("1"), false),
+            (Code::DeadlineExceeded, Some("1"), false),
+        ] {
+            let mut status = tonic::Status::new(code, "publication outcome");
+            if let Some(marker) = marker {
+                status
+                    .metadata_mut()
+                    .insert("space-publication-not-committed", marker.parse().unwrap());
+            }
+            let mut schedule = RegisterRetrySchedule::new();
+            assert_eq!(schedule.next_delay(&request, &status).is_some(), retry);
+            if retry {
+                for _ in 1..REGISTER_RETRY_BACKOFF.len() {
+                    assert!(schedule.next_delay(&request, &status).is_some());
+                }
+                assert!(schedule.next_delay(&request, &status).is_none());
+            }
+        }
+    }
 }

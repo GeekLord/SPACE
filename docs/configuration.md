@@ -194,6 +194,29 @@ jobs that could not be drained: jobs without a grant cannot publish through a
 dual-authority account after the rollout. System-only deployment publishers
 retain their existing publication authority.
 
+Tenant publication grants are in a preparation phase. Before dispatching an
+organization's build, the API records a grant naming the target template and
+organization, sends it with `StartBuild`, and pins it to the accepting builder.
+Failed acceptance revokes that submission's grant. Build-manager persists and
+forwards the optional grant to template and release registration.
+
+ClusterApi still uses the existing tenant publisher and ownership checks. It
+accepts publications both with and without the new field and does not consume
+tenant grants yet. Older gateways/builders may drop the field during a rolling
+upgrade; older queued jobs and direct tenant CLI submissions still work.
+System publication grants remain enforced as before.
+
+Apply the grant-table migration and role bootstrap before deploying the new
+API. After that prerequisite, the API, ClusterApi, node-api, and build-manager
+can roll in any order. Existing grants expire and are swept on new submissions.
+This preparation release does not complete tenant publication hardening.
+
+Before deploying a later enforcement release, finish upgrading every API,
+gateway, and builder, then drain or resubmit jobs accepted before that upgrade.
+Verify tenant builds carry grants end to end. Rollback after enforcement must
+preserve grant-producing and forwarding components until enforcement is removed;
+keep the additive schema in place.
+
 ### Template balloon device
 
 A template can opt its sandboxes into a Firecracker
@@ -226,6 +249,7 @@ Hint mode also needs `balloon_hint_timeout_ms` (at most 30000) in the node's
 free-page hinting then runs one hinting pass bounded by this time; timeouts and
 errors are logged and the snapshot proceeds. Unset, suspend makes no balloon
 calls.
+
 
 ## Object storage and snapshots
 

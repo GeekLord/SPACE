@@ -43,6 +43,7 @@ fn request<T>(body: T, account: &str) -> Request<T> {
 fn registration(name: &str, org: Option<Uuid>) -> RegisterTemplateRequest {
     RegisterTemplateRequest {
         system_publication_grant_id: None,
+        tenant_publication_grant_id: None,
         name: name.into(),
         description: None,
         org_id: org.map(|v| v.to_string()),
@@ -52,6 +53,7 @@ fn registration(name: &str, org: Option<Uuid>) -> RegisterTemplateRequest {
 fn release(name: &str, org: Option<Uuid>) -> RegisterTemplateReleaseRequest {
     RegisterTemplateReleaseRequest {
         system_publication_grant_id: None,
+        tenant_publication_grant_id: None,
         template_name: name.into(),
         org_id: org.map(|v| v.to_string()),
         runtime: "fc".into(),
@@ -84,8 +86,12 @@ async fn system_publication_grants(pool: &sqlx::PgPool, template: &str) -> TestR
     .await?)
 }
 
-#[test]
-fn authenticated_publication_enforces_identity_owner_and_reserved_outputs() -> TestResult {
+/// Run `scenario` in a child process whose ClusterApi authenticates through a
+/// local TokenReview server.
+fn in_publication_process<F>(scenario: impl FnOnce() -> F) -> TestResult
+where
+    F: std::future::Future<Output = TestResult>,
+{
     let env = [
         ("SPACE_K8S_TOKEN_AUTH_ENABLED", "true"),
         // This table exercises authorization, not the separately tested rate limiter.
@@ -121,68 +127,166 @@ fn authenticated_publication_enforces_identity_owner_and_reserved_outputs() -> T
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(run())
+        .block_on(scenario())
+}
+
+/// A ClusterApi behind the production auth layers, reached from 127.0.0.1.
+struct PublicationServer {
+    db: pplx_space_db_test_fixtures::TestDb,
+    client: ClusterApiClient<tonic::transport::Channel>,
+    shutdown: CancellationToken,
+    server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    reviewer: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+impl PublicationServer {
+    async fn start() -> TestResult<Self> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let config = std::path::PathBuf::from(
+            std::env::var_os("KUBECONFIG").expect("test child kubeconfig path"),
+        );
+        std::fs::write(&config, kubeconfig_for_endpoint(listener.local_addr()?))?;
+        let shutdown = CancellationToken::new();
+        // The review response, not the unverified bearer claims, establishes identity.
+        let tokens = [
+            "workers",
+            "space-api",
+            "space-build-manager",
+            "space-template-publish",
+        ]
+        .map(|name| (token(name), name));
+        let reviewer = tokio::spawn(serve_token_reviews(
+            listener,
+            move |review| match tokens
+                .iter()
+                .find(|(token, _)| review.token.as_deref() == Some(token.as_str()))
+            {
+                Some((_, name)) => service_account_status(
+                    "space-cluster-api",
+                    &format!("system:serviceaccount:space:{name}"),
+                ),
+                None => TokenReviewStatus {
+                    authenticated: Some(false),
+                    ..Default::default()
+                },
+            },
+            shutdown.clone(),
+        ));
+        let service_pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_with(
+                (*db.pool.connect_options())
+                    .clone()
+                    .options([("lock_timeout", "100ms")]),
+            )
+            .await?;
+        let mut service = ClusterApiService::new(service_pool);
+        service.reserved_template_names =
+            crate::template_publication::ReservedTemplateNames::from_env()?;
+        let outer = auth::NodeApiAuthLayer::from_config(auth::NodeApiAuthConfig::from_env(
+            auth::NodeRole::Cluster,
+            "shared-token".into(),
+            None,
+        )?)
+        .await?;
+        let publisher = BuildAuthLayer::for_template_publication("shared-token".into()).await?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let server_shutdown = shutdown.clone();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .layer(outer)
+                .layer(publisher)
+                .add_service(ClusterApiServer::new(service))
+                .serve_with_incoming_shutdown(
+                    TcpListenerStream::new(listener),
+                    server_shutdown.cancelled_owned(),
+                )
+                .await
+        });
+        let client = ClusterApiClient::connect(endpoint).await?;
+        Ok(Self {
+            db,
+            client,
+            shutdown,
+            server,
+            reviewer,
+        })
+    }
+
+    async fn finish(self) -> TestResult {
+        drop(self.client);
+        self.shutdown.cancel();
+        self.server.await??;
+        self.reviewer.await??;
+        drop(self.db);
+        Ok(())
+    }
+}
+
+#[test]
+fn authenticated_publication_enforces_identity_owner_and_reserved_outputs() -> TestResult {
+    in_publication_process(run)
+}
+
+#[rstest::rstest]
+#[case::older_builder(false)]
+#[case::grant_forwarding_builder(true)]
+fn tenant_publication_preparation_accepts_both_wire_versions(
+    #[case] with_grant: bool,
+) -> TestResult {
+    in_publication_process(|| async move {
+        let mut fixture = PublicationServer::start().await?;
+        let owner = pplx_space_db_test_fixtures::SEED_ORG_ID;
+        let grant = Uuid::now_v7();
+        sqlx::query(sql!(
+            "INSERT INTO template_tenant_publication_grants (id, template_name, org_id)
+             VALUES ($1, 'rolling-output', $2)"
+        ))
+        .bind(grant)
+        .bind(owner)
+        .execute(&fixture.db.pool)
+        .await?;
+        let mut template = registration("rolling-output", Some(owner));
+        let mut publication = release("rolling-output", Some(owner));
+        template.tenant_publication_grant_id = with_grant.then(|| grant.to_string());
+        publication.tenant_publication_grant_id = template.tenant_publication_grant_id.clone();
+
+        fixture
+            .client
+            .register_template(request(template, "space-build-manager"))
+            .await?;
+        fixture
+            .client
+            .register_template_release(request(publication, "space-build-manager"))
+            .await?;
+
+        let published: (Uuid, String) = sqlx::query_as(sql!(
+            "SELECT r.org_id, r.hash FROM template_release_tags t
+             JOIN template_releases r ON r.id = t.template_release_id
+             WHERE t.template_name = 'rolling-output' AND t.tag = 'latest'"
+        ))
+        .fetch_one(&fixture.db.pool)
+        .await?;
+        assert_eq!(
+            published,
+            (owner, release("rolling-output", Some(owner)).hash)
+        );
+        let retained: bool = sqlx::query_scalar(sql!(
+            "SELECT EXISTS (SELECT 1 FROM template_tenant_publication_grants WHERE id = $1)"
+        ))
+        .bind(grant)
+        .fetch_one(&fixture.db.pool)
+        .await?;
+        assert!(retained, "preparation does not consume publication grants");
+        fixture.finish().await
+    })
 }
 
 async fn run() -> TestResult {
-    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let config = std::path::PathBuf::from(
-        std::env::var_os("KUBECONFIG").expect("test child kubeconfig path"),
-    );
-    std::fs::write(&config, kubeconfig_for_endpoint(listener.local_addr()?))?;
-    let shutdown = CancellationToken::new();
-    let _guard = shutdown.clone().drop_guard();
-    // The review response, not the unverified bearer claims, establishes identity.
-    let tokens = [
-        "workers",
-        "space-api",
-        "space-build-manager",
-        "space-template-publish",
-    ]
-    .map(|name| (token(name), name));
-    let reviewer = tokio::spawn(serve_token_reviews(
-        listener,
-        move |review| match tokens
-            .iter()
-            .find(|(token, _)| review.token.as_deref() == Some(token.as_str()))
-        {
-            Some((_, name)) => service_account_status(
-                "space-cluster-api",
-                &format!("system:serviceaccount:space:{name}"),
-            ),
-            None => TokenReviewStatus {
-                authenticated: Some(false),
-                ..Default::default()
-            },
-        },
-        shutdown.clone(),
-    ));
-    let mut service = ClusterApiService::new(db.pool.clone());
-    service.reserved_template_names =
-        crate::template_publication::ReservedTemplateNames::from_env()?;
-    let outer = auth::NodeApiAuthLayer::from_config(auth::NodeApiAuthConfig::from_env(
-        auth::NodeRole::Cluster,
-        "shared-token".into(),
-        None,
-    )?)
-    .await?;
-    let publisher = BuildAuthLayer::for_template_publication("shared-token".into()).await?;
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let endpoint = format!("http://{}", listener.local_addr()?);
-    let server_shutdown = shutdown.clone();
-    let server = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .layer(outer)
-            .layer(publisher)
-            .add_service(ClusterApiServer::new(service))
-            .serve_with_incoming_shutdown(
-                TcpListenerStream::new(listener),
-                server_shutdown.cancelled_owned(),
-            )
-            .await
-    });
-    let mut client = ClusterApiClient::connect(endpoint).await?;
+    let mut fixture = PublicationServer::start().await?;
+    let db = &fixture.db;
+    let client = &mut fixture.client;
     let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000002")?;
     let foreign = Uuid::parse_str("00000000-0000-0000-0000-000000000003")?;
     for account in ["workers", "space-api"] {
@@ -572,9 +676,5 @@ async fn run() -> TestResult {
     let (stored_owner, hash): (Uuid,String) = sqlx::query_as(sql!("SELECT t.org_id, r.hash FROM templates t JOIN template_release_tags tag ON tag.template_name=t.name JOIN template_releases r ON r.id=tag.template_release_id WHERE t.name='tenant-output' AND tag.tag='latest'")).fetch_one(&db.pool).await?;
     assert_eq!(stored_owner, owner);
     assert_eq!(hash, release("tenant-output", Some(owner)).hash);
-    drop(client);
-    shutdown.cancel();
-    server.await??;
-    reviewer.await??;
-    Ok(())
+    fixture.finish().await
 }

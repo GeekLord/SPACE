@@ -305,6 +305,7 @@ async fn accepted_build_pins_only_its_own_base_grant(
             None,
             without_identity,
             Some(first),
+            None,
         )
         .await
         .unwrap();
@@ -313,7 +314,14 @@ async fn accepted_build_pins_only_its_own_base_grant(
     let (_, on_builder) = accepted_build(Some(fixture.builder_node_id));
     fixture
         .controller
-        .record_template_build_response(TEST_ORG, child.clone(), None, on_builder, Some(first))
+        .record_template_build_response(
+            TEST_ORG,
+            child.clone(),
+            None,
+            on_builder,
+            Some(first),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -337,6 +345,7 @@ async fn accepted_build_pins_only_its_own_base_grant(
             None,
             on_other_builder,
             Some(second),
+            None,
         )
         .await
         .unwrap();
@@ -353,7 +362,7 @@ async fn accepted_build_pins_only_its_own_base_grant(
     let (_, from_scratch) = accepted_build(Some(other_builder));
     fixture
         .controller
-        .record_template_build_response(TEST_ORG, child.clone(), None, from_scratch, None)
+        .record_template_build_response(TEST_ORG, child.clone(), None, from_scratch, None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -471,7 +480,7 @@ async fn accepted_build_without_builder_identity_records_unpinned_routing(
 
     let actual = fixture
         .controller
-        .record_template_build_response(TEST_ORG, template_name.clone(), None, response, None)
+        .record_template_build_response(TEST_ORG, template_name.clone(), None, response, None, None)
         .await
         .expect("an old Node API response should preserve the accepted build");
     let job = fixture
@@ -497,7 +506,7 @@ async fn accepted_build_with_builder_identity_records_routing(
 
     let actual = fixture
         .controller
-        .record_template_build_response(TEST_ORG, template_name.clone(), None, response, None)
+        .record_template_build_response(TEST_ORG, template_name.clone(), None, response, None, None)
         .await
         .unwrap();
     let job = fixture
@@ -530,6 +539,7 @@ async fn accepted_e2b_build_records_client_build_mapping(
             Some(&client_build_id),
             response,
             None,
+            None,
         )
         .await?;
     let job = fixture
@@ -553,7 +563,7 @@ async fn accepted_build_with_invalid_builder_identity_is_rejected(
 
     let actual = fixture
         .controller
-        .record_template_build_response(TEST_ORG, template_name.clone(), None, response, None)
+        .record_template_build_response(TEST_ORG, template_name.clone(), None, response, None, None)
         .await
         .unwrap_err();
     let job = fixture
@@ -658,10 +668,10 @@ fn template_build_status_not_found_is_not_transient() {
     );
 }
 
-/// A system build records its publication grant before dispatch and withdraws
+/// Every build records its publication grant before dispatch and withdraws
 /// it when dispatch fails, so a submission that never reached a builder
-/// authorizes no publication; an organization build records none. Recording
-/// sweeps stale grants, which is how this test observes that it happened.
+/// authorizes no publication. Recording sweeps stale grants, which is how
+/// this test observes that it happened.
 #[tokio::test]
 async fn system_build_withdraws_its_publication_grant_when_dispatch_fails() -> TestDbResult<()> {
     let db = pg_test_db().await?;
@@ -693,14 +703,44 @@ async fn system_build_withdraws_its_publication_grant_when_dispatch_fails() -> T
         org_id: TEST_ORG,
     };
 
+    let tenant_grants = || {
+        sqlx::query_scalar::<_, i64>(sql!(
+            "SELECT COUNT(*) FROM template_tenant_publication_grants"
+        ))
+        .fetch_one(&db.pool)
+    };
     insert_stale_grant().await?;
+    sqlx::query(sql!(
+        "INSERT INTO organizations (id, slug, name) VALUES ($1, 'grant-test', 'grant-test')
+         ON CONFLICT (id) DO NOTHING"
+    ))
+    .bind(TEST_ORG.as_uuid())
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_tenant_publication_grants (id, template_name, org_id, granted_at)
+         VALUES ($1, 'tenant-output', $2, NOW() - INTERVAL '8 days')"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(TEST_ORG.as_uuid())
+    .execute(&db.pool)
+    .await?;
     controller
         .submit_template_build(submission(TemplateBuildTarget::Organization(
             TemplateName::parse("tenant-output").unwrap(),
         )))
         .await
         .expect_err("no builder node is registered");
-    assert_eq!(grants().await?, 1, "an organization build records no grant");
+    assert_eq!(
+        grants().await?,
+        1,
+        "an organization build records no system grant"
+    );
+    assert_eq!(
+        tenant_grants().await?,
+        0,
+        "the organization build swept the stale grant and withdrew its own"
+    );
 
     controller
         .submit_template_build(submission(TemplateBuildTarget::System(
@@ -713,5 +753,132 @@ async fn system_build_withdraws_its_publication_grant_when_dispatch_fails() -> T
         0,
         "the system build swept the stale grant and withdrew its own"
     );
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum AcceptanceFailure {
+    Pin,
+    DeletedBuilder,
+    MissingBuilder,
+    InvalidBuilder,
+    InvalidJob,
+}
+
+#[rstest]
+#[case::pin_failure(AcceptanceFailure::Pin)]
+#[case::deleted_builder(AcceptanceFailure::DeletedBuilder)]
+#[case::missing_builder(AcceptanceFailure::MissingBuilder)]
+#[case::invalid_builder(AcceptanceFailure::InvalidBuilder)]
+#[case::invalid_job(AcceptanceFailure::InvalidJob)]
+#[tokio::test]
+async fn failed_acceptance_revokes_only_its_publication_grant(
+    #[future] template_controller_fixture: TestDbResult<TemplateControllerFixture>,
+    #[case] failure: AcceptanceFailure,
+    #[values(false, true)] system: bool,
+) -> TestDbResult<()> {
+    let fixture = template_controller_fixture.await?;
+    let pool = &fixture._db.pool;
+    let name = TemplateName::parse(if system { "seed" } else { "tenant-build" })?;
+    if !system {
+        insert_org_specific_template(pool, name.as_str(), TEST_ORG.as_uuid()).await?;
+    }
+    let record_grant = || async {
+        if system {
+            fixture
+                .store
+                .record_system_publication_grant(&name)
+                .await
+                .map(PublicationGrant::System)
+        } else {
+            fixture
+                .store
+                .record_tenant_publication_grant(TEST_ORG, &name)
+                .await
+                .map(PublicationGrant::Tenant)
+        }
+    };
+    let grant = record_grant().await?;
+    let other = record_grant().await?;
+    insert_org_specific_template(pool, "base", TEST_ORG.as_uuid()).await?;
+    let base = fixture
+        .store
+        .record_base_grant(TEST_ORG, &name, &TemplateName::parse("base")?)
+        .await?;
+    let (job_id, mut response) = accepted_build(Some(fixture.builder_node_id));
+    match failure {
+        AcceptanceFailure::Pin => {
+            sqlx::query(sql!(
+                "CREATE FUNCTION reject_publication_pin() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN RAISE EXCEPTION 'synthetic grant pin failure'; END $$"
+            ))
+            .execute(pool)
+            .await?;
+            let trigger = if system {
+                sql!(
+                    "CREATE TRIGGER reject_publication_pin BEFORE UPDATE
+                      ON template_build_base_grants
+                      FOR EACH ROW EXECUTE FUNCTION reject_publication_pin()"
+                )
+            } else {
+                sql!(
+                    "CREATE TRIGGER reject_publication_pin BEFORE UPDATE
+                      ON template_tenant_publication_grants
+                      FOR EACH ROW EXECUTE FUNCTION reject_publication_pin()"
+                )
+            };
+            sqlx::query(trigger).execute(pool).await?;
+        }
+        AcceptanceFailure::DeletedBuilder => {
+            sqlx::query(sql!("DELETE FROM nodes WHERE id = $1"))
+                .bind(fixture.builder_node_id.as_uuid())
+                .execute(pool)
+                .await?;
+        }
+        AcceptanceFailure::MissingBuilder => response.builder_node_id.clear(),
+        AcceptanceFailure::InvalidBuilder => response.builder_node_id = "not-a-node-id".into(),
+        AcceptanceFailure::InvalidJob => response.job_id = "not-a-job-id".into(),
+    }
+
+    let result = fixture
+        .controller
+        .record_template_build_response(
+            TEST_ORG,
+            name.clone(),
+            None,
+            response,
+            Some(base),
+            Some(grant),
+        )
+        .await;
+
+    // Older gateways may omit builder identity during the preparation rollout.
+    let accepted = matches!(failure, AcceptanceFailure::MissingBuilder);
+    assert_eq!(result.is_ok(), accepted);
+    let job = fixture
+        .store
+        .lookup_build(TEST_ORG, &name, &job_id.to_string())
+        .await?;
+    assert_eq!(job.map(|job| job.daemon_job_id), accepted.then_some(job_id));
+    let query = if system {
+        sql!("SELECT id FROM template_system_publication_grants WHERE template_name = $1")
+    } else {
+        sql!("SELECT id FROM template_tenant_publication_grants WHERE template_name = $1")
+    };
+    let mut remaining: Vec<Uuid> = sqlx::query_scalar(query)
+        .bind(name.as_str())
+        .fetch_all(pool)
+        .await?;
+    let grant_id = |grant| match grant {
+        PublicationGrant::System(id) => id.as_uuid(),
+        PublicationGrant::Tenant(id) => id.as_uuid(),
+    };
+    let mut expected = vec![grant_id(other)];
+    if accepted {
+        expected.push(grant_id(grant));
+    }
+    remaining.sort();
+    expected.sort();
+    assert_eq!(remaining, expected);
     Ok(())
 }
