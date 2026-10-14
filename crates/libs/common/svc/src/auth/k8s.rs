@@ -33,6 +33,8 @@ const SPACE_NODE_API_AUTH_TRUSTED_WAIT_READY_SERVICE_ACCOUNTS_ENV: &str =
     "SPACE_NODE_API_AUTH_TRUSTED_WAIT_READY_SERVICE_ACCOUNTS";
 const SPACE_NODE_API_AUTH_TRUSTED_POLICY_SERVICE_ACCOUNTS_ENV: &str =
     "SPACE_NODE_API_AUTH_TRUSTED_POLICY_SERVICE_ACCOUNTS";
+const SPACE_NODE_API_AUTH_TEMPLATE_TRANSFER_SERVICE_ACCOUNTS_ENV: &str =
+    "SPACE_NODE_API_AUTH_TEMPLATE_TRANSFER_SERVICE_ACCOUNTS";
 const SPACE_NODE_API_INTERNAL_AUTH_ALLOWED_SERVICE_ACCOUNTS_ENV: &str =
     "SPACE_NODE_API_INTERNAL_AUTH_ALLOWED_SERVICE_ACCOUNTS";
 const SPACE_CLUSTER_API_AUTH_ALLOWED_SERVICE_ACCOUNTS_ENV: &str =
@@ -501,6 +503,7 @@ pub(super) struct K8sTokenAuthConfig {
     node_api_guest_bridge_usernames: BTreeSet<String>,
     node_api_trusted_wait_ready_usernames: BTreeSet<String>,
     node_api_trusted_policy_usernames: BTreeSet<String>,
+    template_transfer_usernames: BTreeSet<String>,
     node_api_internal_allowed_usernames: BTreeSet<String>,
     cluster_api_allowed_usernames: BTreeSet<String>,
     cache_ttl: Duration,
@@ -558,6 +561,9 @@ impl K8sTokenAuthConfig {
             node_api_trusted_policy_usernames: qualified_env_set(
                 SPACE_NODE_API_AUTH_TRUSTED_POLICY_SERVICE_ACCOUNTS_ENV,
             ),
+            template_transfer_usernames: qualified_env_set(
+                SPACE_NODE_API_AUTH_TEMPLATE_TRANSFER_SERVICE_ACCOUNTS_ENV,
+            ),
             node_api_internal_allowed_usernames: qualified_env_set(
                 SPACE_NODE_API_INTERNAL_AUTH_ALLOWED_SERVICE_ACCOUNTS_ENV,
             ),
@@ -578,6 +584,14 @@ impl K8sTokenAuthConfig {
     }
 
     pub(super) fn validate_for_role(&self, role: NodeRole) -> Result<(), AuthConfigError> {
+        if matches!(role, NodeRole::Worker | NodeRole::Builder)
+            && self.template_transfer_usernames.is_empty()
+        {
+            tracing::warn!(
+                setting = SPACE_NODE_API_AUTH_TEMPLATE_TRANSFER_SERVICE_ACCOUNTS_ENV,
+                "template transfer allowlist is empty; peer template transfers are disabled"
+            );
+        }
         if role == NodeRole::Worker && self.node_api_trusted_wait_ready_usernames.is_empty() {
             return Err(AuthConfigError::TrustedWaitReadyServiceAccountsMissing);
         }
@@ -645,6 +659,7 @@ impl K8sTokenAuthConfig {
             trusted_wait_ready_usernames,
             guest_bridge_usernames: &self.node_api_guest_bridge_usernames,
             trusted_policy_usernames,
+            template_transfer_usernames: &self.template_transfer_usernames,
         })
     }
 }
@@ -678,6 +693,7 @@ struct AuthPolicy<'a> {
     trusted_wait_ready_usernames: Option<&'a BTreeSet<String>>,
     guest_bridge_usernames: &'a BTreeSet<String>,
     trusted_policy_usernames: Option<&'a BTreeSet<String>>,
+    template_transfer_usernames: &'a BTreeSet<String>,
 }
 
 /// Guest operations retain their sandbox-scoped route-token checks downstream.
@@ -786,11 +802,19 @@ impl AuthPolicy<'_> {
     }
 
     fn authenticated_caller(&self, username: &str) -> NodeApiAuthenticatedCaller {
-        NodeApiAuthenticatedCaller::kubernetes_service_account(
+        let mut caller = NodeApiAuthenticatedCaller::kubernetes_service_account(
             self.wait_ready_lifecycle_authority(username),
             self.network_policy_mutation_authority(username),
             self.data_plane_session_refresh_authority(username),
-        )
+        );
+        if matches!(self.role, NodeRole::Worker | NodeRole::Builder)
+            && self.template_transfer_usernames.contains(username)
+            && !self.guest_bridge_usernames.contains(username)
+        {
+            caller.template_transfer_authority =
+                super::template_transfer::TemplateTransferAuthority::Granted;
+        }
+        caller
     }
 }
 
