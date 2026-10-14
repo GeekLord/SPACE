@@ -62,7 +62,14 @@ from space_smoke.runtime import BackgroundWork, Compensation, ResourceScope, bac
 if TYPE_CHECKING:
     from space_smoke.fixtures import KindEcw
 
-OCI_IMAGE = "docker.io/library/python:3.12-slim-bookworm"
+# Pinned to the tag's linux/amd64 image manifest, the platform of the x86_64
+# Kind builders, so a rebuild of the tag cannot change an unchanged run. The
+# builder takes a single-platform manifest as it is, and this digest is the one
+# ci/mirrored-images.txt holds a copy of.
+OCI_IMAGE = (
+    "docker.io/library/python:3.12-slim-bookworm"
+    "@sha256:2ed6491b93cd49272ee6de2b5a38440c3448360322c089fc23e370722d74179d"
+)
 SCENARIO_ID = "local.ecw_template_build_from_oci_boots"
 
 COPY_MARKER_TEXT = "hello from ecw template build smoke\n"

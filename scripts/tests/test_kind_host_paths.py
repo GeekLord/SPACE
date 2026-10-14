@@ -12,6 +12,7 @@ assert where the paths land rather than that the harness runs.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import pathlib
 import re
@@ -32,6 +33,10 @@ INSTALL_FC_VENDOR = KIND_DIR / "scripts/install-fc-vendor.sh"
 SMOKE_BOOTSTRAP = REPO_ROOT / "scripts/tests/lib/bootstrap-kind-stack.sh"
 
 FC_VERSION = "v1.15.1"
+# The fake devbox image's kernel. install-fc-vendor.sh stages only a kernel at
+# the pinned sha256, so the tests that stage it pin this one.
+FAKE_KERNEL = b"not-a-real-kernel\n"
+FAKE_KERNEL_SHA256 = hashlib.sha256(FAKE_KERNEL).hexdigest()
 
 # The escalation branch in install-fc-vendor.sh is gated on the vendor root
 # being unwritable *by us*. Root writes through mode 0555, so as root that
@@ -146,7 +151,21 @@ def stage_fake_image_vendor(root: Path) -> None:
         stub.chmod(0o755)
     kernel = root / "kernels/vmlinux-6.1.0"
     kernel.mkdir(parents=True)
-    (kernel / "vmlinux.bin").write_text("not-a-real-kernel\n")
+    (kernel / "vmlinux.bin").write_bytes(FAKE_KERNEL)
+
+
+def stage_fake_vendor_tree(root: Path) -> None:
+    """A vendor root as install-fc-vendor.sh leaves it, with FAKE_KERNEL staged."""
+    binaries = root / f"firecracker/{FC_VERSION}/bin"
+    binaries.mkdir(parents=True)
+    for name in ("firecracker", "jailer"):
+        stub = binaries / name
+        stub.write_text(f"#!/usr/bin/env bash\nprintf 'Firecracker {FC_VERSION}\\n'\n")
+        stub.chmod(0o755)
+    (root / "firecracker/default").symlink_to(FC_VERSION)
+    kernel = root / f"firecracker/{FC_VERSION}/kernel"
+    kernel.mkdir()
+    (kernel / "vmlinux.bin").write_bytes(FAKE_KERNEL)
 
 
 class RenderTests(unittest.TestCase):
@@ -1249,7 +1268,9 @@ class InstallerAgreementTests(unittest.TestCase):
         self.image_vendor = self.tmp / "opt/space/vendor"
         stage_fake_image_vendor(self.image_vendor)
         self.env = base_env(
-            str(self.home), SPACE_IMAGE_VENDOR_ROOT=str(self.image_vendor)
+            str(self.home),
+            SPACE_IMAGE_VENDOR_ROOT=str(self.image_vendor),
+            SPACE_FC_KERNEL_SHA256=FAKE_KERNEL_SHA256,
         )
 
     def install(self):
@@ -1634,6 +1655,310 @@ class InstallerAgreementTests(unittest.TestCase):
         self.assertIn("vmlinux already present", second.stdout)
 
 
+    def serving_curl(self, body: bytes, codes: str = "200") -> tuple[pathlib.Path, pathlib.Path]:
+        """A `curl` on PATH that records its argv and answers like `curl -w '%{http_code}'`.
+
+        Call N answers the Nth of `codes` (the last one repeats), each an HTTP
+        status with an optional curl exit, `200:18` for a body cut short after
+        its status. A 200 writes `body` to the -o file; 000 alone is a timeout.
+        """
+        stub_dir = self.tmp / "curlbin"
+        stub_dir.mkdir(exist_ok=True)
+        (self.tmp / "kernel-body").write_bytes(body)
+        log = self.tmp / "curl.log"
+        log.touch()
+        stub = stub_dir / "curl"
+        stub.write_text(
+            textwrap.dedent(
+                f"""\
+                #!/usr/bin/env bash
+                printf '%s\\n' "$*" >>{shell_quote(str(log))}
+                codes=({codes})
+                calls=$(wc -l <{shell_quote(str(log))})
+                answer="${{codes[calls - 1]:-${{codes[-1]}}}}"
+                code="${{answer%%:*}}"
+                status=0
+                [[ "$answer" != *:* ]] || status="${{answer#*:}}"
+                [[ "$answer" != 000 ]] || status=28
+                while [[ $# -gt 0 ]]; do
+                  if [[ "$1" == -o && "$code" == 200 ]]; then cp {shell_quote(str(self.tmp / "kernel-body"))} "$2"; fi
+                  shift
+                done
+                printf '%s' "$code"
+                exit "$status"
+                """
+            )
+        )
+        stub.chmod(0o755)
+        return stub_dir, log
+
+    def stub_mv(self) -> pathlib.Path:
+        """An `mv` on PATH that fails a move to a path ending in $FAKE_MV_FAIL_INTO.
+
+        After a move to vmlinux.bin it sleeps $FAKE_MV_SLEEP_AFTER seconds, and
+        with $FAKE_MV_BLOCK_STAMP set puts a directory where the stamp goes,
+        so the stamp write that follows fails.
+        """
+        stub_dir = self.tmp / "mvbin"
+        stub_dir.mkdir(exist_ok=True)
+        stub = stub_dir / "mv"
+        stub.write_text(
+            textwrap.dedent(
+                f"""\
+                #!/usr/bin/env bash
+                dest="${{*: -1}}"
+                if [[ -n "${{FAKE_MV_FAIL_INTO:-}}" && "$dest" == *"$FAKE_MV_FAIL_INTO" ]]; then
+                  echo "mv: cannot move to $dest: Read-only file system" >&2
+                  exit 1
+                fi
+                {shell_quote(shutil.which("mv") or "/bin/mv")} "$@" || exit
+                [[ "$dest" == */vmlinux.bin ]] || exit 0
+                [[ -z "${{FAKE_MV_BLOCK_STAMP:-}}" ]] || mkdir "${{dest%/*}}/.vmlinux.bin.sha256"
+                sleep "${{FAKE_MV_SLEEP_AFTER:-0}}"
+                """
+            )
+        )
+        stub.chmod(0o755)
+        return stub_dir
+
+    def installer_env(self, codes: str = "200", body: bytes = b"", **overrides: str):
+        stub_dir, log = self.serving_curl(body, codes)
+        env = dict(self.env, **overrides)
+        env["PATH"] = f"{stub_dir}:{self.stub_mv()}:{env['PATH']}"
+        return env, log
+
+    def run_installer(self, *args: str, body: bytes = b"", codes: str = "200", **overrides: str):
+        env, log = self.installer_env(codes, body, **overrides)
+        result = subprocess.run(
+            ["bash", str(INSTALL_FC_VENDOR), *args],
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        return result, log.read_text().splitlines()
+
+    @property
+    def kernel_dir(self) -> pathlib.Path:
+        return self.home / f".space-devbox/space/vendor/firecracker/{FC_VERSION}/kernel"
+
+    def download_kernel(self, body: bytes, codes: str = "200", **overrides: str):
+        """Install with the image providing Firecracker but no kernel, so the kernel downloads."""
+        shutil.rmtree(self.image_vendor / "kernels")
+        result, calls = self.run_installer(body=body, codes=codes, **overrides)
+        return result, calls, self.kernel_dir
+
+    def test_the_kernel_is_the_pinned_object_at_its_checksum(self) -> None:
+        body = b"pinned-kernel\n"
+        result, calls, kernel_dir = self.download_kernel(
+            body,
+            SPACE_FC_KERNEL_VERSION="6.1.999",
+            SPACE_FC_KERNEL_SHA256=hashlib.sha256(body).hexdigest(),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # One request, for the pinned key: no bucket listing picks the newest patch.
+        self.assertEqual(len(calls), 1, calls)
+        self.assertIn("https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/x86_64/vmlinux-6.1.999", calls[0])
+        # Deadlines, so a stalled transfer cannot hold the job until its timeout.
+        for flag in ("--connect-timeout", "--max-time", "--speed-time"):
+            self.assertIn(flag, calls[0])
+        self.assertEqual((kernel_dir / "vmlinux.bin").read_bytes(), body)
+
+    def test_a_kernel_that_fails_its_checksum_is_not_installed(self) -> None:
+        # The pin is FAKE_KERNEL's, which this content cannot match.
+        result, _, kernel_dir = self.download_kernel(b"some-other-kernel\n")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not the pinned", result.stderr)
+        self.assertEqual(sorted(path.name for path in kernel_dir.iterdir()), [".vmlinux.bin.lock"])
+
+    def test_a_missing_object_fails_without_retrying(self) -> None:
+        result, calls, kernel_dir = self.download_kernel(b"", codes="404")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("HTTP 404", result.stderr)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertEqual(sorted(path.name for path in kernel_dir.iterdir()), [".vmlinux.bin.lock"])
+
+    def test_a_transient_failure_is_retried(self) -> None:
+        body = b"pinned-kernel\n"
+        result, calls, kernel_dir = self.download_kernel(
+            body, codes="503 000 200", SPACE_FC_KERNEL_SHA256=hashlib.sha256(body).hexdigest()
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 3, calls)
+        self.assertEqual((kernel_dir / "vmlinux.bin").read_bytes(), body)
+
+    def test_a_body_cut_short_or_timed_out_after_its_status_is_retried(self) -> None:
+        # `%{http_code}` reports the 200 already received; curl's exit says the body failed.
+        body = b"pinned-kernel\n"
+        result, calls, kernel_dir = self.download_kernel(
+            body, codes="200:18 200:28 200", SPACE_FC_KERNEL_SHA256=hashlib.sha256(body).hexdigest()
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 3, calls)
+        self.assertEqual((kernel_dir / "vmlinux.bin").read_bytes(), body)
+
+    def test_a_certificate_failure_fails_without_retrying(self) -> None:
+        result, calls, kernel_dir = self.download_kernel(b"", codes="000:60")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("curl exit 60", result.stderr)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertEqual(sorted(path.name for path in kernel_dir.iterdir()), [".vmlinux.bin.lock"])
+
+    def test_a_version_without_its_checksum_is_refused(self) -> None:
+        """Else it would pass as the default kernel on a host that has it staged."""
+        self.install()
+        env = dict(self.env)
+        del env["SPACE_FC_KERNEL_SHA256"]
+        env["SPACE_FC_KERNEL_VERSION"] = "6.1.999"
+        for args in (["--check"], []):
+            stub_dir, log = self.serving_curl(b"")
+            run_env = dict(env, PATH=f"{stub_dir}:{env['PATH']}")
+            result = subprocess.run(
+                ["bash", str(INSTALL_FC_VENDOR), *args], env=run_env, text=True, capture_output=True, check=False
+            )
+            self.assertNotEqual(result.returncode, 0, args)
+            self.assertIn("needs SPACE_FC_KERNEL_SHA256", result.stderr)
+            self.assertEqual(log.read_text(), "", "downloaded without a checksum")
+        self.assertEqual((self.kernel_dir / "vmlinux.bin").read_bytes(), FAKE_KERNEL)
+
+    def test_a_failed_rename_keeps_the_previous_kernel_and_fails(self) -> None:
+        self.install()
+        shutil.rmtree(self.image_vendor / "kernels")
+        body = b"newly-pinned-kernel\n"
+        new_pin = hashlib.sha256(body).hexdigest()
+
+        result, _ = self.run_installer(body=body, SPACE_FC_KERNEL_SHA256=new_pin, FAKE_MV_FAIL_INTO="/vmlinux.bin")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not move the verified kernel", result.stderr)
+        self.assertNotIn("installed at", result.stdout)
+        self.assertEqual((self.kernel_dir / "vmlinux.bin").read_bytes(), FAKE_KERNEL)
+        self.assertNotEqual(self.run_installer("--check", SPACE_FC_KERNEL_SHA256=new_pin)[0].returncode, 0)
+        self.assertEqual(self.run_installer("--check")[0].returncode, 0, "the previous kernel's pin no longer passes")
+
+    def test_a_failed_stamp_write_fails_the_install(self) -> None:
+        # The stamp is removed and the verified kernel renamed into place; only
+        # writing the stamp then fails.
+        result, _ = self.run_installer(FAKE_MV_BLOCK_STAMP="1")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not write", result.stderr)
+        self.assertNotIn("installed at", result.stdout)
+        # The new kernel is in place, verified but unstamped: the next check hashes it.
+        self.assertEqual((self.kernel_dir / "vmlinux.bin").read_bytes(), FAKE_KERNEL)
+        self.assertTrue((self.kernel_dir / ".vmlinux.bin.sha256").is_dir())
+        self.assertEqual(self.run_installer("--check")[0].returncode, 0)
+
+    def test_a_failed_stamp_refresh_of_a_present_kernel_only_warns(self) -> None:
+        # A directory where the stamp goes: the present kernel is verified by
+        # hashing it, and refreshing the stamp then fails.
+        self.install()
+        stamp = self.kernel_dir / ".vmlinux.bin.sha256"
+        stamp.unlink()
+        stamp.mkdir()
+
+        result, calls = self.run_installer()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("WARNING: could not refresh", result.stderr)
+        self.assertIn("the next run hashes", result.stderr)
+        self.assertIn("vmlinux already present", result.stdout)
+        self.assertEqual(calls, [])
+        self.assertEqual((self.kernel_dir / "vmlinux.bin").read_bytes(), FAKE_KERNEL)
+
+    def test_installers_sharing_a_root_never_stamp_the_other_ones_kernel(self) -> None:
+        """Two pins at once: one installer replaces the kernel between the other's rename and stamp.
+
+        The first stages kernel A and stalls right after renaming it into place;
+        the second, pinned to B, runs meanwhile. Whatever order they finish in,
+        `--check` may pass only for the kernel actually staged.
+        """
+        kernel_b = b"kernel-b\n"
+        pin_b = hashlib.sha256(kernel_b).hexdigest()
+        other = self.image_vendor / "kernels/vmlinux-6.1.1"
+        other.mkdir(parents=True)
+        (other / "vmlinux.bin").write_bytes(kernel_b)
+
+        env_a, _ = self.installer_env(FAKE_MV_SLEEP_AFTER="3")
+        first = subprocess.Popen(
+            ["bash", str(INSTALL_FC_VENDOR)], env=env_a, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        kernel = self.kernel_dir / "vmlinux.bin"
+        for _ in range(100):
+            if kernel.exists() and kernel.read_bytes() == FAKE_KERNEL:
+                break
+            subprocess.run(["sleep", "0.05"], check=True)
+        else:
+            first.kill()
+            self.fail("the first installer never renamed its kernel into place")
+
+        second, _ = self.run_installer(SPACE_FC_KERNEL_SHA256=pin_b)
+        first_out, first_err = first.communicate(timeout=60)
+
+        self.assertEqual(first.returncode, 0, first_err)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        staged = kernel.read_bytes()
+        self.assertEqual(staged, kernel_b, "the second installer finished last")
+        self.assertEqual(self.run_installer("--check", SPACE_FC_KERNEL_SHA256=pin_b)[0].returncode, 0)
+        self.assertNotEqual(
+            self.run_installer("--check")[0].returncode, 0, "--check accepted kernel B under kernel A's pin"
+        )
+
+    def test_a_present_kernel_that_is_not_the_pinned_one_is_replaced(self) -> None:
+        # Staged from the image at FAKE_KERNEL's pin; then the pin moves.
+        self.install()
+        shutil.rmtree(self.image_vendor / "kernels")
+        body = b"newly-pinned-kernel\n"
+
+        result, calls = self.run_installer(body=body, SPACE_FC_KERNEL_SHA256=hashlib.sha256(body).hexdigest())
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("replacing", result.stdout)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertEqual((self.kernel_dir / "vmlinux.bin").read_bytes(), body)
+
+    def test_an_image_kernel_that_is_not_the_pinned_one_is_not_staged(self) -> None:
+        body = b"pinned-kernel\n"
+
+        result, calls = self.run_installer(body=body, SPACE_FC_KERNEL_SHA256=hashlib.sha256(body).hexdigest())
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("not staging image-provided", result.stdout)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertEqual((self.kernel_dir / "vmlinux.bin").read_bytes(), body)
+
+    def test_an_image_kernel_at_the_pin_is_staged_without_a_download(self) -> None:
+        result, calls = self.run_installer()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("from image-provided", result.stdout)
+        self.assertEqual(calls, [])
+        self.assertEqual((self.kernel_dir / "vmlinux.bin").read_bytes(), FAKE_KERNEL)
+
+    def test_check_requires_the_pinned_kernel_as_well_as_firecracker(self) -> None:
+        """The bring-ups run the installer whenever `--check` fails."""
+        self.assertNotEqual(self.run_installer("--check")[0].returncode, 0, "an empty root passed")
+        self.install()
+        self.assertEqual(self.run_installer("--check")[0].returncode, 0)
+
+        # A pin change on a staged host.
+        moved, calls = self.run_installer("--check", SPACE_FC_KERNEL_SHA256="0" * 64)
+        self.assertNotEqual(moved.returncode, 0, "a kernel at the old pin passed")
+        self.assertEqual(calls, [], "--check downloaded")
+
+        # Firecracker staged, kernel missing: the state a failed download leaves.
+        (self.kernel_dir / "vmlinux.bin").unlink()
+        self.assertNotEqual(self.run_installer("--check")[0].returncode, 0, "a missing kernel passed")
+        self.install()
+        self.assertEqual(self.run_installer("--check")[0].returncode, 0)
+
+
 class RenderWrapperTests(unittest.TestCase):
     """`render-cluster-config.sh` prints a path for an operator to paste."""
 
@@ -1845,18 +2170,12 @@ class BringUpConfigPrivacyTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.home = self.tmp / "home/notdev"
         self.home.mkdir(parents=True)
-        # Staged, so the bring-up skips install-fc-vendor.sh and gets as far
-        # as the preflight.
-        probe = (
-            self.home
-            / ".space-devbox/space/vendor/firecracker/default/bin/firecracker"
-        )
-        probe.parent.mkdir(parents=True)
-        probe.write_text("#!/bin/sh\nexit 0\n")
-        probe.chmod(0o755)
+        # Staged, so `install-fc-vendor.sh --check` passes, the bring-up skips
+        # the installer and gets as far as the preflight.
+        stage_fake_vendor_tree(self.home / ".space-devbox/space/vendor")
         self.shared = self.home / ".space-devbox/kind/kind-cluster.yaml"
 
-    def drive_bring_up(self):
+    def drive_bring_up(self, **env_overrides: str):
         """Run the real `bootstrap_kind_stack__bring_up` against stubs.
 
         The stubs are the commands, not the library: `bring_up` sources
@@ -1894,7 +2213,7 @@ class BringUpConfigPrivacyTests(unittest.TestCase):
         """
         result = subprocess.run(
             ["bash", "-uo", "pipefail", "-c", script],
-            env=base_env(str(self.home)),
+            env=base_env(str(self.home), SPACE_FC_KERNEL_SHA256=FAKE_KERNEL_SHA256, **env_overrides),
             text=True,
             capture_output=True,
             check=False,
@@ -1909,6 +2228,18 @@ class BringUpConfigPrivacyTests(unittest.TestCase):
             f"render and this test would prove nothing.\n{result.stderr}",
         )
         return match.group(1), result
+
+    def test_a_staged_tree_without_its_kernel_is_staged_again(self) -> None:
+        """Firecracker alone, as a failed kernel download leaves it, is not a staged tree."""
+        kernel = self.home / f".space-devbox/space/vendor/firecracker/{FC_VERSION}/kernel/vmlinux.bin"
+        kernel.unlink()
+        image_vendor = self.tmp / "opt/space/vendor"
+        stage_fake_image_vendor(image_vendor)
+
+        _, result = self.drive_bring_up(SPACE_IMAGE_VENDOR_ROOT=str(image_vendor))
+
+        self.assertIn("staging Firecracker vendor tree", result.stdout)
+        self.assertEqual(kernel.read_bytes(), FAKE_KERNEL)
 
     def test_the_config_handed_onward_is_never_the_shared_path(self) -> None:
         """Both the preflight and `kind create` get this run's own file.
