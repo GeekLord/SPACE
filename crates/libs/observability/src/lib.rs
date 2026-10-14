@@ -33,6 +33,15 @@ mod traces;
 
 const RUSQLITE_QUERY_TARGET: &str = "rusqlite::query";
 const SQLX_ACQUIRE_TARGET: &str = "sqlx::pool::acquire";
+/// libdd's shared runtime warns, once per exporter worker, that its
+/// `BasicRuntime` ignores restart-on-fork. datadog-opentelemetry 0.5.2 builds
+/// its trace exporter with libdd's default (restart after fork) on that
+/// runtime, so every process starting the native tracer logged it; SPACE has no
+/// setting that changes it, and no SPACE process forks with the tracer running.
+/// A log filter sees only the callsite, not the message, so the whole module's
+/// WARN level is dropped: in libdd-shared-runtime 3.0.0 this notice is its only
+/// WARN. Recheck that on a libdd upgrade.
+const LIBDD_BASIC_RUNTIME_TARGET: &str = "libdd_shared_runtime::shared_runtime::basic";
 const SQLX_QUERY_TARGET: &str = "sqlx::query";
 
 /// Canonical metric name for successful SQLx pool-acquire duration.
@@ -1104,6 +1113,11 @@ fn should_format_event(metadata: &tracing::Metadata<'_>) -> bool {
     if metadata.target() == SQLX_ACQUIRE_TARGET {
         return *metadata.level() <= tracing::Level::WARN;
     }
+    // The module's only WARN is the restart-on-fork notice; its ERROR, a
+    // worker that failed to shut down, still reaches logs.
+    if metadata.target() == LIBDD_BASIC_RUNTIME_TARGET {
+        return *metadata.level() == tracing::Level::ERROR;
+    }
     should_format_target(metadata.target())
 }
 
@@ -1288,6 +1302,16 @@ pub mod trace_propagation {
         let _ = span.set_parent(cx);
     }
 
+    /// Whether incoming HTTP headers carry a valid trace context, that is,
+    /// whether the caller's request is being traced.
+    pub fn headers_carry_trace_context(headers: &HeaderMap) -> bool {
+        use opentelemetry::trace::TraceContextExt;
+        let cx = opentelemetry::global::get_text_map_propagator(|propagator| {
+            propagator.extract(&HeaderExtractor(headers))
+        });
+        cx.span().span_context().is_valid()
+    }
+
     /// Extract an OpenTelemetry context from incoming HTTP headers and attach
     /// it as the parent of an explicit span before that span is entered.
     pub fn set_span_parent_from_headers(span: &tracing::Span, headers: &HeaderMap) {
@@ -1325,6 +1349,20 @@ pub mod trace_propagation {
         }
     }
 
+    /// Whether the current span carries a valid trace context, that is, whether
+    /// a span opened now would join a trace rather than start one.
+    ///
+    /// Client wrappers use this to keep background calls, made with no request
+    /// in scope, from opening a root trace per successful call.
+    pub fn has_traced_current_span() -> bool {
+        use opentelemetry::trace::TraceContextExt;
+        tracing::Span::current()
+            .context()
+            .span()
+            .span_context()
+            .is_valid()
+    }
+
     /// Serialize an explicit tracing span's OpenTelemetry context as W3C
     /// traceparent. This is useful when the child work happens on another task.
     pub fn traceparent_for_span(span: &tracing::Span) -> Option<String> {
@@ -1359,8 +1397,14 @@ pub mod trace_propagation {
     pub fn inject_current_context_into_headers<T>(_headers: &mut T) {}
     pub fn set_span_parent_context_from<T>(_span: &tracing::Span, _metadata: &T) {}
     pub fn set_span_parent_from_headers<T>(_span: &tracing::Span, _headers: &T) {}
+    pub fn headers_carry_trace_context<T>(_headers: &T) -> bool {
+        false
+    }
     pub fn set_span_parent_from_traceparent(_span: &tracing::Span, _traceparent: &str) {}
     pub fn link_span_from_traceparent(_span: &tracing::Span, _traceparent: &str) {}
+    pub fn has_traced_current_span() -> bool {
+        false
+    }
     pub fn traceparent_for_span(_span: &tracing::Span) -> Option<String> {
         None
     }
