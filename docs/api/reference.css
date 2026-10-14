@@ -49,10 +49,14 @@ a { color: var(--docs-color-accent); }
 /* Keep wide field tables accessible inside the native content column. */
 #reference .api-content table { display: block; max-width: 100%; overflow-x: auto; }
 footer { padding: 24px 32px; font-size: 13px; }
-/* Native inline sample containers stay light; code and copy controls keep
-   high contrast against Redoc's dark codeBlock theme. */
-#reference [role="tabpanel"] { color: #fff; }
+/* Sample tabs use the page surface; panels retain the contrasting code colors. */
+#reference [role="tabpanel"] { color: var(--docs-color-code-text); }
+#reference [role="tab"][aria-selected="true"] { background-color: var(--docs-color-surface); }
 #reference h3 { color: var(--docs-color-text); }
+/* Native section labels and uncolored arrows need the shared foreground too. */
+#reference h5 { color: var(--docs-color-muted); border-color: var(--docs-color-border); }
+#reference h5 span { color: var(--docs-color-muted); }
+#reference svg, #reference svg polygon { fill: currentColor; }
 .schema-context { max-width: 65ch; line-height: 1.6; }
 .schema-context p { margin: .5rem 0; }
 .schema-context code { font-size: .9em; }
