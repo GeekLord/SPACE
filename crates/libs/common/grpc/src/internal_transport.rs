@@ -236,6 +236,10 @@ impl ClientTransport {
             _ => Err(TransportError::Scheme),
         }
     }
+    /// Apply this transport to `endpoint` for a channel tonic dials itself,
+    /// such as a balanced channel's. Its connect-phase failures carry no
+    /// [`crate::ConnectPhaseError`]; connect through
+    /// [`Self::connect_endpoint`] wherever SPACE's TCP connector can dial.
     pub fn endpoint(&self, endpoint: Endpoint) -> Result<Endpoint, TransportError> {
         Ok(self.connect_endpoint(endpoint)?.endpoint)
     }
@@ -243,6 +247,10 @@ impl ClientTransport {
     /// Apply this transport to `endpoint` for the TCP connect helpers: the
     /// result carries the handshake bound of the TLS config it applies.
     pub fn connect_endpoint(&self, endpoint: Endpoint) -> Result<ConnectEndpoint, TransportError> {
+        // A Unix-socket endpoint reports an http fallback URI; it is not TCP.
+        if crate::connect::is_unix_socket_endpoint(&endpoint) {
+            return Err(TransportError::Scheme);
+        }
         match endpoint.uri().scheme_str() {
             Some("https") => {
                 let tls = self.tls.as_ref().ok_or(TransportError::Missing(CA_ENV))?;
@@ -264,7 +272,9 @@ impl ClientTransport {
 /// An endpoint with a [`ClientTransport`] applied, and the handshake bound of
 /// the TLS config it set (none for plaintext). Internal-RPC callers connect
 /// through it so the TCP connect helpers size their attempt caps from the
-/// bound actually applied.
+/// bound actually applied. Only [`ClientTransport::connect_endpoint`] builds
+/// one, which guarantees a TCP endpoint whose `https` scheme comes with its
+/// handshake bound, so its connects cannot fail the helpers' endpoint checks.
 #[derive(Clone, Debug)]
 pub struct ConnectEndpoint {
     endpoint: Endpoint,
@@ -272,6 +282,33 @@ pub struct ConnectEndpoint {
 }
 
 impl ConnectEndpoint {
+    /// [`crate::connect_tcp_channel`] with this endpoint's handshake bound.
+    pub async fn connect(self) -> Result<tonic::transport::Channel, tonic::transport::Error> {
+        crate::connect::dial_tcp_channel(self.endpoint, self.tls_handshake_timeout).await
+    }
+
+    /// [`crate::connect_tcp_channel_lazy`] with this endpoint's handshake
+    /// bound.
+    pub fn connect_lazy(self) -> tonic::transport::Channel {
+        crate::connect::lazy_tcp_channel(self.endpoint, self.tls_handshake_timeout)
+    }
+
+    /// [`crate::RotatingChannel::connect`] with this endpoint's handshake
+    /// bound.
+    pub async fn connect_rotating(
+        self,
+        service_name: &'static str,
+        max_age: Option<std::time::Duration>,
+    ) -> Result<crate::RotatingChannel, tonic::transport::Error> {
+        crate::RotatingChannel::connect_tcp(
+            service_name,
+            self.endpoint,
+            self.tls_handshake_timeout,
+            max_age,
+        )
+        .await
+    }
+
     /// [`crate::connect_tcp_channel_with_retry`] with this endpoint's
     /// handshake bound.
     pub async fn connect_with_retry(
@@ -316,7 +353,7 @@ impl ConnectEndpoint {
         attempt_timeout: std::time::Duration,
         retry_policy: crate::GrpcRetryPolicy,
     ) -> Result<tonic::transport::Channel, tonic::transport::Error> {
-        crate::connect_tcp_channel_with_retrying_redials(
+        crate::connect::connect_retrying_redials(
             service_name,
             self.endpoint,
             attempt_timeout,
@@ -338,16 +375,8 @@ impl ConnectEndpoint {
     }
 }
 
-pub async fn client_endpoint(
-    service: Service,
-    endpoint: Endpoint,
-) -> Result<Endpoint, TransportError> {
-    ClientTransport::from_env(service, endpoint.uri())
-        .await?
-        .endpoint(endpoint)
-}
-
-/// [`client_endpoint`] for the TCP connect helpers: see
+/// Apply the internal transport for `service`, read from the environment, to
+/// `endpoint` for the TCP connect helpers: see
 /// [`ClientTransport::connect_endpoint`].
 pub async fn client_connect_endpoint(
     service: Service,
