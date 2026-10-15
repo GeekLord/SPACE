@@ -34,6 +34,7 @@ jobs:
             rust_cache_key: clippy
             rust_cache_size: 2G
             rust_cache_refresh_misses: 20
+            cargo_registry: restore
             timeout: 45
             archcheck: true
 
@@ -44,11 +45,54 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # The report after Clippy runs this copy of the package cache helper,
+      # taken before Clippy starts, as in common-ci.yml.
+      - name: Copy the package cache helper
+        if: matrix.cargo_registry
+        run: |
+          set -euo pipefail
+          install -d "${RUNNER_TEMP}/space-ci-helpers"
+          install -m 0444 ci/scripts/package-cache.py "${RUNNER_TEMP}/space-ci-helpers/"
+          chmod 0555 "${RUNNER_TEMP}/space-ci-helpers"
+
       - name: Get the CI image
         id: ci-image
         env:
           GHCR_TOKEN: ${{ github.token }}
         run: bash ci/scripts/ci-image.sh ensure "space-ci:${GITHUB_SHA}"
+
+      # Common CI's Rust tests job saves the crates on main; see the package
+      # caches in common-ci.yml. The path matches theirs, which the cache's
+      # version includes.
+      - name: Name the Cargo registry cache
+        id: cargo-registry-key
+        if: matrix.cargo_registry
+        run: python3 ci/scripts/package-cache.py key cargo
+
+      - name: Restore the Cargo registry
+        id: restore-cargo-registry
+        if: matrix.cargo_registry
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: '3'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/cargo-home/registry/cache
+            ${{ runner.temp }}/cargo-home/registry/index
+          key: ${{ steps.cargo-registry-key.outputs.key }}
+          restore-keys: |
+            ${{ steps.cargo-registry-key.outputs.lock }}
+            ${{ steps.cargo-registry-key.outputs.family }}
+
+      - name: Prepare the Cargo registry
+        if: matrix.cargo_registry
+        env:
+          MATCHED_KEY: ${{ steps.restore-cargo-registry.outputs.cache-matched-key }}
+        run: >-
+          python3 ci/scripts/package-cache.py restored cargo "${RUNNER_TEMP}/cargo-home/registry"
+          "${MATCHED_KEY}" --lockfile Cargo.lock
 
       # Keep Clippy's compiler outputs separate from the test graph: the two
       # modes use different rustc invocations and cannot reliably share keys.
@@ -83,7 +127,7 @@ jobs:
         env:
           SPACE_CI_COMMAND: ${{ matrix.command }}
           SPACE_CI_RUST_CACHE: ${{ matrix.rust_cache }}
-          SPACE_CI_CARGO_DIR: ${{ runner.temp }}/space-cargo
+          SPACE_CI_CARGO_DIR: ${{ runner.temp }}/cargo-home
           SPACE_CI_SCCACHE_DIR: ${{ runner.temp }}/space-sccache
           SPACE_CI_SCCACHE_RUN_DIR: ${{ runner.temp }}/space-sccache-run
           SPACE_CI_SCCACHE_SIZE: ${{ matrix.rust_cache_size }}
@@ -135,7 +179,7 @@ jobs:
           ${{ !cancelled() && steps.ci-image.outcome == 'success' && matrix.archcheck == true &&
           github.event_name == 'pull_request' }}
         env:
-          CARGO_DIR: ${{ runner.temp }}/space-cargo
+          CARGO_DIR: ${{ runner.temp }}/cargo-home
           SCCACHE_DIR: ${{ runner.temp }}/space-sccache
           SCCACHE_SIZE: ${{ matrix.rust_cache_size }}
           PULL_REQUEST_HEAD: ${{ github.event.pull_request.head.sha }}
@@ -216,6 +260,12 @@ jobs:
           annotate '.severity != "ERROR"' none "${ordered}" ||
             echo "::warning title=archcheck::Not every advisory finding was annotated; run cargo arch."
           annotate '.severity == "ERROR"' error target/archcheck.rdjson
+
+      - name: Report the Cargo registry
+        if: always() && matrix.cargo_registry
+        env:
+          PACKAGE_CACHE: ${{ runner.temp }}/space-ci-helpers/package-cache.py
+        run: python3 -I "${PACKAGE_CACHE}" report cargo "${RUNNER_TEMP}/cargo-home/registry"
 
       - name: Decide whether to refresh the Rust compiler cache
         id: refresh-rust-cache
