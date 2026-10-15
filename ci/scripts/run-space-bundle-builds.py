@@ -17,6 +17,7 @@ import json
 import os
 import random
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -24,12 +25,13 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[1]
 RELEASE_IMAGE_MANIFEST = REPO_ROOT / "ci/space-helm-release-images.json"
 MIRROR_IMAGES_SCRIPT = SCRIPT_DIR / "mirror-images.sh"
+MIRRORED_IMAGES_LIST = REPO_ROOT / "ci/mirrored-images.txt"
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 os.environ.setdefault("AWS_DEFAULT_REGION", AWS_REGION)
 SCCACHE_REGION = os.environ.get("SCCACHE_REGION", AWS_REGION)
@@ -46,13 +48,32 @@ SPACE_UI_DATA_PLANE_URL = "http://space-data-plane:8090"
 ECR_TRANSIENT_ERROR_EXIT_STATUS = 75
 # The BuildKit daemon runs privileged and does the registry push, so it's
 # pinned rather than pulled by a mutable tag. v0.32.2 is what `buildx-stable-1`
-# resolved to when this was pinned.
+# resolved to when this was pinned. GitHub CI takes it from the GHCR mirror
+# (ci/mirrored-images.txt lists it under this name) before the source.
 BUILDKIT_IMAGE = (
     "moby/buildkit:v0.32.2"
     "@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8"
 )
 BUILDX_RATE_LIMIT_MAX_ATTEMPTS = 5
 BUILDX_RATE_LIMIT_INITIAL_DELAY_SECONDS = 2
+# The registry login is a few seconds of work, so wait out a short outage:
+# five attempts of at most 30 seconds each, 5 + 10 + 20 + 40 seconds apart,
+# so at most 225 seconds per command.
+ECR_LOGIN_MAX_ATTEMPTS = 5
+ECR_LOGIN_INITIAL_DELAY_SECONDS = 5
+REGISTRY_COMMAND_TIMEOUT_SECONDS = 30
+# Bounds each lookup of a cache tag, so an unreachable registry costs a cold
+# build rather than a hung job.
+REGISTRY_LOOKUP_TIMEOUT_SECONDS = 60
+# Bound each step of starting a builder, so a stalled image pull moves on to
+# the next BuildKit candidate: at most 300 seconds per candidate, 600 for the
+# mirror and the source together.
+BUILDX_CREATE_TIMEOUT_SECONDS = 60
+BUILDX_BOOTSTRAP_TIMEOUT_SECONDS = 180
+BUILDX_RM_TIMEOUT_SECONDS = 60
+# Bounds mirror-images.sh's lookup of a Dockerfile's mirrored bases, which
+# inspects each one in the mirror; past it, the build uses the FROM images.
+MIRROR_LOOKUP_TIMEOUT_SECONDS = 120
 # Downstream builder subclasses still read these during their compatibility transition.
 MAIN_HISTORY_DEPTH = 100
 MAIN_HISTORY_READ_ATTEMPTS = 3
@@ -60,6 +81,41 @@ REGISTRY_RATE_LIMIT_PATTERN = re.compile(
     r"(?:\btoomanyrequests:\s*Rate exceeded\b|\b429 Too Many Requests\b)",
     re.IGNORECASE,
 )
+# A push the network or registry dropped. A refusal (bad credentials, an
+# immutable tag) names none of these, so it fails at once.
+TRANSIENT_PUSH_FAILURE_PATTERN = re.compile(
+    r"\bfailed to push\b.*(?:TLS handshake timeout|i/o timeout|connection reset"
+    r"|connection refused|unexpected EOF|broken pipe|no such host"
+    r"|server misbehaving|context deadline exceeded"
+    r"|\b50[0234] (?:Internal Server Error|Bad Gateway|Service Unavailable|Gateway Timeout)\b)",
+    re.IGNORECASE,
+)
+# A build that could not read a layer blob a manifest named: missing,
+# unreadable or corrupt. BuildKit reports it the same way while building and,
+# for layers it took from a cache, while pushing ("failed to push ...:
+# httpReadSeeker: ..."). The blob may belong to an imported cache or to a
+# mirrored base image.
+LAYER_READ_FAILURE_PATTERN = re.compile(
+    r"^ERROR:.*(?:httpReadSeeker|could not fetch content descriptor"
+    r"|unexpected commit digest|failed size validation)"
+)
+# The progress lines of BuildKit's cache export, which logs its failures even
+# when `ignore-error=true` keeps them from failing the build.
+CACHE_EXPORT_VERTEX_PATTERN = re.compile(r"^#(\d+) exporting cache\b")
+VERTEX_ERROR_PATTERN = re.compile(r"^#(\d+) ERROR: (.*)")
+# Answers a retry cannot change: rejected, expired or missing credentials.
+REGISTRY_AUTH_FAILURE_PATTERN = re.compile(
+    r"(?:\b40[013] (?:Bad Request|Unauthorized|Forbidden)\b|unauthorized|denied"
+    r"|ExpiredToken|InvalidClientTokenId|UnrecognizedClient|SignatureDoesNotMatch"
+    r"|Unable to locate credentials)",
+    re.IGNORECASE,
+)
+# Holds every feature's layer cache under feature-prefixed tags: a registry
+# host, optionally with a port, and an untagged repository path.
+CACHE_REPOSITORY_PATTERN = re.compile(
+    r"[a-z0-9][a-z0-9.-]*(?::[0-9]+)?(?:/[a-z0-9][a-z0-9._-]*)+"
+)
+TRUSTED_CACHE_WRITER_REPOSITORY = "perplexityai/SPACE"
 
 RELEASE_IMAGE_REPOSITORIES: dict[str, str] = json.loads(
     RELEASE_IMAGE_MANIFEST.read_text()
@@ -104,6 +160,8 @@ RUST_DEPENDENCY_INPUTS = (
     Path("rust-toolchain.toml"),
     Path("docker/Dockerfile.rust-build-common"),
     Path("docker/run-cargo-with-sccache.sh"),
+    # Copied into the dependency stage before `cargo chef cook`.
+    Path("infra/space/identity/node-identities.sh"),
 )
 
 
@@ -142,6 +200,7 @@ def run(
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
     input_text: str | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         list(args),
@@ -151,6 +210,7 @@ def run(
         cwd=str(cwd) if cwd is not None else None,
         env=env,
         input=input_text,
+        timeout=timeout,
     )
     if check and result.returncode != 0:
         raise subprocess.CalledProcessError(
@@ -162,17 +222,172 @@ def run(
     return result
 
 
+def run_registry_command(
+    args: Sequence[str], *, description: str, input_text: str | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run a short registry call, retrying all but authentication failures.
+
+    Exits ECR_TRANSIENT_ERROR_EXIT_STATUS once ECR_LOGIN_MAX_ATTEMPTS attempts
+    have failed. Standard output is captured and never printed, since it can
+    hold a registry password.
+    """
+    delay_seconds = ECR_LOGIN_INITIAL_DELAY_SECONDS
+    for attempt in range(1, ECR_LOGIN_MAX_ATTEMPTS + 1):
+        try:
+            result = run(
+                args,
+                check=False,
+                capture=True,
+                input_text=input_text,
+                timeout=REGISTRY_COMMAND_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            result = subprocess.CompletedProcess(
+                args, 1, "", f"timed out after {REGISTRY_COMMAND_TIMEOUT_SECONDS}s\n"
+            )
+        if result.returncode == 0:
+            return result
+        sys.stderr.write(result.stderr)
+        if REGISTRY_AUTH_FAILURE_PATTERN.search(result.stderr):
+            raise subprocess.CalledProcessError(result.returncode, args)
+        if attempt == ECR_LOGIN_MAX_ATTEMPTS:
+            print(
+                f"{description} failed {attempt} times; exiting "
+                f"{ECR_TRANSIENT_ERROR_EXIT_STATUS} to mark the failure transient.",
+                file=sys.stderr,
+            )
+            raise SystemExit(ECR_TRANSIENT_ERROR_EXIT_STATUS)
+        print(
+            f"{description} failed (attempt {attempt}/{ECR_LOGIN_MAX_ATTEMPTS}); "
+            f"retrying in {delay_seconds}s.",
+            file=sys.stderr,
+        )
+        time.sleep(delay_seconds)
+        delay_seconds *= 2
+
+    raise AssertionError("unreachable")
+
+
+def registry_ref_exists(ref: str) -> bool:
+    """Whether a registry serves `ref`. An unreachable registry counts as a miss."""
+    try:
+        result = run(
+            ["docker", "buildx", "imagetools", "inspect", "--raw", ref],
+            check=False,
+            capture=True,
+            timeout=REGISTRY_LOOKUP_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"--- :warning: Looking up {ref} timed out; treating it as absent.")
+        return False
+    if result.returncode != 0 and "not found" not in result.stderr:
+        error = result.stderr.strip().splitlines()[-1:] or ["no error output"]
+        print(f"--- :warning: Couldn't look up {ref}; treating it as absent: {error[0]}")
+    return result.returncode == 0
+
+
+def mirrored_image_ref(name: str) -> str | None:
+    """GitHub CI's GHCR mirror of an image ci/mirrored-images.txt lists, by digest.
+
+    None unless SPACE_CI_IMAGE_MIRROR is set, as for mirror-images.sh, and for
+    an unlisted image.
+    """
+    if not os.environ.get("SPACE_CI_IMAGE_MIRROR"):
+        return None
+    listing = Path(os.environ.get("SPACE_MIRRORED_IMAGES") or MIRRORED_IMAGES_LIST)
+    for line in listing.read_text().splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and fields[0] == name:
+            digest, destination = fields[1], fields[2]
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                raise SystemExit(f"Malformed line in {listing}: {line}")
+            return f"{destination.rsplit(':', 1)[0]}@{digest}"
+    return None
+
+
+def without_external_sources(command: Sequence[str]) -> list[str]:
+    """The command without its cache imports and registry build contexts.
+
+    The build then takes every layer from the Dockerfile's own sources. Cache
+    exports stay, so a rebuild on main replaces a damaged cache; local build
+    contexts, such as the Rust artifacts, stay too.
+    """
+    result: list[str] = []
+    args = iter(command)
+    for arg in args:
+        if arg == "--cache-from":
+            next(args, None)
+        elif arg == "--build-context":
+            value = next(args, "")
+            if "=docker-image://" not in value:
+                result.extend([arg, value])
+        elif arg.startswith("--cache-from=") or (
+            arg.startswith("--build-context=") and "=docker-image://" in arg
+        ):
+            continue
+        else:
+            result.append(arg)
+    return result
+
+
+def external_source_names(command: Sequence[str]) -> list[str]:
+    """How BuildKit's errors name the registries the command's cache imports
+    and registry build contexts read: each repository by reference and by its
+    registry API URL. A failure naming one, such as resolving a mirrored
+    base's metadata, is that copy's failure, not the build's.
+    """
+    names: list[str] = []
+    args = list(command)
+    for index, arg in enumerate(args):
+        if arg in {"--cache-from", "--build-context"} and index + 1 < len(args):
+            value = args[index + 1]
+        elif arg.startswith(("--cache-from=", "--build-context=")):
+            value = arg.split("=", 1)[1]
+        else:
+            continue
+        if "=docker-image://" in value:
+            ref = value.split("=docker-image://", 1)[1]
+        else:
+            refs = [part[4:] for part in value.split(",") if part.startswith("ref=")]
+            if not refs:
+                continue
+            ref = refs[0]
+        repository = ref.split("@", 1)[0]
+        host, _, path = repository.partition("/")
+        if ":" in path.rsplit("/", 1)[-1]:
+            path = path.rsplit(":", 1)[0]
+        names.extend([f"{host}/{path}", f"{host}/v2/{path}/"])
+    return names
+
+
 def run_buildx_command(
     args: Sequence[str],
     *,
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
+    published: Callable[[], bool] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    command = list(args)
-    delay_seconds = BUILDX_RATE_LIMIT_INITIAL_DELAY_SECONDS
+    """Run a buildx build, retrying registry rate limits and dropped pushes.
 
-    for attempt in range(1, BUILDX_RATE_LIMIT_MAX_ATTEMPTS + 1):
-        rate_limited = False
+    A build that fails reading a layer while it imports a cache or takes a
+    base from a registry build context (GitHub CI's mirror), or fails with an
+    error that names one of those registries, runs once more without either, so a damaged or unreachable copy costs a cold build from
+    the sources rather than the job. `published`, when given, says whether a
+    push the build reported as failed has reached the registry anyway; a
+    retry would then collide with the immutable tag it wrote. A cache export
+    that failed is reported as a warning, since it does not fail the build.
+    """
+    command = [str(arg) for arg in args]
+    delay_seconds = BUILDX_RATE_LIMIT_INITIAL_DELAY_SECONDS
+    attempt = 1
+
+    while True:
+        print(f"+ {shlex.join(command)}", file=sys.stderr, flush=True)
+        retryable = False
+        source_failed = False
+        sources = external_source_names(command)
+        export_vertices: set[str] = set()
+        export_error = ""
         with subprocess.Popen(
             command,
             text=True,
@@ -185,37 +400,81 @@ def run_buildx_command(
             for line in process.stderr:
                 sys.stderr.write(line)
                 sys.stderr.flush()
-                rate_limited = (
-                    rate_limited or REGISTRY_RATE_LIMIT_PATTERN.search(line) is not None
+                retryable = (
+                    retryable
+                    or REGISTRY_RATE_LIMIT_PATTERN.search(line) is not None
+                    or TRANSIENT_PUSH_FAILURE_PATTERN.search(line) is not None
                 )
+                source_failed = (
+                    source_failed
+                    or LAYER_READ_FAILURE_PATTERN.search(line) is not None
+                    or (line.startswith("ERROR:") and any(name in line for name in sources))
+                )
+                if match := CACHE_EXPORT_VERTEX_PATTERN.match(line):
+                    export_vertices.add(match.group(1))
+                elif (match := VERTEX_ERROR_PATTERN.match(line)) and match.group(1) in export_vertices:
+                    export_error = match.group(2).strip()
             returncode = process.wait()
 
         if returncode == 0:
+            if export_error:
+                print(
+                    f"::warning::Exporting the layer cache failed, so later runs reuse "
+                    f"an older cache or build cold: {export_error}"
+                )
             return subprocess.CompletedProcess(command, returncode)
-        if not rate_limited:
+        fallback = without_external_sources(command)
+        if source_failed and fallback != command:
+            if published is not None and published():
+                print(
+                    "Buildx reported a failed push, but the registry holds the image; "
+                    "not pushing again.",
+                    file=sys.stderr,
+                )
+                return subprocess.CompletedProcess(command, 0)
+            print(
+                "::warning::The build could not use the layer cache or the image "
+                "mirror; building once more from the Dockerfile's sources without "
+                "them."
+            )
+            command = fallback
+            continue
+        if not retryable:
             raise subprocess.CalledProcessError(returncode, command)
+        if published is not None and published():
+            print(
+                "Buildx reported a failed push, but the registry holds the image; "
+                "not pushing again.",
+                file=sys.stderr,
+            )
+            return subprocess.CompletedProcess(command, 0)
         if attempt == BUILDX_RATE_LIMIT_MAX_ATTEMPTS:
             print(
-                f"Buildx registry rate limit persisted for {attempt} attempts; "
-                f"exiting {ECR_TRANSIENT_ERROR_EXIT_STATUS} so Buildkite can retry.",
+                f"Buildx registry errors persisted for {attempt} attempts; exiting "
+                f"{ECR_TRANSIENT_ERROR_EXIT_STATUS} to mark the failure transient.",
                 file=sys.stderr,
             )
             raise SystemExit(ECR_TRANSIENT_ERROR_EXIT_STATUS)
 
         print(
-            f"Buildx registry rate limited attempt {attempt}/"
-            f"{BUILDX_RATE_LIMIT_MAX_ATTEMPTS}; retrying in {delay_seconds}s.",
+            f"Buildx registry rate limit or transient push failure on attempt "
+            f"{attempt}/{BUILDX_RATE_LIMIT_MAX_ATTEMPTS}; retrying in {delay_seconds}s.",
             file=sys.stderr,
         )
         time.sleep(delay_seconds)
         delay_seconds *= 2
+        attempt += 1
 
-    raise AssertionError("unreachable")
 
-
-def run_buildx(args: Sequence[str], *, push: bool, context: Path = REPO_ROOT) -> None:
+def run_buildx(
+    args: Sequence[str],
+    *,
+    push: bool,
+    context: Path = REPO_ROOT,
+    published: Callable[[], bool] | None = None,
+) -> None:
     command = [*args, "--push" if push else "--load", str(context)]
-    run_buildx_command(command)
+    run_buildx_command(command, published=published)
 
 
 def run_buildx_local_output(
@@ -425,6 +684,7 @@ class BundleBuilder:
         self._targets: list[Target] | None = None
         self.ecr_logged_in_hosts: set[str] = set()
         self.buildx_builder_name = ""
+        self._abandoned_builders: list[str] = []
         self.disable_external_cache = False
         self._branch_name: str | None = None
         self._uv_bin: str | None = None
@@ -531,6 +791,49 @@ class BundleBuilder:
             "Expected registry or gha."
         )
 
+    @staticmethod
+    def cache_repository() -> str | None:
+        """The repository SPACE_BUNDLE_CACHE_REPOSITORY names for the registry
+        cache, or None to keep it in each feature's primary-target repository.
+        """
+        value = os.environ.get("SPACE_BUNDLE_CACHE_REPOSITORY", "")
+        if not value:
+            return None
+        if not CACHE_REPOSITORY_PATTERN.fullmatch(value):
+            raise SystemExit(
+                f"Invalid SPACE_BUNDLE_CACHE_REPOSITORY value: {value!r}. "
+                "Expected a lowercase registry repository without a tag or digest."
+            )
+        return value
+
+    def uses_target_cache(self) -> bool:
+        """Whether the registry cache lives in the publish targets' repositories."""
+        return self.should_use_registry_cache() and not self.cache_repository()
+
+    def cache_target(self) -> Target | None:
+        return None if self.cache_repository() else self.primary_target()
+
+    def cache_location(self, target: Target | None) -> str:
+        return self.cache_repository() or (target.name if target else "unknown")
+
+    @staticmethod
+    def require_trusted_cache_writer() -> None:
+        # Imports are optional and may come from anywhere that can read the
+        # repository. Only main pushes of this repository write it; the
+        # workflow, not this check, withholds the token's write permission.
+        trusted = (
+            os.environ.get("GITHUB_ACTIONS") == "true"
+            and os.environ.get("GITHUB_EVENT_NAME") == "push"
+            and os.environ.get("GITHUB_REF") == "refs/heads/main"
+            and os.environ.get("GITHUB_REPOSITORY") == TRUSTED_CACHE_WRITER_REPOSITORY
+        )
+        if not trusted:
+            raise SystemExit(
+                "Only main push CI in "
+                f"{TRUSTED_CACHE_WRITER_REPOSITORY} writes SPACE_BUNDLE_CACHE_REPOSITORY; "
+                "set SPACE_BUNDLE_CACHE=read-only elsewhere."
+            )
+
     def branch_name(self) -> str | None:
         if self._branch_name is not None:
             return self._branch_name
@@ -623,14 +926,18 @@ class BundleBuilder:
         if policy == "read-only":
             return False
         if policy == "enabled":
-            return True
-        if policy == "disabled":
+            export = True
+        elif policy == "disabled":
             return False
-        # Publishing BuildKit caches is synchronous and can add more than a
-        # minute after compilation has finished. PR builds still consume the
-        # main cache and use sccache for compiler outputs; main refreshes the
-        # BuildKit cache without extending the PR critical path.
-        return self.is_main_branch_context() and not self.pull_request_number()
+        else:
+            # Publishing BuildKit caches is synchronous and can add more than a
+            # minute after compilation has finished. PR builds still consume the
+            # main cache and use sccache for compiler outputs; main refreshes the
+            # BuildKit cache without extending the PR critical path.
+            export = self.is_main_branch_context() and not self.pull_request_number()
+        if export and self.cache_repository():
+            self.require_trusted_cache_writer()
+        return export
 
     def should_export_cache(self) -> bool:
         if not self.should_use_cache():
@@ -648,6 +955,8 @@ class BundleBuilder:
     def cache_mode_message(self) -> str:
         policy = self.normalized_cache_policy()
         backend = self.cache_backend()
+        if backend == "registry" and self.cache_repository():
+            backend = f"registry ({self.cache_repository()})"
         if policy == "read-only":
             return (
                 f"{backend} cache enabled for imports only via "
@@ -685,10 +994,14 @@ class BundleBuilder:
         return self.should_publish_bundle_images() or self.should_use_cache()
 
     def should_push_remote_rust_artifact(self) -> bool:
-        # The GitHub Actions cache carries Rust artifacts between runs, so a
-        # gha build hands them to the bundle build as a local context and keeps
-        # the registry to deployable images.
-        return bool(self.buildx_builder_name) and self.cache_backend() == "registry"
+        # A gha build, or one whose cache has its own repository, hands the
+        # artifacts to the bundle build as a local context and keeps the
+        # publish targets to deployable images.
+        return (
+            bool(self.buildx_builder_name)
+            and self.cache_backend() == "registry"
+            and not self.cache_repository()
+        )
 
     @staticmethod
     def repository_name_for_feature(feature: str) -> str:
@@ -867,6 +1180,15 @@ class BundleBuilder:
             for target in self.resolve_targets()
         )
 
+    def push_reached_registry(self, feature: str) -> bool:
+        """Whether a push buildx reported as failed was stored anyway. A
+        lookup that fails too counts as no, so the push is retried."""
+        try:
+            return self.commit_images_published(feature)
+        except (subprocess.CalledProcessError, SystemExit) as exc:
+            print(f"--- :warning: Couldn't check the published {feature} image: {exc}")
+            return False
+
     def rust_artifact_digest(self, feature: str) -> str:
         if feature not in self._rust_artifact_digests:
             namespace = (
@@ -913,11 +1235,8 @@ class BundleBuilder:
     def rust_dependency_cache_tag(self, feature: str) -> str:
         return f"buildcache-rust-deps-{self.rust_dependency_digest(feature)}"
 
-    def rust_dependency_cache_ref(self, target: Target, feature: str) -> str:
-        return (
-            f"{target.registry_host}/{self.repository_name_for_feature(feature)}:"
-            f"{self.rust_dependency_cache_tag(feature)}"
-        )
+    def rust_dependency_cache_ref(self, target: Target | None, feature: str) -> str:
+        return self.cache_ref(target, feature, self.rust_dependency_cache_tag(feature))
 
     @classmethod
     def build_git_sha(cls) -> str:
@@ -932,11 +1251,19 @@ class BundleBuilder:
         )
         return result.stdout.strip() or "unknown"
 
-    def main_cache_ref(self, target: Target, feature: str, kind: str) -> str:
-        return (
-            f"{target.registry_host}/{self.repository_name_for_feature(feature)}:"
-            f"{self.cache_tag_for_kind(kind)}"
-        )
+    def cache_ref(self, target: Target | None, feature: str, tag: str) -> str:
+        """Where the registry cache keeps `tag`: in SPACE_BUNDLE_CACHE_REPOSITORY
+        under the feature's prefix, or else in the target's feature repository.
+        """
+        repository = self.cache_repository()
+        if repository:
+            return f"{repository}:{feature}-{tag}"
+        if target is None:
+            raise SystemExit("The registry cache needs a target or SPACE_BUNDLE_CACHE_REPOSITORY.")
+        return f"{target.registry_host}/{self.repository_name_for_feature(feature)}:{tag}"
+
+    def main_cache_ref(self, target: Target | None, feature: str, kind: str) -> str:
+        return self.cache_ref(target, feature, self.cache_tag_for_kind(kind))
 
     def pr_cache_tag_for_kind(self, kind: str) -> str | None:
         pr = self.pull_request_number()
@@ -944,11 +1271,11 @@ class BundleBuilder:
             return None
         return f"{self.cache_tag_for_kind(kind)}-pr-{pr}"
 
-    def pr_cache_ref(self, target: Target, feature: str, kind: str) -> str | None:
+    def pr_cache_ref(self, target: Target | None, feature: str, kind: str) -> str | None:
         tag = self.pr_cache_tag_for_kind(kind)
         if not tag:
             return None
-        return f"{target.registry_host}/{self.repository_name_for_feature(feature)}:{tag}"
+        return self.cache_ref(target, feature, tag)
 
     @staticmethod
     def buildx_cache_to_option(cache_ref: str) -> str:
@@ -1024,55 +1351,77 @@ class BundleBuilder:
         if run(["docker", "buildx", "version"], check=False).returncode != 0:
             raise SystemExit("docker buildx is not available after installing the Docker CLI tools.")
 
+    @staticmethod
+    def buildkit_images() -> list[str]:
+        """The pinned BuildKit image's references, in the order to try them:
+        GitHub CI's mirror of it when it is listed, then its source."""
+        mirrored = mirrored_image_ref(BUILDKIT_IMAGE)
+        return [mirrored, BUILDKIT_IMAGE] if mirrored else [BUILDKIT_IMAGE]
+
+    @staticmethod
+    def remove_buildx_builder(name: str) -> bool:
+        try:
+            return run(
+                ["docker", "buildx", "rm", "--force", name],
+                check=False,
+                timeout=BUILDX_RM_TIMEOUT_SECONDS,
+            ).returncode == 0
+        except subprocess.TimeoutExpired:
+            print(f"--- :warning: Removing buildx builder {name} timed out.")
+            return False
+
+    def start_buildx_builder(self, name: str, image: str) -> bool:
+        create = [
+            "docker",
+            "buildx",
+            "create",
+            "--name",
+            name,
+            "--driver",
+            "docker-container",
+            "--driver-opt",
+            f"image={image}",
+            "--use",
+        ]
+        # The docker-container driver pulls its image at bootstrap, not create.
+        bootstrap = ["docker", "buildx", "inspect", name, "--bootstrap"]
+        for step, command, timeout in (
+            ("create", create, BUILDX_CREATE_TIMEOUT_SECONDS),
+            ("bootstrap", bootstrap, BUILDX_BOOTSTRAP_TIMEOUT_SECONDS),
+        ):
+            try:
+                failed = run(command, check=False, timeout=timeout).returncode != 0
+            except subprocess.TimeoutExpired:
+                failed = True
+                print(f"--- :warning: {step.capitalize()} timed out after {timeout}s.")
+            if failed:
+                print(f"--- :warning: Failed to {step} buildx builder {name} from {image}.")
+                # A create that timed out may still have registered the builder;
+                # one that can't be removed now is removed again at cleanup.
+                if not self.remove_buildx_builder(name):
+                    self._abandoned_builders.append(name)
+                return False
+        return True
+
     def setup_buildx_builder(self) -> None:
         if not self.should_use_explicit_buildx_builder() or self.buildx_builder_name:
             return
 
-        self.buildx_builder_name = f"space-bundle-{random.randint(1000, 9999)}{random.randint(1000, 9999)}"
-        print(f"--- :docker: Creating buildx builder {self.buildx_builder_name}")
-
-        create = run(
-            [
-                "docker",
-                "buildx",
-                "create",
-                "--name",
-                self.buildx_builder_name,
-                "--driver",
-                "docker-container",
-                "--driver-opt",
-                f"image={BUILDKIT_IMAGE}",
-                "--use",
-            ],
-            check=False,
-        )
-        if create.returncode != 0:
-            print(
-                "--- :warning: Failed to create a docker-container buildx builder; falling back to the default builder."
-            )
-            print(
-                "--- :warning: External cache is disabled for this run because the default builder may not support it."
-            )
-            self.buildx_builder_name = ""
-            self.disable_external_cache = True
-            self.require_pinned_builder_when_publishing()
-            return
-
-        inspect = run(
-            ["docker", "buildx", "inspect", self.buildx_builder_name, "--bootstrap"],
-            check=False,
-        )
-        if inspect.returncode == 0:
-            return
+        for image in self.buildkit_images():
+            # A fresh name per image, so a builder a failed attempt couldn't
+            # remove doesn't block the next one.
+            name = f"space-bundle-{random.randint(1000, 9999)}{random.randint(1000, 9999)}"
+            print(f"--- :docker: Creating buildx builder {name} from {image}")
+            if self.start_buildx_builder(name, image):
+                self.buildx_builder_name = name
+                return
 
         print(
-            f"--- :warning: Failed to bootstrap buildx builder {self.buildx_builder_name}; falling back to the default builder."
+            "--- :warning: Couldn't start a docker-container buildx builder; falling back to the default builder."
         )
         print(
             "--- :warning: External cache is disabled for this run because the default builder may not support it."
         )
-        run(["docker", "buildx", "rm", "--force", self.buildx_builder_name], check=False)
-        self.buildx_builder_name = ""
         self.disable_external_cache = True
         self.require_pinned_builder_when_publishing()
 
@@ -1087,8 +1436,11 @@ class BundleBuilder:
 
     def cleanup_buildx_builder(self) -> None:
         if self.buildx_builder_name:
-            run(["docker", "buildx", "rm", "--force", self.buildx_builder_name], check=False)
+            self.remove_buildx_builder(self.buildx_builder_name)
             self.buildx_builder_name = ""
+        for name in self._abandoned_builders:
+            self.remove_buildx_builder(name)
+        self._abandoned_builders.clear()
         for temporary_directory in self._temporary_directories:
             temporary_directory.cleanup()
         self._temporary_directories.clear()
@@ -1130,13 +1482,14 @@ class BundleBuilder:
         return result.returncode == 0
 
     def cache_tag_exists(
-        self, target: Target, feature: str, kind: str, *, tag: str | None = None
+        self, target: Target | None, feature: str, kind: str, *, tag: str | None = None
     ) -> bool:
-        return self.image_tag_exists(
-            target,
-            feature,
-            tag or self.cache_tag_for_kind(kind),
-        )
+        tag = tag or self.cache_tag_for_kind(kind)
+        if self.cache_repository():
+            return registry_ref_exists(self.cache_ref(target, feature, tag))
+        if target is None:
+            raise SystemExit("The registry cache needs a target or SPACE_BUNDLE_CACHE_REPOSITORY.")
+        return self.image_tag_exists(target, feature, tag)
 
     def ensure_ecr_login(self) -> None:
         # ECR auth tokens issued by `get-login-password` are scoped to the IAM
@@ -1149,14 +1502,15 @@ class BundleBuilder:
         if not unseen:
             return
         self.prepare_aws_environment()
-        password = run(
+        password = run_registry_command(
             self.aws_command("ecr", "get-login-password", "--region", AWS_REGION),
-            capture=True,
+            description="Fetching the ECR login password",
         ).stdout
         for target in unseen:
             print(f"--- :docker: Logging into {target.registry_host} ({target.name})")
-            run(
+            run_registry_command(
                 ["docker", "login", "--username", "AWS", "--password-stdin", target.registry_host],
+                description=f"Logging into {target.registry_host}",
                 input_text=password,
             )
             self.ecr_logged_in_hosts.add(target.registry_host)
@@ -1171,10 +1525,18 @@ class BundleBuilder:
         if not os.environ.get("SPACE_CI_IMAGE_MIRROR") or "--file" not in command:
             return []
         dockerfile = command[list(command).index("--file") + 1]
-        result = run(
-            ["bash", str(MIRROR_IMAGES_SCRIPT), "build-contexts", dockerfile],
-            capture=True,
-        )
+        try:
+            result = run(
+                ["bash", str(MIRROR_IMAGES_SCRIPT), "build-contexts", dockerfile],
+                capture=True,
+                timeout=MIRROR_LOOKUP_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            print(
+                f"::warning::Looking up the mirrored bases of {dockerfile} timed out "
+                f"after {MIRROR_LOOKUP_TIMEOUT_SECONDS}s; building from its FROM images."
+            )
+            return []
         sys.stderr.write(result.stderr)
         return result.stdout.split()
 
@@ -1242,7 +1604,8 @@ class BundleBuilder:
         # Cache imports come from the primary target only. Other targets
         # (e.g. prod on `main`) only ever see main-line images, so their
         # caches are derivative of the primary's and add nothing on import.
-        primary = self.primary_target()
+        primary = self.cache_target()
+        location = self.cache_location(primary)
         imported: list[str] = []
 
         pr_tag = self.pr_cache_tag_for_kind(kind)
@@ -1250,16 +1613,19 @@ class BundleBuilder:
             command.extend(
                 ["--cache-from", f"type=registry,ref={self.pr_cache_ref(primary, feature, kind)}"]
             )
-            imported.append(f"{primary.name} PR-{self.pull_request_number()}")
+            imported.append(f"{location} PR-{self.pull_request_number()}")
 
         if self.cache_tag_exists(primary, feature, kind):
             command.extend(
                 ["--cache-from", f"type=registry,ref={self.main_cache_ref(primary, feature, kind)}"]
             )
-            imported.append(f"{primary.name} main")
+            imported.append(f"{location} main")
 
         if not imported:
-            print(f"--- :docker: No existing {label} cache found for {feature}; skipping cache import.")
+            print(
+                f"--- :docker: No existing {label} cache found for {feature} at "
+                f"{self.main_cache_ref(primary, feature, kind)}; skipping cache import."
+            )
         else:
             print(f"--- :docker: Importing {label} cache for {feature} from: {', '.join(imported)}")
 
@@ -1274,13 +1640,15 @@ class BundleBuilder:
         pr = self.pull_request_number()
         label = "Rust" if kind == "rust" else "image"
         exported: list[str] = []
-        for target in targets:
+        # A cache repository holds one cache for every target.
+        locations: list[Target | None] = [None] if self.cache_repository() else [*targets]
+        for target in locations:
             if pr:
                 cache_ref = self.pr_cache_ref(target, feature, kind)
-                where = f"{target.name} PR-{pr}"
+                where = f"{self.cache_location(target)} PR-{pr}"
             else:
                 cache_ref = self.main_cache_ref(target, feature, kind)
-                where = f"{target.name} main"
+                where = f"{self.cache_location(target)} main"
             if not cache_ref:
                 continue
             command.extend(
@@ -1299,11 +1667,20 @@ class BundleBuilder:
             return
         if not self.should_use_registry_cache():
             return
+        if self.cache_repository():
+            # One rolling tag per feature, refreshed by every main push, as for
+            # the image cache: a dependency change still imports the toolchain
+            # layers, any input change is re-exported by the next main push,
+            # and every superseded version is untagged, so pruning untagged
+            # versions bounds the repository.
+            self.maybe_append_cache_import(command, feature, "rust")
+            self.maybe_append_cache_export(command, feature, "rust", targets=[])
+            return
 
-        primary = self.primary_target()
+        primary = self.cache_target()
         cache_tag = self.rust_dependency_cache_tag(feature)
         cache_ref = self.rust_dependency_cache_ref(primary, feature)
-        if self.image_tag_exists(primary, feature, cache_tag):
+        if self.cache_tag_exists(primary, feature, "rust", tag=cache_tag):
             command.extend(["--cache-from", f"type=registry,ref={cache_ref}"])
             print(
                 f"--- :docker: Importing content-addressed Rust dependency cache for {feature}."
@@ -1326,6 +1703,22 @@ class BundleBuilder:
             print(
                 f"--- :docker: Exporting new Rust dependency cache for {feature} "
                 f"({self.rust_dependency_digest(feature)[:12]})."
+            )
+
+    def check_cache_written(self, command: Sequence[str], feature: str, kind: str) -> None:
+        """Warn when a build that exported to the cache repository left no cache.
+
+        Exports ignore errors so a cache problem never fails a build; this
+        keeps a lasting one (no package, no write permission) from going
+        unnoticed while every run stays cold.
+        """
+        if not self.cache_repository() or "--cache-to" not in command:
+            return
+        ref = self.main_cache_ref(None, feature, kind)
+        if not registry_ref_exists(ref):
+            print(
+                f"::warning::The {kind} layer cache for {feature} was not written to "
+                f"{ref}; later runs will build cold until it is."
             )
 
     def create_rust_artifact_context(self, feature: str) -> Path:
@@ -1397,11 +1790,12 @@ class BundleBuilder:
             run_buildx_local_output(command, local_context, context=self.source_root)
         else:
             run_buildx(command, push=push_remote, context=self.source_root)
+        self.check_cache_written(command, feature, "rust")
 
     def build_space_bundle_image(self, feature: str) -> None:
         dockerfile = self.dockerfile_for_feature(feature)
         publish = self.should_publish_bundle_images()
-        targets = self.resolve_targets() if publish or self.should_use_registry_cache() else []
+        targets = self.resolve_targets() if publish or self.uses_target_cache() else []
 
         if publish:
             output_refs = [
@@ -1471,7 +1865,13 @@ class BundleBuilder:
         self.maybe_append_cache_import(command, feature, "image")
         self.maybe_append_cache_export(command, feature, "image", targets=targets[:1])
 
-        run_buildx(command, push=publish, context=self.source_root)
+        run_buildx(
+            command,
+            push=publish,
+            context=self.source_root,
+            published=(lambda: self.push_reached_registry(feature)) if publish else None,
+        )
+        self.check_cache_written(command, feature, "image")
 
     def publish_space_bundle_image_message(self, feature: str) -> None:
         if not self.should_publish_bundle_images():
@@ -1497,8 +1897,8 @@ class BundleBuilder:
             self.publish_space_bundle_image_message(feature)
 
     def targets_message(self) -> str:
-        if not self.should_publish_bundle_images() and not self.should_use_registry_cache():
-            return "No registry targets needed for this local build."
+        if not self.should_publish_bundle_images() and not self.uses_target_cache():
+            return "No registry targets needed for this build."
         targets = self.resolve_targets()
         names = ", ".join(f"{t.name} ({t.account_id})" for t in targets)
         return f"Publish targets: {names}."
@@ -1509,9 +1909,11 @@ class BundleBuilder:
         print(f"--- :docker: {self.cache_mode_message()}")
         print(f"--- :docker: {self.targets_message()}")
         self.wait_for_docker()
-        self.setup_buildx_builder()
         try:
-            if self.should_publish_bundle_images() or self.should_use_registry_cache():
+            # Inside the try, so builders a failed setup left are removed even
+            # when a publishing build then exits.
+            self.setup_buildx_builder()
+            if self.should_publish_bundle_images() or self.uses_target_cache():
                 self.ensure_ecr_login()
             for feature in self.features:
                 self.build_space_bundle_feature(feature)
