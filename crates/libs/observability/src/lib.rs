@@ -57,8 +57,6 @@ static GIT_SHA: OnceLock<String> = OnceLock::new();
 
 const GIT_SHA_PATHS: &[&str] = &["/etc/space/build-git-sha", "/space/etc/build-git-sha"];
 
-pub use sink::METRICS_TARGET;
-
 /// Workspace package version stamped into every SPACE binary at build time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -627,9 +625,7 @@ enum LogFormat {
 pub enum ObservabilityError {
     #[error("invalid SPACE_LOG_FORMAT={raw:?}; expected one of: json, compact, pretty, text")]
     InvalidLogFormat { raw: String },
-    #[error(
-        "invalid SPACE_METRICS_SINK={raw:?}; expected one of: auto, datadog, journald, otlp, off"
-    )]
+    #[error("invalid SPACE_METRICS_SINK={raw:?}; expected one of: auto, datadog, otlp, off")]
     InvalidMetricsSink { raw: String },
     #[error("SPACE_METRICS_SINK={raw:?} requires the datadog feature")]
     DatadogMetricsSinkUnavailable { raw: String },
@@ -1133,10 +1129,7 @@ fn should_format_event(metadata: &tracing::Metadata<'_>) -> bool {
 }
 
 fn should_format_target(target: &str) -> bool {
-    !matches!(
-        target,
-        RUSQLITE_QUERY_TARGET | SQLX_QUERY_TARGET | sink::METRICS_TARGET
-    )
+    !matches!(target, RUSQLITE_QUERY_TARGET | SQLX_QUERY_TARGET)
 }
 
 #[cfg(feature = "otel")]
