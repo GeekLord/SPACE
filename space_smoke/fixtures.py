@@ -1223,12 +1223,36 @@ class CommandSandboxFixture:
                 sandbox_id, node_names=[worker], since_time=since_time
             )
             if any(event.reason == "cluster_row_absent" for event in evictions):
+                reclaimed_by = "node eviction completed"
+                break
+            # The eviction's first cleanup attempt can be refused as retryable,
+            # for example while node-manager resets the network slot the stop
+            # released: the reset holds the sandbox's exclusive host-mutation
+            # claim. sbx-manager then reports the eviction failed once and
+            # durable cleanup recovery finishes the claimed row without another
+            # eviction event. A failed event alone does not prove the claim:
+            # refusals before it carry the same reason. Only the eviction's own
+            # durable cleanup job, created after the claim, prefixes the
+            # node-manager CleanupSandbox error with its context, so that
+            # prefix proves the claim; the removed rootfs proves the retry
+            # finished. Any other failure leaves the wait on the completed
+            # event above.
+            claimed = any(
+                event.reason == "cluster_row_absent"
+                and event.error.startswith(_CLAIMED_EVICTION_CLEANUP_ERROR_PREFIX)
+                for event in control.local_eviction_failures(
+                    sandbox_id, node_names=[worker], since_time=since_time
+                )
+            )
+            if claimed and not control.sandbox_cache_dir_present(worker, sandbox_id):
+                reclaimed_by = "node eviction claimed; durable cleanup retry completed"
                 break
             self.verify(
                 time.monotonic() < deadline,
                 "deleted stopped sandbox was not reclaimed by node reconciliation",
                 worker=worker,
                 sandbox_id=sandbox_id,
+                eviction_claimed_but_cleanup_pending=claimed,
             )
             self._context.wait(10)
         self.verify(
@@ -1236,7 +1260,7 @@ class CommandSandboxFixture:
             "node cleanup completed but retained rootfs still exists",
             worker=worker,
         )
-        self.record("stopped_delete_local_cleanup", "node eviction completed and rootfs removed")
+        self.record("stopped_delete_local_cleanup", f"{reclaimed_by} and rootfs removed")
 
     def start_background_process(
         self, command: str, *, timeout: int = 60
@@ -4039,6 +4063,12 @@ class StartupRecoveryAssertions:
 # The two healthy outcomes of a remote pull. `remote_local_mismatch` and
 # `remote_metadata_unknown` are anomaly classes and must not pass.
 REMOTE_RESTORE_PROVENANCE = frozenset({"remote_matches_local", "remote_only"})
+
+
+# sbx-manager's durable cleanup job runs with this context and prefixes it to
+# a refused node-manager CleanupSandbox call. A cluster-deleted eviction
+# persists that job only after it has claimed the local row.
+_CLAIMED_EVICTION_CLEANUP_ERROR_PREFIX = "durable sandbox cleanup: "
 
 
 def _log_since_time() -> str:

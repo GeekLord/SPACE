@@ -2018,12 +2018,15 @@ class ColdEvictionConfig:
 
 @dataclass(frozen=True)
 class LocalEviction:
-    """One `local_eviction_completed` sandbox event from a worker's sbx-manager."""
+    """One `local_eviction_completed` or `local_eviction_failed` sandbox event
+    from a worker's sbx-manager."""
 
     sandbox_id: str
     node_name: str
     reason: str
     snapshot_id: str
+    # The failed event's `error`; empty for completed evictions.
+    error: str = ""
 
 
 class ColdEvictionControl(RestoreStateRead, SandboxEventRead, Protocol):
@@ -2060,6 +2063,24 @@ class ColdEvictionControl(RestoreStateRead, SandboxEventRead, Protocol):
         since_time: str | None = None,
     ) -> list[LocalEviction]:
         """`local_eviction_completed` events for the sandbox, from sandbox-manager logs."""
+        ...
+
+    def local_eviction_failures(
+        self,
+        sandbox_id: str,
+        *,
+        node_names: Collection[str] | None = None,
+        since_time: str | None = None,
+    ) -> list[LocalEviction]:
+        """`local_eviction_failed` events for the sandbox, from sandbox-manager logs.
+
+        The event alone does not prove the eviction claimed the local row:
+        sbx-manager emits it, with the same reason, for refusals before the
+        claim (an active cleanup fence, a live restore staging pull, a storage
+        error) as well as for a failed cleanup after it. The `error` tells
+        them apart. A claimed eviction leaves a durable cleanup job, and the
+        recovery that finishes that job emits no further eviction event.
+        """
         ...
 
     def eviction_loop_log(self, node_name: str, *, since_time: str) -> list[str]:
