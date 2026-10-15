@@ -1,6 +1,14 @@
 //! Artifact-owned immutable send inputs. A private parent snapshot keeps retries
 //! independent of template GC; per-attempt wire clones avoid exporting an UUID
 //! that a same-filesystem receive could still find in the retained source.
+//!
+//! btrfs keeps one UUID-tree item listing every subvolume that carries a
+//! received UUID, and `btrfs receive` reads that item with a fixed 3992-byte
+//! search buffer: past 495 holders it cannot find any parent for the template.
+//! Sends therefore stamp a per-attempt wire parent, and with
+//! [`ParentSeal::Unstamped`] the retained private parent rests without the
+//! template's received UUID. Every reader accepts both seals, so a release that
+//! still captures stamped parents can be rolled back to before the switch.
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::MetadataExt;
@@ -29,6 +37,38 @@ const ALLOWED: &[UdsPeerPrincipal] = &[
     ),
 ];
 
+/// The private parent carries the template's received UUID, or once had it
+/// cleared in place. Releases before [`ParentSeal`] read only stamped parents.
+const STAMPED_PARENT_VERSION: u32 = 1;
+/// The private parent was sealed without the received UUID.
+const UNSTAMPED_PARENT_VERSION: u32 = 2;
+const ENV_UNSTAMPED_PARENT: &str = "SPACE_NODEMGR_BTRFS_SEND_UNSTAMPED_PARENT";
+
+/// How capture seals a retained bundle's private parent (module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ParentSeal {
+    /// Version 1, readable by releases before this mode existed. Each bundle
+    /// adds a holder to the template's received-UUID item.
+    Stamped,
+    /// Version 2: no holder at rest. Earlier releases reject these bundles.
+    Unstamped,
+}
+
+impl ParentSeal {
+    /// `SPACE_NODEMGR_BTRFS_SEND_UNSTAMPED_PARENT=true` selects
+    /// [`Self::Unstamped`]; anything else keeps the rollback-safe default.
+    pub(crate) fn from_env() -> Self {
+        Self::from_setting(std::env::var(ENV_UNSTAMPED_PARENT).ok().as_deref())
+    }
+
+    fn from_setting(value: Option<&str>) -> Self {
+        match value.map(|value| value.trim().to_ascii_lowercase()) {
+            Some(value) if matches!(value.as_str(), "1" | "true") => Self::Unstamped,
+            _ => Self::Stamped,
+        }
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
@@ -36,30 +76,47 @@ struct Manifest {
     source_id: Uuid,
     source_uuid: Uuid,
     parent_uuid: Uuid,
+    /// The identity sends export for the parent.
     received_uuid: Uuid,
 }
 
 /// The caller owns the enclosing artifact until publication or cleanup. No
 /// pathname is reopened after pinning it, including when a cache peer renames
 /// the enclosing directory. A partial capture remains inside that same owner.
-pub(super) fn capture(artifact: &Path, parent: &Path, source: &Path) -> Result<Uuid, Status> {
+pub(super) fn capture(
+    artifact: &Path,
+    parent: &Path,
+    source: &Path,
+    seal: ParentSeal,
+) -> Result<Uuid, Status> {
     let artifact = trusted_paths::open_directory(artifact)?;
     let parent = trusted_paths::open_directory(parent)?;
     let source = trusted_paths::open_directory(source)?;
-    capture_open(&artifact, &parent, &source, Uuid::now_v7())
+    let received_uuid = btrfs::info(&parent)
+        .map_err(artifact_fs::error)?
+        .1
+        .received_uuid
+        .ok_or_else(|| Status::failed_precondition("send parent has no received identity"))?;
+    capture_open(
+        &artifact,
+        &parent,
+        &source,
+        Uuid::now_v7(),
+        received_uuid,
+        seal,
+    )
 }
 
+/// `received_uuid` is the identity sends export for `parent`: the template's
+/// stamp at first capture, or the manifest's when restaging a retained source.
 pub(super) fn capture_open(
     artifact: &File,
     parent: &File,
     source: &File,
     source_id: Uuid,
+    received_uuid: Uuid,
+    seal: ParentSeal,
 ) -> Result<Uuid, Status> {
-    let received_uuid = btrfs::info(parent)
-        .map_err(artifact_fs::error)?
-        .1
-        .received_uuid
-        .ok_or_else(|| Status::failed_precondition("send parent has no received identity"))?;
     nix::sys::stat::mkdirat(
         artifact,
         DIRECTORY,
@@ -70,19 +127,23 @@ pub(super) fn capture_open(
         artifact_fs::directory(artifact, DIRECTORY.as_ref()).map_err(artifact_fs::error)?;
     trusted_paths::set_permissions(&bundle, Some(RETAINED_SOURCE_GID), RETAINED_SOURCE_MODE)?;
     let result = (|| {
-        // Templates use a deterministic received UUID and stransid=0. Preserve
-        // that remote identity on the private, byte-identical parent before
-        // sealing it. Never change the original template's identity or flags.
+        // A writable snapshot drops the received UUID. Seal the private,
+        // byte-identical parent with or without it (module docs). Never change
+        // the original template's identity or flags.
         btrfs::snapshot(parent, &bundle, "parent".as_ref(), false).map_err(artifact_fs::error)?;
         let private_parent =
             artifact_fs::directory(&bundle, "parent".as_ref()).map_err(artifact_fs::error)?;
-        btrfs::stamp(&private_parent, received_uuid).map_err(artifact_fs::error)?;
+        let (version, stamp) = match seal {
+            ParentSeal::Stamped => (STAMPED_PARENT_VERSION, received_uuid),
+            ParentSeal::Unstamped => (UNSTAMPED_PARENT_VERSION, Uuid::nil()),
+        };
+        btrfs::stamp(&private_parent, stamp).map_err(artifact_fs::error)?;
         btrfs::set_readonly(&private_parent, true).map_err(artifact_fs::error)?;
         btrfs::snapshot(source, &bundle, "source".as_ref(), true).map_err(artifact_fs::error)?;
         let private_source =
             artifact_fs::directory(&bundle, "source".as_ref()).map_err(artifact_fs::error)?;
         let manifest = Manifest {
-            version: 1,
+            version,
             source_id,
             source_uuid: subvolume_uuid(&private_source)?,
             parent_uuid: subvolume_uuid(&private_parent)?,
@@ -189,6 +250,7 @@ pub(super) struct SendSource {
     bundle: File,
     pub(super) parent: File,
     pub(super) source: File,
+    pub(super) received_uuid: Uuid,
 }
 
 impl SendSource {
@@ -208,7 +270,14 @@ impl SendSource {
         }
         let manifest: Manifest =
             serde_json::from_slice(&bytes).map_err(SourceError::ManifestMalformed)?;
-        if manifest.version != 1 || manifest.source_id != expected {
+        // A version 1 parent may have had its stamp cleared in place; sends
+        // stamp their own wire parent, so either state is usable.
+        let parent_received_allowed: &[Option<Uuid>] = match manifest.version {
+            STAMPED_PARENT_VERSION => &[Some(manifest.received_uuid), None],
+            UNSTAMPED_PARENT_VERSION => &[None],
+            _ => return Err(SourceError::IdentityChanged),
+        };
+        if manifest.source_id != expected {
             return Err(SourceError::IdentityChanged);
         }
         let subvolume = |name: &str| {
@@ -224,7 +293,7 @@ impl SendSource {
         let (source, source_info) = subvolume("source")?;
         if parent_info.uuid != Some(manifest.parent_uuid)
             || source_info.uuid != Some(manifest.source_uuid)
-            || parent_info.received_uuid != Some(manifest.received_uuid)
+            || !parent_received_allowed.contains(&parent_info.received_uuid)
         {
             return Err(SourceError::LineageMismatch);
         }
@@ -235,6 +304,7 @@ impl SendSource {
             bundle,
             parent,
             source,
+            received_uuid: manifest.received_uuid,
         })
     }
 
@@ -263,13 +333,22 @@ impl SendSource {
         let result = (|| {
             let attempt =
                 artifact_fs::directory(&self.bundle, name.as_ref()).map_err(artifact_fs::error)?;
+            // The stream names its parent by the parent's received UUID with
+            // stransid=0, as templates are stamped. Only this attempt's clone
+            // carries it (module docs).
+            btrfs::snapshot(&self.parent, &attempt, "parent".as_ref(), false)
+                .map_err(artifact_fs::error)?;
+            let wire_parent =
+                artifact_fs::directory(&attempt, "parent".as_ref()).map_err(artifact_fs::error)?;
+            btrfs::stamp(&wire_parent, self.received_uuid).map_err(artifact_fs::error)?;
+            btrfs::set_readonly(&wire_parent, true).map_err(artifact_fs::error)?;
             btrfs::snapshot(&self.source, &attempt, "instance.ro".as_ref(), true)
                 .map_err(artifact_fs::error)?;
             let wire = artifact_fs::directory(&attempt, "instance.ro".as_ref())
                 .map_err(artifact_fs::error)?;
-            btrfs::send(&self.parent, &wire, output).map_err(artifact_fs::error)
+            btrfs::send(&wire_parent, &wire, output).map_err(artifact_fs::error)
         })();
-        // Kernel send has returned before releasing the wire clone, even if
+        // Kernel send has returned before releasing the wire clones, even if
         // the RPC waiter disappeared. Artifact cleanup owns interrupted attempts.
         let cleanup = artifact_fs::remove_at(&self.bundle, name.as_ref());
         if let Err(error) = cleanup {

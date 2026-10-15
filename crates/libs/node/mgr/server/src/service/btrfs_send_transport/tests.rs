@@ -25,9 +25,16 @@ async fn durable_lease_survives_producer_removal_and_cancelled_grpc_reader() {
     btrfs::create(&directory, "parent".as_ref()).unwrap();
     let parent = artifact_fs::directory(&directory, "parent".as_ref()).unwrap();
     std::fs::write(root.join("parent/rootfs.ext4"), b"template").unwrap();
-    btrfs::stamp(&parent, Uuid::now_v7()).unwrap();
+    let received_uuid = Uuid::now_v7();
+    btrfs::stamp(&parent, received_uuid).unwrap();
     btrfs::set_readonly(&parent, true).unwrap();
     btrfs::snapshot(&parent, &directory, "instance".as_ref(), false).unwrap();
+    // The receiving node's own install of the same template build: neither
+    // the retained source nor the lease carries the received UUID at rest.
+    btrfs::snapshot(&parent, &directory, "remote-template".as_ref(), false).unwrap();
+    let remote_template = artifact_fs::directory(&directory, "remote-template".as_ref()).unwrap();
+    btrfs::stamp(&remote_template, received_uuid).unwrap();
+    btrfs::set_readonly(&remote_template, true).unwrap();
     let expected = vec![42; 4 * 1024 * 1024];
     std::fs::write(root.join("instance/rootfs.ext4"), &expected).unwrap();
     let sandbox = Uuid::now_v7().to_string();
@@ -36,9 +43,13 @@ async fn durable_lease_survives_producer_removal_and_cancelled_grpc_reader() {
     std::fs::create_dir(&sandbox_path).unwrap();
     let artifact = sandbox_path.join("snapshot");
     std::fs::create_dir(&artifact).unwrap();
-    let source =
-        btrfs_send_source::capture(&artifact, &root.join("parent"), &root.join("instance"))
-            .unwrap();
+    let source = btrfs_send_source::capture(
+        &artifact,
+        &root.join("parent"),
+        &root.join("instance"),
+        btrfs_send_source::ParentSeal::Stamped,
+    )
+    .unwrap();
     let service = crate::service::tests::service_tests::service_for_unit_tests().await;
     let lease = BtrfsSendLease {
         lease_id: Uuid::now_v7().to_string(),
