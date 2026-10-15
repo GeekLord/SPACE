@@ -4,6 +4,13 @@ Run `npm ci` and `npm run dev` for local development, or `npm run build`
 and `npm start` for a production build. Run `npm test` for the
 dashboard URL validation tests.
 
+## API proxy routing
+
+`NEXT_PUBLIC_API_URL` selects the backend for `/api/*` and `/auth/*`, defaulting
+to `http://localhost:8080`. Admin requests under `/admin/*` use the same backend
+unless `NEXT_PUBLIC_ADMIN_API_URL` is set to a separate admin API origin. An
+unset or empty admin override preserves the existing fallback.
+
 ## Curiosity theme
 
 `src/lib/curiosity-theme.ts` provides a standalone light/dark Ant Design preset
@@ -11,13 +18,6 @@ and page/sidebar surfaces. `createCuriosityTheme` accepts the resolved dark-mode
 preference and an optional organization primary color. An unset color uses the
 preset accent; a configured color derives matching interaction and link states
 without replacing status colors or surfaces. Table density remains page-owned.
-
-The root provider applies the preset and loads local
-[Inter 4.1 assets](public/fonts/inter/README.md) through `/fonts/inter/inter.css`.
-Login uses the base appearance; the dashboard refines its accent with the
-organization's configured primary color. Existing Light/Dark/Auto preferences
-are preserved. The dashboard places Ant Design's `App` below its themed
-`ConfigProvider`, and sandbox feedback uses `App.useApp()` to inherit that theme.
 
 ## Sandbox dashboard link
 
