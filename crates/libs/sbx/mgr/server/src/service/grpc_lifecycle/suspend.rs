@@ -370,6 +370,7 @@ impl SandboxManagerService {
             let guest_preparation_budget = context.guest_preparation_budget();
             if let Err(e) = prepare_guest_for_pause(&sandbox.id, guest_preparation_budget).await {
                 let db = self.db_conn()?;
+                // Unreachable under suspend's fence and locks; a refusal answers `Internal`.
                 if let Err(error) = require_state_write_from(
                     crate::db::update_state_from(
                         &db,
@@ -444,6 +445,7 @@ impl SandboxManagerService {
                     "fc_pause_failed",
                     reason.clone(),
                 );
+                // A refusal is unreachable under suspend's fence and locks; it answers `Internal`.
                 return Err(Status::internal(reason));
             }
             {
