@@ -89,6 +89,34 @@ comparison, so every variant fails. `--gate-metric`, `--min-reduction-pct`, and
 `--min-reduction-mib` change the comparison. `--fail-on-gate` exits with status
 1 unless every variant passes.
 
+### API mode for clusters that require route tokens
+
+Where the sandbox manager only accepts in-sandbox commands carrying a SPACE
+API route token, as on EKS, node-local `space-sbxmgr exec` is refused. Pass
+`--api-url` and `--data-plane-url` to drive create, commands, suspend, wake,
+and delete through the SPACE API instead. Put the bearer token in
+`SPACE_API_TOKEN` or a file named by `--api-token-file`, and give each variant
+an API template reference such as `baseline=bench-balloon-baseline:bench`.
+
+API mode still reads Firecracker statistics and snapshot sizes from the host,
+so run it on the worker the sandboxes land on and keep every other worker
+cordoned. A create that lands elsewhere is deleted and recorded as an error,
+and a wake that lands elsewhere ends that sandbox's cycles with an error.
+
+An API suspend can remove the local snapshot once it is durable, so the harness
+also samples file sizes every 100 ms while suspend runs.
+`snapshot_local_after_suspend` records whether the files survived. When they
+did not, the measured size fields stay `null` and the samples are recorded
+under `<field>_sampled`, with `snapshot_sample_stable_ms` giving how long the
+memory file's allocated size held at its maximum. A sample can catch a file
+mid-write, so the summary's gate ignores sampled sizes and fails any variant
+or baseline with cycles missing the gate metric. Pass `--use-sampled-sizes` to
+let it use samples that held steady for at least `--min-sample-stable-ms`
+(default 500 ms); the report counts the cycles that used them.
+
+`--api-vcpu` and `--api-memory-mib` (default 2 and 8192) should match the
+templates.
+
 Measuring the compressed size reads the memory file after suspend and before
 restore. Suspend has just written that file, so it is usually still in the host
 page cache, but under memory pressure the read can warm pages that restore then

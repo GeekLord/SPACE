@@ -318,7 +318,15 @@ elif cmd == "create":
     (run / sid).mkdir(parents=True)
     (run / sid / "template").write_text(rest[rest.index("--template") + 1])
     os.symlink(f"/proc/{os.getppid()}", run / sid / "fc.pid")
-    print(f"Created sandbox {sid}")
+    # Like the real CLI: create prints only the short label (the UUID's last 8 hex digits).
+    print(f"Sandbox:   {sid[-8:]}")
+    print("Boot mode: cold")
+elif cmd in ("start", "health"):
+    matches = [d.name for d in run.iterdir() if d.name.endswith(rest[0])]
+    if len(matches) != 1:
+        sys.exit(f"no unique sandbox for {rest[0]}")
+    if cmd == "health":
+        print(f"Sandbox: {matches[0]}")
 elif cmd == "exec":
     sid = rest[0]
     argv = rest[rest.index("--") + 1:]
@@ -404,3 +412,197 @@ def test_harness_end_to_end_with_fake_worker(tmp_path, monkeypatch, capsys):
     report = capsys.readouterr().out
     assert "reporting        PASS" in report
     assert "broken           FAIL" in report and "8 correctness failures" in report
+
+
+def _fake_space_api(root: pathlib.Path):
+    """In-process stand-in for the SPACE API and data plane used by API mode.
+
+    Suspend writes the snapshot, holds it briefly, then tears the local state
+    down the way an EKS suspend does, so the harness must sample sizes live.
+    """
+    import base64
+    import http.server
+    import os
+    import re
+    import subprocess
+    import threading
+    import time
+    import uuid
+
+    run, cache, guest = root / "run", root / "cache", root / "guest"
+    # Only run the harness's own guest scripts with integer arguments, rebuilt from
+    # constants, so the fake never executes request-supplied text.
+    known = {script: script for script in (bench.GUEST_SETUP, bench.GUEST_VERIFY, bench.GUEST_ANON_HOLDER, *bench.GUEST_WORKLOADS.values())}
+
+    def trusted_argv(argv):
+        assert argv[:2] == ["sh", "-c"] and argv[3] == "space-bench", argv[:2]
+        rebuilt = ["sh", "-c", known[argv[2]], "space-bench"]
+        for arg in argv[4:]:
+            rebuilt.append(known[arg] if arg in known else str(int(arg)))
+        return rebuilt
+
+    states: dict[str, str] = {}
+    templates: dict[str, str] = {}
+    # Snapshot memory per template, in MiB; "t-elsewhere" wakes on another worker.
+    mem_mib = {"t-base": 8, "t-small": 4, "t-elsewhere": 4}
+    sessions: dict[str, tuple[int, bytes]] = {}
+    seen_tokens: set[str] = set()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):  # keep pytest output clean
+            pass
+
+        def reply(self, body, status=200):
+            data = json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def body(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            return json.loads(self.rfile.read(length) or b"{}")
+
+        def do_GET(self):
+            seen_tokens.add(self.headers.get("Authorization", ""))
+            path = self.path.split("?")[0]
+            if path.startswith("/v1/operations/"):
+                return self.reply({"state": "succeeded"})
+            if m := re.fullmatch(r"/v1/sessions/(proc_[0-9a-f-]+)/events", path):
+                code, out = sessions.pop(m.group(1))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                frames = [{"type": "stdout", "data_base64": base64.b64encode(out).decode()}, {"type": "process_exited", "exit_code": code}]
+                for frame in frames:
+                    self.wfile.write(b"data: " + json.dumps(frame).encode() + b"\n\n")
+                return None
+            if m := re.fullmatch(r"/v1/sandboxes/sbx_([0-9a-f-]+)(/processes)?", path):
+                return self.reply({"state": states[m.group(1)]} if not m.group(2) else {"processes": []})
+            return self.reply({"error": path}, 404)
+
+        def do_POST(self):
+            path = self.path
+            if path == "/v1/sandboxes":
+                body = self.body()
+                assert body["resources"] == {"vcpu": 2, "memory_mib": 8192}
+                sid = str(uuid.uuid4())
+                templates[sid] = body["template"]
+                (run / sid).mkdir(parents=True)
+                os.symlink(f"/proc/{os.getpid()}", run / sid / "fc.pid")
+                states[sid] = "running"
+                return self.reply({"sandbox_id": f"sbx_{sid}", "operation_id": f"op_{uuid.uuid4()}"}, 202)
+            m = re.fullmatch(r"/v1/sandboxes/sbx_([0-9a-f-]+)(/commands|:suspend|:wake)", path)
+            assert m, path
+            sid, action = m.groups()
+            if action == "/commands":
+                argv = trusted_argv(self.body()["command"])
+                log = root / f"cmd-{uuid.uuid4()}.log"
+                with log.open("wb") as out:
+                    code = subprocess.run(argv, check=False, stdout=out, stderr=subprocess.STDOUT, env=dict(os.environ, SBX_BENCH_GUEST_ROOT=str(guest / sid))).returncode
+                session = f"proc_{uuid.uuid4()}"
+                sessions[session] = (code, log.read_bytes())
+                return self.reply({"session_id": session, "attach": {"events_url": f"/v1/sessions/{session}/events", "token": "attach-token"}}, 201)
+            if action == ":suspend":
+                snap = cache / sid / "snapshot"
+                snap.mkdir(parents=True, exist_ok=True)
+                (snap / "memory").write_bytes(b"\x01" * (mem_mib[templates[sid]] << 20))
+                (snap / "vmstate").write_bytes(b"v" * 4096)
+                time.sleep(0.5)
+                for name in ("memory", "vmstate"):
+                    (snap / name).unlink()
+                (run / sid / "fc.pid").unlink()
+                states[sid] = "suspended"
+            else:
+                if templates[sid] != "t-elsewhere":
+                    os.symlink(f"/proc/{os.getpid()}", run / sid / "fc.pid")
+                states[sid] = "running"
+            return self.reply({"sandbox_id": f"sbx_{sid}", "operation_id": f"op_{uuid.uuid4()}"}, 202)
+
+        def do_DELETE(self):
+            sid = self.path.rsplit("sbx_", 1)[1]
+            states[sid] = "deleted"
+            subprocess.run(["pkill", "-f", str(guest / sid)], check=False)
+            return self.reply({"sandbox_id": f"sbx_{sid}", "operation_id": f"op_{uuid.uuid4()}"}, 202)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, seen_tokens
+
+
+def test_harness_api_mode_with_fake_space_api(tmp_path, monkeypatch, capsys):
+    import shutil
+    import subprocess
+
+    for tool in ("sh", "dd", "sha256sum", "pkill"):
+        if not shutil.which(tool):
+            pytest.skip(f"{tool} not available")
+    server, seen_tokens = _fake_space_api(tmp_path)
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    token = tmp_path / "token"
+    token.write_text("mgmt-token\n")
+    out_dir = tmp_path / "out"
+    args = bench.build_parser().parse_args(
+        [
+            "--variant", "baseline=t-base", "--variant", "reporting=t-small", "--variant", "moved=t-elsewhere",
+            "--sandboxes", "2", "--cycles", "2", "--concurrency", "2", "--no-sudo",
+            "--no-compressed-size", "--settle-secs", "0", "--idle-secs", "0", "--pattern-mem-mb", "1",
+            "--pattern-file-mb", "1", "--anon-check-mb", "1", "--build-units", "2", "--build-blob-mb", "1",
+            "--alloc-min-mb", "8", "--alloc-max-mb", "8", "--file-heavy-mb", "8", "--profiles", "idle",
+            "--sbxmgr", str(tmp_path / "missing-sbxmgr"), "--api-url", url, "--data-plane-url", url,
+            "--api-token-file", str(token),
+            "--sandbox-cache-dir", str(tmp_path / "cache"), "--sandbox-run-dir", str(tmp_path / "run"),
+            "--jail-dir", str(tmp_path / "jail"), "--output-dir", str(out_dir),
+        ]
+    )
+    try:
+        bench.BalloonBenchmark(args).run()
+    finally:
+        server.shutdown()
+        subprocess.run(["pkill", "-f", str(tmp_path / "guest")], check=False)
+
+    rows = summary.load_rows([out_dir / "results.jsonl"])
+    by_variant = summary.group_by_variant(rows)
+    good = by_variant["baseline"] + by_variant["reporting"]
+    assert len(good) == 2 * 2 * 2
+    assert {r["error"] for r in good} == {None}
+    assert all(r["api_mode"] and r["sandbox_id"].startswith("sbx_") for r in rows)
+    assert all(r["correctness_ok"] for r in good)
+    # The fake removes the files before suspend returns: measured sizes stay empty
+    # and the sampled ones are kept apart, with how long they held steady.
+    assert {r["snapshot_local_after_suspend"] for r in good} == {False}
+    assert {r["snapshot_mem_disk_bytes"] for r in good} == {None}
+    assert {r["snapshot_mem_bytes_sampled"] for r in by_variant["baseline"]} == {8 * MIB}
+    assert {r["snapshot_mem_bytes_sampled"] for r in by_variant["reporting"]} == {4 * MIB}
+    assert all(r["snapshot_sample_stable_ms"] >= 200 for r in good)
+    # A wake on another worker ends that sandbox with an error instead of empty rows.
+    moved = by_variant["moved"]
+    assert len(moved) == 2
+    assert all(r["cycle"] == 1 and r["correctness_ok"] is None for r in moved)
+    assert {r["error"] for r in moved} == {"restored on another node; cordon the other workers"}
+    assert seen_tokens == {"Bearer mgmt-token", "Bearer attach-token"}
+
+    results = str(out_dir / "results.jsonl")
+    capsys.readouterr()
+    # Without opting in, sampled sizes never reach the gate.
+    assert summary.main([results, "--min-reduction-mib", "1", "--fail-on-gate"]) == 1
+    report = capsys.readouterr().out
+    assert "baseline invalid: 4 cycles missing snapshot_mem_disk_bytes" in report
+    # Opting in uses steady samples and says so.
+    gate = summary.evaluate_gate(
+        [r for r in rows if r["variant"] != "moved"], baseline="baseline", min_reduction_bytes=1 * MIB, min_sample_stable_ms=200
+    )
+    assert [(g.variant, g.passed, g.sampled_cycles, g.baseline_sampled_cycles) for g in gate] == [("reporting", True, 4, 4)]
+    # A stricter stability bar than the samples met counts them as missing.
+    strict = summary.evaluate_gate(
+        [r for r in rows if r["variant"] != "moved"], baseline="baseline", min_reduction_bytes=1 * MIB, min_sample_stable_ms=60_000
+    )
+    assert not strict[0].passed and strict[0].missing_cycles == 4
+
+
+def test_api_mode_sudo_prefix(tmp_path):
+    ns = argparse.Namespace(use_sudo="auto", sandbox_run_dir=str(tmp_path))
+    assert bench.api_mode_sudo_prefix(ns) == []
+    assert bench.api_mode_sudo_prefix(argparse.Namespace(use_sudo="yes", sandbox_run_dir=str(tmp_path))) == ["sudo"]
+    assert bench.api_mode_sudo_prefix(argparse.Namespace(use_sudo="no", sandbox_run_dir="/nonexistent")) == []
