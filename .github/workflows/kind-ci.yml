@@ -110,6 +110,9 @@ jobs:
       # images come from the GHCR mirror; see ci/mirrored-images.txt.
       SPACE_CI_IMAGE_MIRROR: ghcr
       SPACE_KIND_RUST_ARTIFACTS: prebuilt
+      # The runtime images and the seed import their dependency layers from
+      # the cache main writes; a miss builds them cold. Never written here.
+      SPACE_KIND_BUILD_CACHE_REPOSITORY: ghcr.io/perplexityai/space-kind-build-cache
       # The shards explicitly select the devbox `otel` profile, with the
       # local metrics, traces and logs backends installed from the mirror and
       # every service exporting to them. The scenarios run with telemetry on,

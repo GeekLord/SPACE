@@ -16,31 +16,102 @@
 #   seed (this script) → code-runtime (recipe)
 set -euo pipefail
 
-extract_verified_squashfs() (
+# Ubuntu's cloud image signing key: the keyring the builder image installs and
+# the one signer whose checksums a seed accepts.
+SEED_IMAGE_KEYRING=/usr/share/keyrings/ubuntu-cloudimage-keyring.gpg
+SEED_IMAGE_SIGNER=D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81
+# Downloads of the release's files give up on a host that does not connect
+# within 30 s or stalls below 1 KiB/s for a minute, each attempt, instead of
+# waiting on it indefinitely.
+SEED_IMAGE_CURL=(curl -fSL --retry 3 --retry-delay 5 --connect-timeout 30 --speed-limit 1024 --speed-time 60)
+
+# Set SEED_IMAGE_BASE_URL and SEED_IMAGE_NAME to a dated Ubuntu minimal cloud
+# release and its squashfs for the given machine architecture.
+seed_image_source() {
+  local release="$1" version="$2" date="$3" arch="$4" img_arch
+  # Ubuntu uses "arm64" not "aarch64" in file names
+  case "$arch" in
+    aarch64) img_arch="arm64" ;;
+    x86_64) img_arch="amd64" ;;
+    *) echo "ERROR: unsupported seed architecture: ${arch}" >&2; return 1 ;;
+  esac
+  SEED_IMAGE_BASE_URL="https://cloud-images.ubuntu.com/minimal/releases/${release}/${date}"
+  SEED_IMAGE_NAME="ubuntu-${version}-minimal-cloudimg-${img_arch}.squashfs"
+}
+
+# Print the SHA-256 that base_url's SHA256SUMS, signed by the pinned signer,
+# lists for name. Every run downloads the dated SHA256SUMS, so a cache entry
+# cannot change which image a build accepts: a valid signature proves the file
+# is Canonical's, not that it belongs to this date.
+#
+# SPACE_SEED_REUSE_SIGNED_CHECKSUMS=1 (the Kind seed build, whose cache only
+# the build itself and main CI's build cache fill) keeps the signed checksums
+# in an existing cache_dir under the release's URL and verifies that copy
+# instead, so a cached release builds with cloud-images.ubuntu.com
+# unreachable. The production build manager's persistent cache never sets it.
+verified_checksum() (
   set -euo pipefail
-  local base_url="$1" name="$2" cache_dir="$3" build_dir="$4" keyring="$5" signer="$6"
-  local verify_dir checksum cache_tmp=""
+  local base_url="$1" name="$2" cache_dir="$3" keyring="$4" signer="$5"
+  local verify_dir checksum file downloaded="" cache_tmp="" sums_cache=""
+  [[ "${SPACE_SEED_REUSE_SIGNED_CHECKSUMS:-0}" != 1 ]] || sums_cache="${cache_dir}/sums/${base_url#*://}"
   verify_dir="$(mktemp -d)"
   trap 'rm -rf "$verify_dir"; [[ -z "$cache_tmp" ]] || rm -f "$cache_tmp"' EXIT
 
-  # Authenticate this release even when reusing a shared cache entry.
-  for file in SHA256SUMS SHA256SUMS.gpg; do
-    curl -fSL --retry 3 --retry-delay 5 -o "${verify_dir}/${file}" "${base_url}/${file}"
-  done
-  gpgv --status-fd 3 --homedir "$verify_dir" --keyring "$keyring" \
-    "${verify_dir}/SHA256SUMS.gpg" "${verify_dir}/SHA256SUMS" 3>"${verify_dir}/status"
-  if ! awk -v signer="$signer" '
-    $1 == "[GNUPG:]" && $2 == "VALIDSIG" && $3 == signer { valid = 1 }
-    END { exit !valid }
-  ' "${verify_dir}/status"; then
-    echo "ERROR: checksum signature does not match the pinned signer" >&2
-    exit 1
+  signed_by_pinned_signer() {
+    gpgv --status-fd 3 --homedir "$verify_dir" --keyring "$keyring" \
+      "${verify_dir}/SHA256SUMS.gpg" "${verify_dir}/SHA256SUMS" 3>"${verify_dir}/status" >&2 \
+      && awk -v signer="$signer" '
+        $1 == "[GNUPG:]" && $2 == "VALIDSIG" && $3 == signer { valid = 1 }
+        END { exit !valid }
+      ' "${verify_dir}/status"
+  }
+
+  if [[ -n "$sums_cache" && -f "${sums_cache}/SHA256SUMS" && -f "${sums_cache}/SHA256SUMS.gpg" ]]; then
+    cp "${sums_cache}/SHA256SUMS" "${sums_cache}/SHA256SUMS.gpg" "$verify_dir/"
+    if signed_by_pinned_signer; then
+      echo "Using cached signed checksums: ${sums_cache}" >&2
+    else
+      echo "Cached checksums failed verification; downloading them again" >&2
+      rm -f "${verify_dir}/SHA256SUMS" "${verify_dir}/SHA256SUMS.gpg"
+    fi
+  fi
+  if [[ ! -f "${verify_dir}/SHA256SUMS" ]]; then
+    for file in SHA256SUMS SHA256SUMS.gpg; do
+      "${SEED_IMAGE_CURL[@]}" -o "${verify_dir}/${file}" "${base_url}/${file}"
+    done
+    if ! signed_by_pinned_signer; then
+      echo "ERROR: checksum signature does not match the pinned signer" >&2
+      exit 1
+    fi
+    downloaded=1
   fi
   checksum="$(awk -v name="$name" '$2 == name || $2 == "*" name { print $1 }' "${verify_dir}/SHA256SUMS")"
   if [[ ! "$checksum" =~ ^[a-fA-F0-9]{64}$ ]]; then
     echo "ERROR: expected exactly one SHA-256 for ${name}" >&2
     exit 1
   fi
+  if [[ -n "$sums_cache" && -n "$downloaded" && -d "$cache_dir" ]]; then
+    mkdir -p "$sums_cache"
+    for file in SHA256SUMS SHA256SUMS.gpg; do
+      cache_tmp="$(mktemp "${sums_cache}/.${file}.XXXXXX")"
+      cp "${verify_dir}/${file}" "$cache_tmp"
+      chmod 0644 "$cache_tmp"
+      mv -f "$cache_tmp" "${sums_cache}/${file}"
+      cache_tmp=""
+    done
+  fi
+  printf '%s\n' "$checksum"
+)
+
+# Leave at dest (when given) a copy of base_url/name that matches its verified
+# checksum. A cache_dir that exists keeps the verified image under its name.
+fetch_verified_squashfs() (
+  set -euo pipefail
+  local base_url="$1" name="$2" cache_dir="$3" keyring="$4" signer="$5" dest="$6"
+  local verify_dir checksum cache_tmp=""
+  checksum="$(verified_checksum "$base_url" "$name" "$cache_dir" "$keyring" "$signer")"
+  verify_dir="$(mktemp -d)"
+  trap 'rm -rf "$verify_dir"; [[ -z "$cache_tmp" ]] || rm -f "$cache_tmp"' EXIT
 
   if [[ -f "${cache_dir}/${name}" ]]; then
     echo "Using cached squashfs: ${cache_dir}/${name}"
@@ -52,7 +123,7 @@ extract_verified_squashfs() (
   fi
   if [[ ! -f "${verify_dir}/image.squashfs" ]]; then
     echo "Downloading: ${name}"
-    curl -fSL --retry 3 --retry-delay 5 -o "${verify_dir}/image.squashfs" "${base_url}/${name}"
+    "${SEED_IMAGE_CURL[@]}" -o "${verify_dir}/image.squashfs" "${base_url}/${name}"
     printf '%s  %s\n' "$checksum" "${verify_dir}/image.squashfs" | sha256sum --check --strict -
     if [[ -d "$cache_dir" ]]; then
       cache_tmp="$(mktemp "${cache_dir}/.${name}.XXXXXX")"
@@ -60,11 +131,21 @@ extract_verified_squashfs() (
       mv -f "$cache_tmp" "${cache_dir}/${name}"
     fi
   fi
+  [[ -z "$dest" ]] || mv "${verify_dir}/image.squashfs" "$dest"
+)
+
+extract_verified_squashfs() (
+  set -euo pipefail
+  local base_url="$1" name="$2" cache_dir="$3" build_dir="$4" keyring="$5" signer="$6"
+  local image_dir
+  image_dir="$(mktemp -d)"
+  trap 'rm -rf "$image_dir"' EXIT
+  fetch_verified_squashfs "$base_url" "$name" "$cache_dir" "$keyring" "$signer" "${image_dir}/image.squashfs"
 
   echo "=== Extracting squashfs ==="
   rm -rf "$build_dir"
   mkdir -p "$build_dir"
-  unsquashfs -d "${build_dir}/squashfs-root" "${verify_dir}/image.squashfs"
+  unsquashfs -d "${build_dir}/squashfs-root" "${image_dir}/image.squashfs"
 )
 
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
@@ -171,21 +252,16 @@ fi
 UBUNTU_RELEASE="${SPACE_SEED_UBUNTU_RELEASE}"
 UBUNTU_VERSION="${SPACE_SEED_UBUNTU_VERSION}"
 UBUNTU_DATE="${SPACE_SEED_UBUNTU_DATE}"
-BASE_URL="https://cloud-images.ubuntu.com/minimal/releases/${UBUNTU_RELEASE}/${UBUNTU_DATE}"
-# Ubuntu uses "arm64" not "aarch64" in file names
-case "$ARCH" in
-  aarch64) IMG_ARCH="arm64" ;;
-  x86_64) IMG_ARCH="amd64" ;;
-  *) echo "ERROR: unsupported seed architecture: ${ARCH}" >&2; exit 1 ;;
-esac
-SQUASHFS_NAME="ubuntu-${UBUNTU_VERSION}-minimal-cloudimg-${IMG_ARCH}.squashfs"
+seed_image_source "$UBUNTU_RELEASE" "$UBUNTU_VERSION" "$UBUNTU_DATE" "$ARCH"
+BASE_URL="$SEED_IMAGE_BASE_URL"
+SQUASHFS_NAME="$SEED_IMAGE_NAME"
 SQUASHFS_URL="${BASE_URL}/${SQUASHFS_NAME}"
 
 echo "Image: ${SQUASHFS_NAME}"
 echo "URL:   ${SQUASHFS_URL}"
 
 extract_verified_squashfs "$BASE_URL" "$SQUASHFS_NAME" /cache "$BUILD" \
-  /usr/share/keyrings/ubuntu-cloudimage-keyring.gpg D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81
+  "$SEED_IMAGE_KEYRING" "$SEED_IMAGE_SIGNER"
 cd "$BUILD"
 
 # ── Unmount helper ────────────────────────────────────────────────────────────

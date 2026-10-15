@@ -20,7 +20,25 @@ printf 'older release\n' > "$work/source/payload"
 mksquashfs "$work/source" "$work/stale.squashfs" -noappend -processors 1 >/dev/null
 printf 'verified payload\n' > "$work/source/payload"
 
-for scenario in download cache stale-cache signature manifest signer checksum missing duplicate corrupt-download corrupt-cache corrupt-cache-and-download; do
+# reuse=1 is the Kind seed build's SPACE_SEED_REUSE_SIGNED_CHECKSUMS=1; the
+# production default leaves it unset.
+extract() { # case_dir signer
+  SPACE_SEED_REUSE_SIGNED_CHECKSUMS="$reuse" bash -c 'source "$1"; shift; extract_verified_squashfs "$@"' bash \
+    "$builder" "file://$1/upstream" image.squashfs "$1/cache" \
+    "$1/extracted" "$work/keyring.gpg" "$2"
+}
+
+# With reuse: offline, a cache that holds the release's signed checksums and
+# its image needs no upstream at all; cached-sums-tampered, cached checksums
+# that fail their signature are replaced from upstream; stale-release, another
+# release's signed checksums, cached with its image, do not vouch for this
+# release. Without reuse (production): planted-older-release, an older
+# release's validly signed checksums and image planted where this release's
+# would be cached do not replace this release's image, and no run writes
+# checksums into the cache.
+for scenario in download cache stale-cache signature manifest signer checksum missing duplicate corrupt-download corrupt-cache corrupt-cache-and-download offline cached-sums-tampered stale-release planted-older-release; do
+  reuse=0
+  case "$scenario" in offline|cached-sums-tampered|stale-release) reuse=1 ;; esac
   case_dir="$work/$scenario"
   mkdir -p "$case_dir/upstream" "$case_dir/cache"
   cp "$work/image.squashfs" "$case_dir/upstream/image.squashfs"
@@ -28,7 +46,26 @@ for scenario in download cache stale-cache signature manifest signer checksum mi
   expected_signer="$signer"
   expected_status=1
   case "$scenario" in
-    download) expected_status=0 ;;
+    download|offline|cached-sums-tampered) expected_status=0 ;;
+    stale-release|planted-older-release)
+      expected_status=0
+      mkdir "$case_dir/old"
+      cp "$work/stale.squashfs" "$case_dir/old/image.squashfs"
+      printf '%s  %s\n' "$(sha256sum "$work/stale.squashfs" | cut -d ' ' -f 1)" image.squashfs > "$case_dir/old/SHA256SUMS"
+      gpg --homedir "$work/keys" --batch --detach-sign "$case_dir/old/SHA256SUMS"
+      mv "$case_dir/old/SHA256SUMS.sig" "$case_dir/old/SHA256SUMS.gpg"
+      if [[ "$scenario" == stale-release ]]; then
+        SPACE_SEED_REUSE_SIGNED_CHECKSUMS=1 bash -c 'source "$1"; shift; fetch_verified_squashfs "$@"' bash \
+          "$builder" "file://$case_dir/old" image.squashfs "$case_dir/cache" \
+          "$work/keyring.gpg" "$signer" "" > "$case_dir/prime.log" 2>&1 \
+          || { cat "$case_dir/prime.log" >&2; exit 1; }
+      else
+        planted="$case_dir/cache/sums/$case_dir/upstream"
+        mkdir -p "$planted"
+        cp "$case_dir/old/SHA256SUMS" "$case_dir/old/SHA256SUMS.gpg" "$planted/"
+        cp "$work/stale.squashfs" "$case_dir/cache/image.squashfs"
+      fi
+      ;;
     cache)
       expected_status=0
       cp "$work/image.squashfs" "$case_dir/cache/image.squashfs"
@@ -59,13 +96,22 @@ for scenario in download cache stale-cache signature manifest signer checksum mi
   case "$scenario" in
     signature) printf invalid > "$case_dir/upstream/SHA256SUMS.gpg" ;;
     manifest) printf '\nchanged after signing\n' >> "$case_dir/upstream/SHA256SUMS" ;;
+    offline|cached-sums-tampered)
+      extract "$case_dir" "$signer" > "$case_dir/prime.log" 2>&1 || { cat "$case_dir/prime.log" >&2; exit 1; }
+      rm -rf "$case_dir/extracted"
+      sums_cache="$case_dir/cache/sums/$case_dir/upstream"
+      cmp "$case_dir/upstream/SHA256SUMS" "$sums_cache/SHA256SUMS"
+      if [[ "$scenario" == offline ]]; then
+        rm -rf "$case_dir/upstream"
+      else
+        printf '\nchanged after signing\n' >> "$sums_cache/SHA256SUMS"
+      fi
+      ;;
   esac
 
   # A child shell preserves errexit inside the production function.
   status=0
-  bash -c 'source "$1"; shift; extract_verified_squashfs "$@"' bash \
-    "$builder" "file://$case_dir/upstream" image.squashfs "$case_dir/cache" \
-    "$case_dir/extracted" "$work/keyring.gpg" "$expected_signer" > "$case_dir/log" 2>&1 || status=$?
+  extract "$case_dir" "$expected_signer" > "$case_dir/log" 2>&1 || status=$?
 
   if [[ "$expected_status" == 0 ]]; then
     if [[ "$status" != 0 ]]; then
@@ -74,6 +120,17 @@ for scenario in download cache stale-cache signature manifest signer checksum mi
     fi
     cmp "$work/source/payload" "$case_dir/extracted/squashfs-root/payload"
     cmp "$work/image.squashfs" "$case_dir/cache/image.squashfs"
+    if [[ "$scenario" == offline ]]; then
+      grep -q "Using cached signed checksums" "$case_dir/log"
+    elif [[ "$reuse" == 1 ]]; then
+      cmp "$case_dir/upstream/SHA256SUMS" "$case_dir/cache/sums/$case_dir/upstream/SHA256SUMS"
+    elif grep -q "Using cached signed checksums" "$case_dir/log"; then
+      echo "$scenario: a production run read cached checksums" >&2
+      exit 1
+    elif [[ "$scenario" != planted-older-release && -e "$case_dir/cache/sums" ]]; then
+      echo "$scenario: a production run wrote checksums into the cache" >&2
+      exit 1
+    fi
   else
     if [[ "$status" == 0 || -e "$case_dir/extracted" ]]; then
       echo "$scenario: unverified image reached extraction" >&2

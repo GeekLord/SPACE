@@ -27,8 +27,16 @@
 # Idempotent: skips the (slow, privileged) rootfs build when the inputs
 # (guest binaries, builder script, seed recipe source, pubkey) are unchanged.
 #
+# The builder image's layers and the recipe's Ubuntu cloud image (its signed
+# checksums and the squashfs) come from the Kind registry layer cache
+# (infra/space/kind/lib/build-cache.sh, scope kind-seed-builder-e<epoch>) when it holds
+# them; rootfs-builder.sh verifies both before use, and downloads whatever the
+# cache could not provide.
+#
 # Usage:
 #   bash infra/space/kind/scripts/build-seed.sh
+#   bash infra/space/kind/scripts/build-seed.sh --cache-only   # build just the
+#       stages the cache keeps; main CI exports them (runtime-image-cache.sh publish)
 #
 # Env knobs:
 #   SPACE_SEED_OUTPUT_DIR       artifact dir (default: ~/.space-devbox/kind/seed/build)
@@ -58,6 +66,67 @@ die() { printf '[build-seed] ERROR: %s\n' "$*" >&2; exit 1; }
 
 command -v docker >/dev/null 2>&1 || die "docker not on PATH"
 command -v python3 >/dev/null 2>&1 || die "python3 not on PATH (needed to author manifest.json)"
+
+# shellcheck source=../lib/build-cache.sh
+source "$REPO_ROOT/infra/space/kind/lib/build-cache.sh"
+# shellcheck source=../../../../templates/firecracker/seed/rootfs-builder.sh
+source "$SEED_DIR/rootfs-builder.sh"
+
+# ── Seed source config, read from the seed recipe like build.sh does ─────────
+seed_source_value() {
+  awk -F' = ' -v key="$1" '
+    /^\[source\]/ { in_source = 1; next }
+    /^\[/ { in_source = 0 }
+    in_source && $1 == key { gsub(/"/, "", $2); print $2; exit }
+  ' "$SEED_RECIPE"
+}
+SEED_SOURCE_TYPE="$(seed_source_value type)"
+SEED_UBUNTU_RELEASE="$(seed_source_value release)"
+SEED_UBUNTU_VERSION="$(seed_source_value version)"
+SEED_UBUNTU_DATE="$(seed_source_value date)"
+for v in SEED_SOURCE_TYPE SEED_UBUNTU_RELEASE SEED_UBUNTU_VERSION SEED_UBUNTU_DATE; do
+  [[ -n "${!v}" ]] || die "failed to read ${v#SEED_} from $SEED_RECIPE"
+done
+
+# ── Seed builder builds (templates/firecracker/seed/Dockerfile) ──────────────
+# In GitHub CI (SPACE_CI_IMAGE_MIRROR set) the builder's base comes from the
+# repository's GHCR mirror (ci/mirrored-images.txt); elsewhere this adds nothing.
+# The cache options import the builder's layers, and export them only when
+# the caller enables writes; main takes its bases from the mirror the same
+# way, so the layers' keys agree. A build that fails reading the cache or the
+# mirrored base is built again without either; main's export keeps the
+# mirrored base, so it never writes layers no reader would match.
+seed_builder_build() {
+  local -a mirror optional
+  space_kind_mirror_contexts "$SEED_DIR/Dockerfile"
+  mirror=("${MIRROR_FLAGS[@]}")
+  space_kind_cache_flags "$(space_kind_layer_scope seed-builder)" "${SEED_CACHE_OPTION[@]}" \
+    || die "invalid build cache configuration"
+  if (( ${#CACHE_TO_FLAGS[@]} && MIRROR_MISSING )); then
+    die "the mirrored seed builder base was unavailable; not exporting layers no mirrored build would match"
+  fi
+  optional=("${CACHE_FROM_FLAGS[@]}")
+  if (( ${#CACHE_TO_FLAGS[@]} == 0 )); then
+    optional+=("${mirror[@]}")
+    mirror=()
+  fi
+  space_kind_build_reading_cache "${#optional[@]}" "${optional[@]}" \
+    "${mirror[@]}" "${CACHE_TO_FLAGS[@]}" \
+    --build-arg "SPACE_SEED_UBUNTU_RELEASE=$SEED_UBUNTU_RELEASE" \
+    --build-arg "SPACE_SEED_UBUNTU_VERSION=$SEED_UBUNTU_VERSION" \
+    --build-arg "SPACE_SEED_UBUNTU_DATE=$SEED_UBUNTU_DATE" \
+    "$@" "$SEED_DIR"
+}
+SEED_CACHE_OPTION=()
+
+if [[ "${1:-}" == "--cache-only" ]]; then
+  log "building the seed builder's cached stages (the builder and the recipe's cloud image)"
+  # The export is this mode's only purpose, so its failure is not ignored.
+  SEED_CACHE_OPTION=(--fail-on-export-error)
+  seed_builder_build --target cloud-image --output type=cacheonly
+  exit 0
+fi
+(( $# == 0 )) || die "usage: $0 [--cache-only]"
 
 # Record the bytes staged for the Kind workers, not a guessed kernel release.
 # shellcheck source=lib/kind-host-paths.sh
@@ -119,31 +188,30 @@ if [[ "${SPACE_SEED_REBUILD:-0}" != "1" \
   exit 0
 fi
 
-# ── Seed source config, read from the seed recipe like build.sh does ─────────
-seed_source_value() {
-  awk -F' = ' -v key="$1" '
-    /^\[source\]/ { in_source = 1; next }
-    /^\[/ { in_source = 0 }
-    in_source && $1 == key { gsub(/"/, "", $2); print $2; exit }
-  ' "$SEED_RECIPE"
-}
-SEED_SOURCE_TYPE="$(seed_source_value type)"
-SEED_UBUNTU_RELEASE="$(seed_source_value release)"
-SEED_UBUNTU_VERSION="$(seed_source_value version)"
-SEED_UBUNTU_DATE="$(seed_source_value date)"
-for v in SEED_SOURCE_TYPE SEED_UBUNTU_RELEASE SEED_UBUNTU_VERSION SEED_UBUNTU_DATE; do
-  [[ -n "${!v}" ]] || die "failed to read ${v#SEED_} from $SEED_RECIPE"
-done
-
 # ── Build the seed with the production seed builder ──────────────────────────
 log "building seed builder image (templates/firecracker/seed/Dockerfile)"
-# In GitHub CI (SPACE_CI_IMAGE_MIRROR set) the builder's base comes from the
-# repository's GHCR mirror (ci/mirrored-images.txt); elsewhere this adds nothing.
-# shellcheck disable=SC2046 # one option per line, none containing spaces
-docker build -t space-seed-builder:local \
-  $(bash "$REPO_ROOT/ci/scripts/mirror-images.sh" build-contexts "$SEED_DIR/Dockerfile") "$SEED_DIR"
+SPACE_KIND_BUILD_CACHE_WRITE=0 seed_builder_build -t space-seed-builder:local
 
 mkdir -p "$OUT_DIR" "$OUT_DIR/.cache"
+
+# The builder's /cache holds the cloud image under its name and the release's
+# signed checksums under the release URL. When it lacks either, export the
+# builder's cloud-image stage into it: from the build cache when that holds
+# this release, otherwise downloaded and verified by the stage itself.
+seed_image_source "$SEED_UBUNTU_RELEASE" "$SEED_UBUNTU_VERSION" "$SEED_UBUNTU_DATE" "$(uname -m)"
+sums_cache="$OUT_DIR/.cache/sums/${SEED_IMAGE_BASE_URL#*://}"
+if [[ -f "$OUT_DIR/.cache/$SEED_IMAGE_NAME" && -f "$sums_cache/SHA256SUMS" && -f "$sums_cache/SHA256SUMS.gpg" ]]; then
+  log "cloud image already held in $OUT_DIR/.cache"
+else
+  held="$(mktemp -d "$OUT_DIR/.cloud-image.XXXXXX")"
+  if SPACE_KIND_BUILD_CACHE_WRITE=0 seed_builder_build --target cloud-image --output "type=local,dest=$held" \
+      && cp -R --remove-destination "$held/." "$OUT_DIR/.cache/"; then
+    log "cloud image held in $OUT_DIR/.cache"
+  else
+    log "WARNING: could not prepare a copy of the cloud image; rootfs-builder.sh downloads it"
+  fi
+  rm -rf "$held"
+fi
 rm -f "$OUT_DIR/rootfs.ext4" "$OUT_DIR/metadata.json" "$OUT_DIR/manifest.json"
 
 log "running rootfs-builder.sh (privileged; downloads the Ubuntu minimal squashfs on first run)"
@@ -162,6 +230,7 @@ docker run --rm --privileged \
   -e "SPACE_SEED_STATE_FORMAT_VERSION=$SEED_STATE_FORMAT_VERSION" \
   -e "SPACE_SEED_KERNEL_VERSION=$SEED_KERNEL_VERSION" \
   -e "SPACE_SEED_KERNEL_DIGEST=$SEED_KERNEL_DIGEST" \
+  -e SPACE_SEED_REUSE_SIGNED_CHECKSUMS=1 \
   space-seed-builder:local --id seed --force
 
 [[ -f "$OUT_DIR/rootfs.ext4" && -f "$OUT_DIR/metadata.json" ]] \
