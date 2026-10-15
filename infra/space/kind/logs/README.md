@@ -1,7 +1,7 @@
 # Local logs: Alloy → Loki
 
-Standalone logs ingestion, installed automatically by default Kind bootstrap
-and full-stack Tilt in `otel` mode. This chart deploys only Alloy and Loki;
+Standalone logs ingestion, installed automatically by Kind bootstrap and
+full-stack Tilt with the explicit `otel` profile. This chart deploys only Alloy and Loki;
 neither metrics nor Grafana is required. It neither changes SPACE
 images/environment nor removes or reconfigures Datadog. No application
 exporter, trace correlation, metrics pipeline, or production integration is added.
@@ -28,8 +28,22 @@ For shared clusters use the portable
 [observability charts and deployment runbook](../../observability/README.md),
 not this local test harness. Its Kind guard is intentionally unchanged.
 
+An existing release is owned by its namespace label and Helm identity, not by
+whether it matches the latest checkout. `up` can therefore update chart
+templates and retry a failed release without deleting Loki. Saved overrides,
+including the first install's image pins, are retained; pass the current
+`profiles/kind.yaml` explicitly with any custom overrides afterward when you
+intend to adopt changed profile defaults.
+
+`pause` and `resume` change only the collector and retain recorded Loki,
+configuration, policy, and storage resources. Resume uses a matching retained
+collector revision; if it cannot find one, `up` reconciles the current chart.
+An unchanged healthy release is a no-op. Pending Helm operation locks still
+require operator inspection; this helper never clears them by deleting
+release history or local data.
+
 Keep `ui` running for the Loki HTTP API at <http://127.0.0.1:13101>.
-The default Kind bring-up also installs the independent `grafana` chart with
+The `otel` profile also installs the independent `grafana` chart with
 the Loki datasource enabled at `http://loki.space-logs.svc.cluster.local:3100`.
 For a standalone backend, visualization remains optional. Open its provisioned
 [SPACE logs dashboard](http://127.0.0.1:13000/d/space-main-health-logs).
