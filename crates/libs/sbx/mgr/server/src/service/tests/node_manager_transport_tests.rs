@@ -14,7 +14,7 @@
 
 use super::service_tests::{insert_test_sandbox, runtime_fields};
 use super::*;
-use crate::node_manager_transport::fake::FakeNodeManager;
+use crate::node_manager_transport::fake::{FakeNodeManager, StalledNodeManager};
 use crate::service::activation_support::internal_request;
 use pplx_space_common_core::types::{ExecutionGeneration, LocalArtifactId};
 use pplx_space_node_mgr_client::proto::{
@@ -370,4 +370,183 @@ async fn uncommitted_encrypted_capture_record_is_never_sealed() {
         Some(crate::db::SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE)
     );
     assert!(staging.exists());
+}
+
+/// Template-manager falls back to an unclamped memory size when this read
+/// fails, so a node-manager that is restarting must be waited out within the
+/// connect budget the read always had, not failed after a short local retry.
+#[tokio::test]
+async fn memory_policy_read_waits_out_a_restarting_node_manager() {
+    use pplx_space_node_mgr_client::proto::{NetworkPoolStatusRequest, NetworkPoolStatusResponse};
+    let restarted_at = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let node_manager = FakeNodeManager::default()
+        .unary(
+            "GetNetworkPoolStatus",
+            move |_: NetworkPoolStatusRequest| {
+                if std::time::Instant::now() < restarted_at {
+                    return Err(Status::unavailable("node-manager is restarting"));
+                }
+                Ok(NetworkPoolStatusResponse {
+                    sandbox_cgroup_memory_mib: 4096,
+                    sandbox_guest_memory_max_mib: 3584,
+                    sandbox_memory_headroom_mib: 512,
+                    ..Default::default()
+                })
+            },
+        )
+        .serve();
+    let service = service_with_node_manager(crate::db::test_conn(), node_manager.connector());
+
+    let resolved = service
+        .resolve_sandbox_memory(internal_request(ResolveSandboxMemoryRequest {
+            requested_memory_mib: 8192,
+        }))
+        .await
+        .expect("the read outlasts the restart")
+        .into_inner();
+    assert_eq!(resolved.effective_memory_mib, 3584);
+}
+
+/// The connect budget never outlasts the caller: once its `grpc-timeout` has
+/// passed, the read stops retrying a node-manager that is still down.
+#[tokio::test]
+async fn memory_policy_read_stops_retrying_at_the_caller_deadline() {
+    use pplx_space_node_mgr_client::proto::{NetworkPoolStatusRequest, NetworkPoolStatusResponse};
+    let node_manager = FakeNodeManager::default()
+        .unary(
+            "GetNetworkPoolStatus",
+            |_: NetworkPoolStatusRequest| -> Result<NetworkPoolStatusResponse, Status> {
+                Err(Status::unavailable("node-manager is restarting"))
+            },
+        )
+        .serve();
+    let service = service_with_node_manager(crate::db::test_conn(), node_manager.connector());
+    let mut request = internal_request(ResolveSandboxMemoryRequest {
+        requested_memory_mib: 8192,
+    });
+    request
+        .metadata_mut()
+        .insert("grpc-timeout", "500m".parse().unwrap());
+
+    let started = std::time::Instant::now();
+    service
+        .resolve_sandbox_memory(request)
+        .await
+        .expect_err("node-manager never came back");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "retried for {:?} past a 500 ms caller deadline",
+        started.elapsed()
+    );
+}
+
+/// With node-manager down, as through its restart, `Stats` still answers:
+/// without the cgroup figures only node-manager's inspect supplies, but with
+/// the network figures sandbox-manager holds itself.
+#[tokio::test]
+async fn stats_answers_without_cgroup_figures_while_node_manager_is_down() {
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new().to_string();
+    insert_test_sandbox(&conn, &sandbox_id, SandboxState::Started);
+    // No net-gateway PID, so no live gateway probe: the byte counters come
+    // from the persisted row.
+    conn.execute(
+        "UPDATE sandboxes
+         SET uid = 10000, slot = 7, network_tx_bytes = 1234, network_rx_bytes = 5678
+         WHERE id = ?1",
+        rusqlite::params![sandbox_id],
+    )
+    .unwrap();
+    let service = service_with_node_manager(
+        conn,
+        crate::node_manager_transport::fake::unbound_in_absent_dir(),
+    );
+
+    let stats = service
+        .stats(internal_request(StatsRequest {
+            sandbox_id: sandbox_id.clone(),
+        }))
+        .await
+        .expect("Stats must answer while node-manager is down")
+        .into_inner();
+    assert_eq!(
+        stats,
+        StatsResponse {
+            sandbox_id,
+            network_tx_bytes: 1234,
+            network_rx_bytes: 5678,
+            bytes_forwarded: 1234 + 5678,
+            ..Default::default()
+        }
+    );
+}
+
+/// The read's budget bounds the whole read, not only its retries. The kept
+/// channel dials inside an attempt, so with no caller deadline a node-manager
+/// that accepts but never answers would hold the read until the server's own
+/// timeout; it must instead fail at the budget.
+#[tokio::test(start_paused = true)]
+async fn memory_policy_read_gives_up_on_a_stalled_node_manager_at_its_budget() {
+    let budget = pplx_space_common_grpc::DEFAULT_GRPC_CONNECT_RETRY_POLICY.max_elapsed;
+    let node_manager = StalledNodeManager::bind();
+    let service = service_with_node_manager(crate::db::test_conn(), node_manager.connector());
+
+    let started = tokio::time::Instant::now();
+    let error = tokio::time::timeout(
+        budget + std::time::Duration::from_secs(1),
+        service.resolve_sandbox_memory(internal_request(ResolveSandboxMemoryRequest {
+            requested_memory_mib: 8192,
+        })),
+    )
+    .await
+    .expect("the read outlived its budget")
+    .expect_err("node-manager never answers");
+    assert_eq!(error.code(), tonic::Code::DeadlineExceeded, "{error}");
+    assert!(
+        started.elapsed() >= budget,
+        "gave up after {:?}",
+        started.elapsed()
+    );
+}
+
+/// `Stats` bounds its inspect the same way: a node-manager that accepts but
+/// never answers costs it `STATS_INSPECT_TIMEOUT`, after which it answers
+/// without the cgroup figures.
+#[tokio::test(start_paused = true)]
+async fn stats_answers_without_cgroup_figures_when_node_manager_stalls() {
+    let budget = STATS_INSPECT_TIMEOUT;
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new().to_string();
+    insert_test_sandbox(&conn, &sandbox_id, SandboxState::Started);
+    conn.execute(
+        "UPDATE sandboxes SET uid = 10000, slot = 7 WHERE id = ?1",
+        rusqlite::params![sandbox_id],
+    )
+    .unwrap();
+    let node_manager = StalledNodeManager::bind();
+    let service = service_with_node_manager(conn, node_manager.connector());
+
+    let started = tokio::time::Instant::now();
+    let stats = tokio::time::timeout(
+        budget + std::time::Duration::from_secs(1),
+        service.stats(internal_request(StatsRequest {
+            sandbox_id: sandbox_id.clone(),
+        })),
+    )
+    .await
+    .expect("Stats outlived its inspect budget")
+    .expect("Stats must answer while node-manager stalls")
+    .into_inner();
+    assert!(
+        started.elapsed() >= budget,
+        "gave up after {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        stats,
+        StatsResponse {
+            sandbox_id,
+            ..Default::default()
+        }
+    );
 }
