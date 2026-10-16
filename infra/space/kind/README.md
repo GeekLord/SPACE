@@ -839,6 +839,25 @@ that won would come up on the other run's host roots with every mount it
 declares present. `bootstrap.sh` publishes its copy once it has verified, so
 the documented path still names something real and current.
 
+The node images preload kind's add-on images (kindnetd and the local-path
+provisioner from Docker Hub, the control-plane images from registry.k8s.io) in
+`/var/lib/containerd`, which the `SPACE_KIND_DATA_ROOT` mount hides. Without a
+copy of them, a fresh host's kubelets pull every add-on again, and while
+Docker Hub is unreachable no node becomes Ready. So before `kind create`,
+[`scripts/seed-node-containerd.sh`](scripts/seed-node-containerd.sh) copies
+each node image's `/var/lib/containerd` into that node's directory if the
+directory is absent or empty. That is the image's stock preload, the same set
+on every node, about 430 MB each.
+- The copy goes into a staging directory beside the target and is renamed
+  onto it only when complete and only while the target is still empty.
+- Seeds of one directory take turns under a lock.
+- A directory that holds anything, such as the cache a deleted cluster leaves,
+  is never touched.
+- A seed that fails, is killed, or overlaps another bring-up leaves the
+  directory as it found it, and the kubelets pull as before.
+
+`SPACE_KIND_SEED_CONTAINERD=0` turns the copy off.
+
 `scripts/lib/kind-host-paths.sh` resolves the vendor path for both staging and
 cluster mounts. `SPACE_VENDOR_ROOT` defaults to
 `$SPACE_DEVBOX_SPACE_TARGET/vendor` when that target is set, otherwise
@@ -1749,7 +1768,23 @@ warm Docker cache). Both bring-up paths run it before `kind create`, and the
 renderer writes the tag into the cluster config. Main CI publishes each new tag
 once; Kind CI jobs pull it and fall back to a build. Builds take the
 `kindest/node` base from the third-party image mirror (`ci/mirrored-images.txt`)
-when `SPACE_CI_IMAGE_MIRROR` is set, and from the source otherwise. A package
+when `SPACE_CI_IMAGE_MIRROR` is set, and from the source otherwise.
+
+With `SPACE_CI_IMAGE_MIRROR` set, `ensure` also pulls that base for the
+control-plane and infra nodes from the mirror. The mirror holds the index's
+linux/amd64 manifest, which is the only digest the pulled copy resolves under.
+So the renderer names the base by that digest, and `kind create` uses the copy
+instead of pulling the index from Docker Hub.
+- This holds only while main's mirror job has a record that the index lists
+  that manifest (`ci/scripts/mirror-images.sh`). The renderer checks the record
+  with one bounded read.
+- With no record (a list change main has not published yet), or a record that
+  names another digest, nothing uses the listed digest. `ensure` takes the
+  pinned index from Docker Hub, and the config names the index.
+- The lookup needs Docker's containerd image store, which Kind CI enables. On
+  the classic store, `kind create` pulls the manifest from Docker Hub as before.
+
+Elsewhere the config names the index and kind pulls it. A package
 administrator has to make the `space-kind-node` package public for bring-ups
 outside CI to pull it; until then they build it, with the same result.
 
