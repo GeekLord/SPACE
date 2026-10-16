@@ -320,9 +320,27 @@ filter:
   lost race, not a failure. A tick that acquires or loses leadership records
   `leader_election.change`.
 
-Periodic gRPC polls outside these rules still open a trace per call: dropping
-one end to end needs the caller to propagate a not-sampled context, which is
-the sampler's decision rather than the span layer's.
+Other gRPC calls made while no traced span is current, such as periodic
+polls, keep their spans so APM stats still count them, but start no sampled
+trace. The client span records `untraced_caller` and takes as its parent a
+fresh unsampled context that nothing records, so both samplers record it
+without sampling it, and the call propagates that unsampled context to its
+server, whose spans are recorded unsampled too. The native Datadog sampler
+gives such spans the auto-reject priority; under OTLP the wrapped sampler
+records every span whose parent was not sampled unsampled, whatever
+`OTEL_TRACES_SAMPLER` selects, Kind's `always_on` included. A failed call
+still reaches the backend: the Datadog exporter keeps a rejected chunk that
+contains an error for the Agent's error sampler (a sampling rule's user reject
+would drop it), and under OTLP an unsampled span is exported only when it
+failed. Such a span's parent is the unrecorded context, so it heads its trace.
+The shim does the same for its calls outside any shim operation, such as
+containerd relaying kubelet's stats polls: it sends a fresh unsampled context.
+Both mark that context with the `tracestate` member `space=untraced`, which its
+descendants carry across services. Work that follows such a call, such as a
+job, a reconcile ref or a detached task, does not save it as its origin, since
+no request was sampled out, and is sampled as a root of its own. The member
+counts only on an unsampled context: a sampled one is saved whatever its
+`tracestate` carries.
 
 ## S3 client spans
 
@@ -378,19 +396,28 @@ reaches:
   inside the request's trace. The executor's work and its node calls are
   children of the attempt.
 - Reconciliation is fan-in: one pass applies refs that many writers queued.
-  Each ref saves its latest writer's `traceparent`, and a pass is a root that
-  links to the saved contexts of the refs it claimed.
+  Each ref saves its latest writer's `traceparent`, except that an unsampled
+  writer never replaces a sampled one, and a pass is a root that links to the
+  saved contexts of the refs it claimed.
+- Each `shim.create` attempt is a root linked to the context its Pod's
+  annotation carries: kubelet retries a failed pod sandbox with that
+  annotation unchanged, so joining it would collect every attempt in the one
+  trace. The shim's own teardown spans link to their task's create.
 
 A root that links to the context that caused it records that context's trace
 id as `origin_trace_id`, since a link is not searchable, and whether it was
 sampled as `origin_sampled`. Its sampling follows that origin: it is kept when
 any origin it links to was sampled and dropped when none was, so a kept
-request keeps the work it caused. A root with no origin, and every span with a
-parent, keeps the configured sampler. Under OTLP the sampler that
-`OTEL_TRACES_SAMPLER` selects is wrapped to read the root's links. The native
-Datadog sampler cannot be wrapped and does not read links, so two sampling
-rules on `origin_sampled`, ahead of the ones `DD_TRACE_SAMPLING_RULES`
-configures, keep (`1.0`) or drop (`0.0`) such a root. A root links to at
+request keeps the work it caused. A root with no origin keeps the configured
+sampler. Under OTLP the sampler that `OTEL_TRACES_SAMPLER` selects is wrapped
+to read the root's links. The shim's wrapper also makes every span with a
+parent follow it, sampled or recorded unsampled, so a sampler that is not
+parent-based, such as Kind's `always_on`, cannot sample the children of a
+dropped `shim.create` and send their sampled `traceparent` on. The native
+Datadog samplers do not read links, so two sampling rules on
+`origin_sampled`, ahead of the ones `DD_TRACE_SAMPLING_RULES` configures,
+keep (`1.0`) or drop (`0.0`) such a root. The Rust services and the shim
+apply the same rules to their linked roots. A root links to at
 most eight origins, sampled ones first, so one with any sampled origin always
 links it and is kept. Datadog's rate limit (`DD_TRACE_RATE_LIMIT`) still
 applies to a kept root, and sampling rules sent
@@ -412,6 +439,12 @@ an operation's target, a job's subject, a detached task's sandbox. A pass
 records `sandbox_id` when its refs name one sandbox, and `sandbox_ids`, a
 comma-separated list of at most sixteen, whenever they name any, with the
 rest counted in `sandbox_ids.dropped`.
+
+Each asynchronous root also names its Datadog operation, so it has its own
+APM series: `public_operation.execute`, `job.<kind>`, `node_ctl.pass`,
+`sbxmgr.detached` and `leader_election.change`. An internal span that names
+none falls back to the operation `internal`, shared by every such span of the
+service.
 
 One case remains that SPACE cannot fix. datadog-opentelemetry 0.5.2 counts no
 span whose parent is remote when the process already has that trace open
@@ -552,7 +585,9 @@ The `error` values are listed in `crates/libs/metrics/src/sandbox/vm.rs`.
 Firecracker's flow-control counters (`block` `no_avail_buffer`, `net`
 `no_rx_avail_buffer` and `no_tx_avail_buffer`) are not among them: they count
 times the guest had not yet posted a buffer, which the device retries, not
-failures.
+failures. Nor is `signals` `sigpipe`: Firecracker raises SIGPIPE when it writes
+guest vsock data to a host peer that has gone, and `vsock` `tx_write_fails`
+counts that write once.
 
 Firecracker's ERROR log lines are re-logged by sandbox-manager as
 `firecracker error` with `sandbox_id` and the line in `firecracker_message`, at
@@ -589,6 +624,13 @@ sandbox-manager and node-manager operations, volume-manager jobs and RPCs for
 a sandbox subject, and every RPC a sandbox's net-gateway serves. A Rust
 service's JSON log line written inside such a span carries the same field,
 unless the event sets its own.
+
+A lifecycle request's entry span carries it too, not only its children, so a
+search by `sandbox_id` finds the request itself: space-api's `http.server`
+span for a sandbox route or a create, and the `grpc.server` span of
+node-api's and sandbox-manager's lifecycle RPCs (create, start, wake, stop,
+delete, suspend, pause, resume, kill, rollback and pool adoption). A create
+that names no sandbox records the one it allocated when it returns.
 
 Two other spellings remain where they are part of a contract, and convert by
 prefix:
