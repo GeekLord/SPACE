@@ -26,9 +26,10 @@ Its normal native selection now includes these checks; no extra package or
 separate hardening workflow is needed. Existing duration-balanced sharding
 also includes them.
 
-Kind CI runs this inventory on main and on the existing path-selected Kind PR
-workflow. This does not introduce Kind execution on every PR. Private
-compositions invoke platform commands through their platform-command wrapper.
+Kind CI runs this inventory on main and on pull requests whose paths select
+the Kind smoke in Pull CI. This does not introduce Kind execution on every PR.
+Private compositions invoke platform commands through their platform-command
+wrapper.
 
 For HTTP-only access to an already deployed test environment:
 
@@ -79,7 +80,7 @@ and lifecycle contention.
 
 The **Quarantined smoke backlog (non-blocking)** job inventories all declared
 quarantines on every PR and applicable manual CI entry point. Pull CI owns the
-single PR check; Kind Pull CI does not repeat it, and main pushes and
+single PR check; the Kind smoke it calls does not repeat it, and main pushes and
 merge-group runs do not run it. It displays counts, reasons, and source links
 in the job summary and warning annotations. The check fails when any scenarios
 remain quarantined, and passes when the backlog is empty. It executes no
