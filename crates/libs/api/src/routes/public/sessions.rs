@@ -36,6 +36,7 @@ use super::{
     error::{PublicApiError, with_retry_after_hint},
     operations::accepts_event_stream,
     owner_scope::{AuthorizedSandbox, authorized_sandbox},
+    sandboxes::parse_public_sandbox_id,
 };
 
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
@@ -605,12 +606,6 @@ fn validate_process_request(request: &CreateProcessRequest) -> Result<(), Public
             .map_err(|error| PublicApiError::bad_request(error.to_string()))?;
     }
     validate_terminal_size(request.pty.as_ref())
-}
-
-fn parse_public_sandbox_id(value: &str) -> Result<PublicSandboxId, PublicApiError> {
-    value
-        .parse()
-        .map_err(|_| PublicApiError::bad_request("invalid sandbox id"))
 }
 
 fn parse_session_id(value: &str) -> Result<DataPlaneSessionId, PublicApiError> {
