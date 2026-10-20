@@ -698,6 +698,10 @@ pub fn certificate_cache_entries(entries: usize, capacity: usize) {
 }
 
 /// One completed TLS handshake operation. `leg` names the two peers directly.
+/// `alert` is the wire value of the fatal alert the peer on that leg sent
+/// (RFC 8446 section 6; `48` is `unknown_ca`, `42` is `bad_certificate`), or
+/// `none` when it sent none. On `client_to_netgw`, a certificate alert means the guest
+/// rejected the interception chain; a disconnect or reset carries no alert.
 pub fn tls_handshake(leg: &str, outcome: &str, reason: &str, alert: &str) {
     counter(
         "gateway.tls.handshake",
