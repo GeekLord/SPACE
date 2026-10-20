@@ -40,11 +40,9 @@ from space_smoke.capabilities import (
     EcwForkResult,
     SnapshotReaperConfig,
     SnapshotReaperControl,
-    FailedTransfer,
     ReleaseStorageRow,
     SnapshotRowFacts,
     StartupRecoveryControl,
-    StartupRecoveryReport,
     SuspendCodecControl,
     SandboxNetworkIsolationControl,
     StorageExchangeControl,
@@ -113,6 +111,7 @@ from space_smoke.invariants.lifecycle import prove_idle_deadline_reset
 from space_smoke.network_policy import NetworkPolicyAssertions
 from space_smoke.runtime import (
     Compensation,
+    InconclusiveSmoke,
     InvariantViolation,
     ResourceScope,
     ScenarioContext,
@@ -896,7 +895,13 @@ class CommandSandboxFixture:
         **evidence: object,
     ) -> None:
         if not condition and failure_evidence is not None:
-            evidence.update(failure_evidence())
+            # Evidence must never replace the verdict it explains.
+            try:
+                evidence.update(failure_evidence())
+            except ScenarioTimedOut:
+                raise
+            except Exception as error:  # noqa: BLE001 - attached, the violation still raises
+                evidence["failure_evidence_error"] = f"{type(error).__name__}: {error}"[:500]
         self._context.verify(condition, message, **evidence)
 
     def warn(self, message: str, **evidence: object) -> None:
@@ -3318,6 +3323,12 @@ TEMPLATE_EVICTION_SETTLE_SECONDS = 30.0
 TEMPLATE_EVICTION_RETRY_SECONDS = 3.0
 
 
+# node-manager's `node_mgr.btrfs_send.stream_rejected` counter, as Prometheus names it.
+BTRFS_SEND_STREAM_REJECTED_METRIC = "space_node_mgr_btrfs_send_stream_rejected_total"
+# Export flushes plus scrape lag, as for the on-demand pull counts.
+STREAM_REJECTIONS_SETTLE_SECONDS = ON_DEMAND_PULL_SETTLE_SECONDS
+
+
 class SuspendCodecAssertions:
     """Prove the production suspend codec's failure matrix on a real bench.
 
@@ -3347,6 +3358,8 @@ class SuspendCodecAssertions:
         self._restore_rows: Compensation | None = None
         self._retire_attempted = False
         self._accepted_snapshots: set[str] = set()
+        # node-manager's rejected-stream counts when the send interrupt began.
+        self._rejections_before: dict[str, float] | None = None
 
     @staticmethod
     def mark_since() -> str:
@@ -3411,11 +3424,25 @@ class SuspendCodecAssertions:
         and runs eagerly when the body exits. A body that completes requires
         at least one pulse: without one, nothing was interrupted.
 
+        Before it starts, node-manager's rejected-stream count on the worker
+        is read once it has stopped moving: the baseline
+        `expect_rejected_send_stream` measures the rejection against. That
+        count is read from the bench's Prometheus, which only the `otel`
+        telemetry mode installs; on any other bench the scenario cannot prove
+        the rejection's cause and is inconclusive.
+
         Scenarios on one bench run in turn, so the send in flight is this
         sandbox's. A concurrent smoke's send that took the pulse instead can
         only fail this scenario's rejection check, never pass it.
         """
 
+        mode = self._control.telemetry_mode()
+        if mode != "otel":
+            raise InconclusiveSmoke(
+                f"the bench runs telemetry mode {mode!r}; proving that node-manager "
+                "rejected the restarted send needs its counter from the otel mode's Prometheus"
+            )
+        self._rejections_before = self._settled_stream_rejections(node_name)
         token = secrets.token_hex(8)
         lines: list[str] = []
         end = self._scope.defer(
@@ -3445,45 +3472,131 @@ class SuspendCodecAssertions:
             interrupter_output=lines,
         )
 
-    def expect_rejected_send_stream(self, node_name: str, *, since_time: str) -> FailedTransfer:
-        """node-manager refused the restarted stream and volume-manager retried.
+    def stream_rejections(self, node_name: str) -> dict[str, float]:
+        """node-manager's cumulative rejected send streams on `node_name`, by reason.
 
-        The record is volume-manager's failed `push_btrfs_send` attempt for
-        the sandbox's send stream, failed as retriable with node-manager's
-        rejection. Unlike sbx-manager's bounded restore error kinds, a
-        transfer's retry class does not name the cause, so the message is
-        matched.
+        `node_mgr.btrfs_send.stream_rejected` (`crates/libs/metrics/src/
+        node_manager.rs`), read from the bench's Prometheus. A series appears
+        with its first rejection, so a reason absent here has counted none.
         """
 
-        from space_smoke.adapters import BTRFS_SEND_REJECTED_ERROR, ROOTFS_SEND_FILE
-
-        failures = self._control.failed_transfers(
-            self._fixture.sandbox.sandbox_id, node_name, since_time=since_time
+        query = (
+            f"sum by (reason) ({BTRFS_SEND_STREAM_REJECTED_METRIC}"
+            f"{{k8s_node_name={_promql_string(node_name)}}})"
         )
-        rejected = [
-            failure
-            for failure in failures
-            if failure.kind == "push_btrfs_send"
-            and PurePosixPath(failure.local_path).name == ROOTFS_SEND_FILE
-            and BTRFS_SEND_REJECTED_ERROR in failure.error
-        ]
+        body = self._control.telemetry_query(
+            "prometheus", "/api/v1/query", {"query": query, "time": str(time.time())}
+        )
+        return {
+            str(sample["metric"].get("reason", "")): float(sample["value"][1])
+            for sample in body["data"]["result"]
+        }
+
+    def _settled_stream_rejections(self, node_name: str) -> dict[str, float]:
+        """The rejection counts once unchanged for `STREAM_REJECTIONS_SETTLE_SECONDS`.
+
+        An earlier scenario's rejection on this worker can land after a single
+        read and would then count as this send's.
+        """
+
+        settle_seconds = STREAM_REJECTIONS_SETTLE_SECONDS
+        counts = self.stream_rejections(node_name)
+        unchanged_since = time.monotonic()
+        deadline = unchanged_since + 180
+        while time.monotonic() - unchanged_since < settle_seconds:
+            self._fixture.verify(
+                time.monotonic() <= deadline,
+                "node-manager's rejected-stream count did not settle before the suspend",
+                worker_node=node_name,
+                stream_rejections=counts,
+            )
+            self._fixture.wait(5)
+            now = self.stream_rejections(node_name)
+            if now != counts:
+                counts, unchanged_since = now, time.monotonic()
+        self._fixture.record("stream_rejections_baseline", counts)
+        return counts
+
+    def expect_rejected_send_stream(
+        self, node_name: str, *, since_time: str, timeout: float = 120
+    ) -> TransferJobView:
+        """node-manager refused the restarted stream and volume-manager retried.
+
+        Two durable records. The retry: the sandbox's `push_btrfs_send` job for
+        its send stream ended `completed` after at least two attempts, so one
+        attempt failed and the same job ran again (the job store never resets
+        `attempts`; a permanent failure would have ended it `failed`). The
+        cause: node-manager's rejected-stream counter rose on the worker over
+        the interrupted upload, against the baseline `interrupting_btrfs_send`
+        read. The counter does not name the sandbox; scenarios on one bench run
+        in turn, and the attempt count ties the failure to this sandbox's job.
+        `since_time` bounds the volume-manager log attached when a check fails.
+        """
+
+        from space_smoke.adapters import ROOTFS_SEND_FILE
+
+        sandbox_id = self._fixture.sandbox.sandbox_id
+        before = self._rejections_before
+        if before is None:
+            raise SmokeConfigurationError(
+                "expect_rejected_send_stream reads the baseline interrupting_btrfs_send takes"
+            )
+        deadline = time.monotonic() + timeout
+        while True:
+            after = self.stream_rejections(node_name)
+            delta = {
+                reason: after[reason] - before.get(reason, 0.0)
+                for reason in after
+                if after[reason] > before.get(reason, 0.0)
+            }
+            if delta or time.monotonic() > deadline:
+                break
+            self._fixture.wait(5)
         self._fixture.verify(
-            len(rejected) >= 1,
+            bool(delta),
             "no streamed upload attempt failed on node-manager's rejection of a "
             "restarted send; the interrupted stream was forwarded",
-            sandbox_id=self._fixture.sandbox.sandbox_id,
+            sandbox_id=sandbox_id,
             worker_node=node_name,
-            failed_attempts=[asdict(failure) for failure in failures],
+            stream_rejections_before=before,
+            stream_rejections_after=after,
+            failure_evidence=lambda: {
+                "volume_manager_log": self._control.transfer_job_log(
+                    node_name, since_time=since_time
+                )
+            },
         )
-        failure = rejected[0]
+        jobs = [
+            job
+            for job in self._control.transfer_jobs(node_name, sandbox_id)
+            if job.kind == "push_btrfs_send"
+            and PurePosixPath(job.local_path).name == ROOTFS_SEND_FILE
+        ]
+        completed = [job for job in jobs if job.status == "completed"]
         self._fixture.verify(
-            failure.error_kind == "retriable",
+            bool(completed),
             "the rejected send failed its upload permanently instead of retrying",
-            sandbox_id=self._fixture.sandbox.sandbox_id,
-            failed_attempt=asdict(failure),
+            sandbox_id=sandbox_id,
+            send_jobs=[asdict(job) for job in jobs],
         )
-        self._fixture.record("rejected_send", asdict(failure))
-        return failure
+        retried = max(completed, key=lambda job: job.attempts)
+        self._fixture.verify(
+            retried.attempts >= 2,
+            "no streamed upload attempt failed on node-manager's rejection of a "
+            "restarted send; the interrupted stream was forwarded",
+            sandbox_id=sandbox_id,
+            send_jobs=[asdict(job) for job in jobs],
+            failure_evidence=lambda: {
+                "volume_manager_log": self._control.transfer_job_log(
+                    node_name, since_time=since_time
+                )
+            },
+        )
+        self._fixture.record(
+            "rejected_send",
+            {"job_id": retried.job_id, "attempts": retried.attempts, "stream_rejections": delta},
+        )
+        return retried
 
     def expect_retained_source_without_send_file(self, node_name: str) -> tuple[str, ...]:
         """The canonical snapshot holds the retained bundle and no send file."""
@@ -3993,6 +4106,46 @@ class PlantedBuild:
     digest: str
 
 
+@dataclass(frozen=True)
+class RecoveredBuild:
+    """A plant as startup recovery left it: its digest directories and the daemon's answer."""
+
+    digest_dirs: tuple[str, ...]
+    build_state: str | None
+
+
+# The decision-table branch a plant took, keyed on what it held when the daemon
+# restarted and what it holds after recovery, each as (catalog row, digest
+# directory). With the precondition fixed, every branch ends in its own state.
+_RECOVERY_OUTCOMES = {
+    ((True, True), (True, True)): "confirmed",
+    ((False, True), (True, True)): "registered",
+    ((True, True), (False, False)): "rejected",
+    ((False, True), (False, False)): "rejected",
+    ((True, False), (False, False)): "pruned",
+}
+
+
+def recovery_outcome(held: tuple[bool, bool], digest: str, after: RecoveredBuild) -> str:
+    """The branch a plant holding `held` at restart took, from its state after recovery.
+
+    A row counts when `space-tmplmgr get` answers for it at all; a row beside
+    its directory must be `ready`. `untouched` is a plant other than a
+    row-backed one that recovery left as it was; `inconsistent` is a state no
+    branch leaves.
+    """
+
+    if after.digest_dirs not in ((), (digest,)):
+        return "inconsistent"
+    now = (after.build_state is not None, bool(after.digest_dirs))
+    if now == (True, True) and after.build_state != "ready":
+        return "inconsistent"
+    outcome = _RECOVERY_OUTCOMES.get((held, now))
+    if outcome is not None:
+        return outcome
+    return "untouched" if now == held else "inconsistent"
+
+
 RECOVERY_PLANT_BYTES = 4 * 1024**2
 
 
@@ -4002,11 +4155,19 @@ class StartupRecoveryAssertions:
     Recovery runs once, at daemon start, over every template name directory on
     the node. So the scenario plants one throwaway build per branch of the
     table on the sandbox-pool worker that is *not* running its sandbox, puts
-    each into the on-disk/catalog state that branch handles, restarts that
-    worker's template-manager once, and reads the five verdicts from the new
-    pod's log — then checks each verdict against disk (`sha256:*` directories) and
-    the daemon (`space-tmplmgr get`, safe here because the plants have no
-    cluster release and so a miss cannot re-pull).
+    each into the on-disk/catalog state that branch handles, and restarts that
+    worker's template-manager once. Each plant's outcome follows from what it
+    held at the restart and what it holds after recovery: its `sha256:*`
+    directories on disk and the daemon's `space-tmplmgr get` answer (safe here
+    because the plants have no cluster release, so a miss cannot re-pull).
+
+    Recovery is over once the stale plant's row is gone: rows whose bytes are
+    missing are pruned in one pass after every digest directory has been
+    reconciled (`run_startup_recovery`). The eviction loop, which starts beside
+    recovery, can also drop a row, so the stale plant is read `ready`
+    immediately before the restart: that proves no eviction removed it
+    earlier, and the successful read restarts the build's eviction grace
+    (`SPACE_TEMPLATE_GC_GRACE_SECS`), which outlasts a restart.
 
     No SQLite anywhere: "no row" states are made by stashing the digest
     directory aside, running the daemon's own `delete-template`, and putting
@@ -4026,6 +4187,10 @@ class StartupRecoveryAssertions:
         self._scope = scope
         self._node: str | None = None
         self._pod: str | None = None
+        self._plants: dict[str, PlantedBuild] = {}
+        # What each plant holds when the daemon restarts: (catalog row, digest directory).
+        self._held: dict[str, tuple[bool, bool]] = {}
+        self._recovered: dict[str, RecoveredBuild] = {}
 
     def spare_worker(self) -> str:
         """A sandbox-pool node not running the fixture sandbox."""
@@ -4099,6 +4264,8 @@ class StartupRecoveryAssertions:
             build_state=state,
         )
         planted = PlantedBuild(case, name, digests[0])
+        self._plants[name] = planted
+        self._held[name] = (True, True)
         self._fixture.record(f"plant_{case}", f"{name}/{planted.digest}")
         return planted
 
@@ -4107,11 +4274,16 @@ class StartupRecoveryAssertions:
 
         node = self._current_node()
         self._control.remove_template_digest_dir(node, planted.name, planted.digest)
+        digests = self._control.template_digest_dirs(node, planted.name)
+        state = self._control.template_build_state(node, planted.name, planted.digest)
         self._fixture.verify(
-            self._control.template_digest_dirs(node, planted.name) == (),
-            "the digest directory is still on disk after removal",
+            digests == () and state == "ready",
+            "the stale build should keep its row with its digest directory removed",
             template=planted.name,
+            digest_dirs=list(digests),
+            build_state=state,
         )
+        self._held[planted.name] = (True, False)
 
     def orphan(self, planted: PlantedBuild) -> None:
         """Bytes kept, row gone — the state a crash between rename and DB commit leaves."""
@@ -4123,6 +4295,7 @@ class StartupRecoveryAssertions:
             "the digest directory did not survive being orphaned",
             template=planted.name,
         )
+        self._held[planted.name] = (False, True)
 
     def tamper(self, planted: PlantedBuild) -> None:
         """No row, and the bootable artifact's bytes changed under an unchanged size."""
@@ -4139,10 +4312,28 @@ class StartupRecoveryAssertions:
 
     def restart_and_wait_for_recovery(
         self, *, restart_timeout: float = 600, recovery_timeout: float = 300
-    ) -> StartupRecoveryReport:
-        """Replace the spare worker's template-manager pod and wait for recovery to finish."""
+    ) -> None:
+        """Replace the spare worker's template-manager pod and wait for recovery to finish.
+
+        Finished means every stale plant's row is gone (see the class
+        docstring); each plant's state is then read once for the expectations.
+        """
 
         node = self._current_node()
+        stale = [self._plants[name] for name, held in self._held.items() if held == (True, False)]
+        if not stale:
+            raise SmokeConfigurationError(
+                "plant a stale row before restarting: its prune marks the end of recovery"
+            )
+        before = {
+            planted.name: self._control.template_build_state(node, planted.name, planted.digest)
+            for planted in stale
+        }
+        self._fixture.verify(
+            all(state == "ready" for state in before.values()),
+            "the stale row was gone before the restart; its prune cannot mark the end of recovery",
+            stale_build_states=before,
+        )
         started = time.monotonic()
         self._pod = self._control.restart_node_service(
             node, "template-manager", timeout=restart_timeout
@@ -4153,106 +4344,103 @@ class StartupRecoveryAssertions:
         )
         deadline = time.monotonic() + recovery_timeout
         while True:
-            report = self._control.startup_recovery_report(node)
-            if report.finished:
+            states: dict[str, str | None] = {}
+            last_error: str | None = None
+            for planted in stale:
+                try:
+                    states[planted.name] = self._control.template_build_state(
+                        node, planted.name, planted.digest
+                    )
+                except RuntimeError as error:
+                    # The replacement can be Ready before its socket answers.
+                    states[planted.name], last_error = "<unreadable>", str(error)
+            if all(state is None for state in states.values()):
                 break
             self._fixture.verify(
                 time.monotonic() <= deadline,
-                "template-manager did not log the end of startup recovery in time",
+                "template-manager's startup recovery did not prune the stale row in time",
                 pod=self._pod,
                 recovery_timeout_seconds=recovery_timeout,
-                verdicts_so_far=len(report.verdicts),
+                stale_build_states=states,
+                last_read_error=last_error,
+                failure_evidence=lambda: {
+                    "startup_recovery_log": self._control.startup_recovery_log(node)
+                },
             )
             self._fixture.wait(3)
         self._fixture.record(
-            "recovery_verdicts",
-            [
-                {"template": v.template, "outcome": v.outcome, "reason": v.reason}
-                for v in report.verdicts
-                if v.template.startswith("smoke-rec-")
-            ],
+            "recovery_seconds", round(time.monotonic() - started, 1)
         )
-        return report
+        outcomes = []
+        for name, planted in self._plants.items():
+            recovered = RecoveredBuild(
+                self._control.template_digest_dirs(node, name),
+                self._control.template_build_state(node, name, planted.digest),
+            )
+            self._recovered[name] = recovered
+            outcomes.append(
+                {
+                    "template": name,
+                    "held_row_and_dir": list(self._held[name]),
+                    "digest_dirs": list(recovered.digest_dirs),
+                    "build_state": recovered.build_state,
+                    "outcome": recovery_outcome(self._held[name], planted.digest, recovered),
+                }
+            )
+        self._fixture.record("recovery_outcomes", outcomes)
 
-    def _outcomes(self, report: StartupRecoveryReport, planted: PlantedBuild) -> list[str]:
-        return [v.outcome for v in report.for_build(planted.name, planted.digest)]
-
-    def _expect_state(self, planted: PlantedBuild, *, present: bool) -> None:
-        # `space-tmplmgr get` is safe as a negative probe here only because the
-        # plants have no cluster release: a local miss asks the cluster for a
-        # release to pull, gets NotFound, and cannot re-materialize the build
-        # (nor adopt an orphaned directory: the pull asks the cluster for the
-        # release before it touches the disk).
+    def _expect_outcome(self, planted: PlantedBuild, expected: str, message: str) -> None:
+        recovered = self._recovered.get(planted.name)
+        if recovered is None:
+            raise SmokeConfigurationError("restart_and_wait_for_recovery must run first")
         node = self._current_node()
-        digests = self._control.template_digest_dirs(node, planted.name)
-        state = self._control.template_build_state(node, planted.name, planted.digest)
-        if present:
-            ok = digests == (planted.digest,) and state == "ready"
-            message = "the build should have survived recovery with its bytes and a ready row"
-        else:
-            ok = digests == () and state is None
-            message = "the build should have been removed by recovery, bytes and row"
+        outcome = recovery_outcome(self._held[planted.name], planted.digest, recovered)
         self._fixture.verify(
-            ok,
+            outcome == expected,
             message,
             template=planted.name,
-            digest_dirs=list(digests),
-            build_state=state,
+            held_row_and_dir=list(self._held[planted.name]),
+            digest_dirs=list(recovered.digest_dirs),
+            build_state=recovered.build_state,
+            outcome=outcome,
+            failure_evidence=lambda: {
+                "startup_recovery_log": self._control.startup_recovery_log(node)
+            },
         )
 
-    def expect_confirmed(self, report: StartupRecoveryReport, planted: PlantedBuild) -> None:
-        """Row plus intact declared files: confirmed by stat alone, never hashed."""
+    def expect_confirmed(self, planted: PlantedBuild) -> None:
+        """Row plus intact declared files: kept with its bytes and a ready row."""
 
-        outcomes = self._outcomes(report, planted)
-        self._fixture.verify(
-            outcomes == ["confirmed"],
-            "a build with a row and intact bytes was not confirmed exactly once",
-            template=planted.name,
-            outcomes=outcomes,
+        self._expect_outcome(
+            planted, "confirmed", "a build with a row and intact bytes did not survive recovery"
         )
-        self._expect_state(planted, present=True)
 
-    def expect_pruned(self, report: StartupRecoveryReport, planted: PlantedBuild) -> None:
-        """A row whose bytes are gone is pruned; nothing is hashed or registered."""
+    def expect_pruned(self, planted: PlantedBuild) -> None:
+        """A row whose bytes are gone is pruned."""
 
-        outcomes = self._outcomes(report, planted)
-        self._fixture.verify(
-            outcomes == ["pruned"],
-            "a row without bytes was not pruned (or something else happened to it)",
-            template=planted.name,
-            outcomes=outcomes,
+        self._expect_outcome(
+            planted, "pruned", "a row without bytes was not pruned (or something else happened to it)"
         )
-        self._expect_state(planted, present=False)
 
-    def expect_registered(self, report: StartupRecoveryReport, planted: PlantedBuild) -> None:
-        """Bytes without a row are adopted only through a matching hash."""
+    def expect_registered(self, planted: PlantedBuild) -> None:
+        """Bytes without a row are adopted with a ready row."""
 
-        outcomes = self._outcomes(report, planted)
-        self._fixture.verify(
-            outcomes == ["registered"],
-            "an orphaned valid build was not registered exactly once",
-            template=planted.name,
-            outcomes=outcomes,
+        self._expect_outcome(
+            planted, "registered", "an orphaned valid build was not registered"
         )
-        self._expect_state(planted, present=True)
 
-    def expect_rejected(
-        self, report: StartupRecoveryReport, planted: PlantedBuild, *, reason_contains: str
-    ) -> None:
-        """The directory is removed for the stated reason and never adopted."""
+    def expect_rejected(self, planted: PlantedBuild) -> None:
+        """The directory is removed with any row, and never adopted.
 
-        verdicts = report.for_build(planted.name, planted.digest)
-        outcomes = [v.outcome for v in verdicts]
-        reasons = [v.reason for v in verdicts if v.outcome == "rejected"]
-        self._fixture.verify(
-            outcomes == ["rejected"] and any(reason_contains in r for r in reasons),
-            "an invalid digest directory was not rejected for the expected reason",
-            template=planted.name,
-            outcomes=outcomes,
-            reasons=reasons,
-            expected_reason_fragment=reason_contains,
+        Which check rejected it is the daemon's free-text reason, not part of
+        the outcome: each rejected plant is built like a control the scenario
+        expects to be kept (tamper like orphan, drift like happy) and differs
+        from it only in its bootable artifact's bytes or size.
+        """
+
+        self._expect_outcome(
+            planted, "rejected", "an invalid digest directory was not removed with its row"
         )
-        self._expect_state(planted, present=False)
 
 
 # The two healthy outcomes of a remote pull. `remote_local_mismatch` and

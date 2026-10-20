@@ -1650,38 +1650,6 @@ class TemplateCacheControl(RestoreStateRead, Protocol):
         ...
 
 
-@dataclass(frozen=True)
-class TemplateRecoveryVerdict:
-    """One digest directory's fate in a template-manager startup recovery pass.
-
-    `outcome` is one of `confirmed` (row present, declared files intact, no
-    hashing), `registered` (no row; bootable artifact hashed to the dir name
-    and a row inserted), `rejected` (manifest, size or hash disagreement;
-    directory removed, no row) or `pruned` (row whose bytes were gone).
-    `reason` is the daemon's own rejection text for `rejected`, else empty.
-    """
-
-    template: str
-    content_hash: str
-    outcome: str
-    reason: str = ""
-
-
-@dataclass(frozen=True)
-class StartupRecoveryReport:
-    """What one worker's template-manager logged for its startup recovery pass."""
-
-    node_name: str
-    pod_name: str
-    finished: bool
-    verdicts: tuple[TemplateRecoveryVerdict, ...]
-
-    def for_build(self, template: str, content_hash: str) -> tuple[TemplateRecoveryVerdict, ...]:
-        return tuple(
-            v for v in self.verdicts if v.template == template and v.content_hash == content_hash
-        )
-
-
 class StartupRecoveryControl(RestoreStateRead, Protocol):
     """Privileged operations for template-manager's startup recovery decision table.
 
@@ -1720,7 +1688,13 @@ class StartupRecoveryControl(RestoreStateRead, Protocol):
     def template_build_state(
         self, node_name: str, template: str, content_hash: str
     ) -> str | None:
-        """State of the `template` build with `content_hash`; None once it no longer resolves."""
+        """State of the `template` build with `content_hash`; None once it no longer resolves.
+
+        A row whose digest directory is gone still answers its own state:
+        with no manifest left there is nothing to check the rootfs against,
+        and the answer comes from the row alone, without a pull, so it is
+        safe to poll on a build whose bytes were removed.
+        """
         ...
 
     def template_digest_dirs(self, node_name: str, template: str) -> tuple[str, ...]:
@@ -1759,11 +1733,11 @@ class StartupRecoveryControl(RestoreStateRead, Protocol):
         """
         ...
 
-    def startup_recovery_report(self, node_name: str) -> StartupRecoveryReport:
-        """template-manager's startup recovery verdicts from its pod's log on that node.
+    def startup_recovery_log(self, node_name: str) -> list[str]:
+        """template-manager's startup-recovery lines from its pod's log on that node.
 
-        The pod's own log, a restarted container's previous attempt first, so
-        the first recovery pass is read even if a later attempt ran another.
+        Failure evidence only: no assertion reads it. A restarted container's
+        previous attempt comes first.
         """
         ...
 
@@ -1774,13 +1748,17 @@ class TransferJobView:
 
     `kind` is the job kind: `push_btrfs_send` streams a rootfs from a retained
     btrfs source, while a materialized send file uploads under another kind
-    with the same `local_path`.
+    with the same `local_path`. `error` is the persisted message of the last
+    failed attempt, cleared when the job completes; `attempts` counts the
+    executions the job started, retries included, and is never reset.
     """
 
     job_id: str
     kind: str
     status: str
     local_path: str
+    error: str = ""
+    attempts: int = 0
 
 
 @dataclass(frozen=True)
@@ -1802,21 +1780,6 @@ class RestoreFailure:
     error_kind: str
     error: str
     restore_codec: str
-
-
-@dataclass(frozen=True)
-class FailedTransfer:
-    """One volume-manager transfer attempt that failed, from its log line.
-
-    `error_kind` is volume-manager's retry class (`retriable` or `permanent`);
-    `error` is the message that failed the attempt.
-    """
-
-    node_name: str
-    kind: str
-    local_path: str
-    error_kind: str
-    error: str
 
 
 @dataclass(frozen=True)
@@ -1878,10 +1841,11 @@ class SuspendCodecControl(CrossNodeRestoreControl, Protocol):
         """
         ...
 
-    def failed_transfers(
-        self, sandbox_id: str, node_name: str, *, since_time: str
-    ) -> list[FailedTransfer]:
-        """volume-manager's failed transfer attempts under the sandbox's cache directory on `node_name` since `since_time`."""
+    def transfer_job_log(self, node_name: str, *, since_time: str) -> list[str]:
+        """volume-manager's transfer-job lines on `node_name` since `since_time`.
+
+        Failure evidence only: no assertion reads it. Storage URIs are redacted.
+        """
         ...
 
     def interrupt_btrfs_send(
