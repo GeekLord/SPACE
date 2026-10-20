@@ -5698,6 +5698,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "bytes",
+ "clap",
  "dashmap",
  "form_urlencoded",
  "futures-util",
