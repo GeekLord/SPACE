@@ -77,6 +77,14 @@ async fn refused_teardown_with(payload: impl FnOnce(LocalArtifactId) -> String) 
     let staged =
         insert_stranded_teardown_suspend_sandbox(&conn, sandbox_id, generation(GENERATION));
     let job_id = insert_upload_job(&conn, &sandbox_id_string, staged, &payload(staged));
+    // The worker records a refusal naming a retired execution as the
+    // artifact's own.
+    crate::snapshot_upload_jobs::record_failure_scope(
+        &conn,
+        &job_id,
+        crate::snapshot_upload::UploadFailureScope::Artifact,
+    )
+    .unwrap();
     pplx_space_common_jobs::db::fail_job_permanent(
         conn.raw(),
         &job_id,
@@ -148,7 +156,7 @@ async fn poll_outcome(
     TeardownSuspendOutcome::try_from(response.outcome).unwrap()
 }
 
-async fn drain(service: &SandboxManagerService) {
+pub(super) async fn drain(service: &SandboxManagerService) {
     service.shutdown_token.cancel();
     service.task_tracker.close();
     tokio::time::timeout(Duration::from_secs(5), service.task_tracker.wait())
@@ -1019,7 +1027,19 @@ where
 /// Serves `stub` and runs `test` in an isolated child process whose
 /// cluster-api client wiring points at it, with a synthetic snapshot upload
 /// destination configured.
-async fn with_cluster_api(stub: RetiringClusterApi, test: impl AsyncFnOnce()) {
+pub(super) async fn with_cluster_api<S>(stub: S, test: impl AsyncFnOnce())
+where
+    S: tower::Service<
+            http::Request<tonic::body::Body>,
+            Response = http::Response<tonic::body::Body>,
+            Error = std::convert::Infallible,
+        > + tonic::server::NamedService
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send + 'static,
+{
     use std::ffi::OsStr;
 
     // The parent serves while the isolated child exercises environment-based
@@ -1053,6 +1073,10 @@ async fn with_cluster_api(stub: RetiringClusterApi, test: impl AsyncFnOnce()) {
         ),
         ("SPACE_SNAPSHOT_BUCKET", Some(OsStr::new("test-bucket"))),
         ("SPACE_SNAPSHOT_REGION", Some(OsStr::new("us-east-1"))),
+        // Service construction reads its feature-flag provider from the
+        // environment; keep the child off any provider the host configures.
+        ("EPPO_SDK_KEY", None),
+        ("SPACE_FLAGD_ENABLED", None),
     ]);
     if child {
         test().await;

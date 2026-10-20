@@ -46,6 +46,11 @@ impl SandboxManagerServiceOptions {
     /// - the credential-manager and node-manager sockets are paths under
     ///   `scratch` that nothing binds, so every call to either fails to
     ///   connect;
+    /// - the volume-manager socket that snapshot uploads stage and observe
+    ///   their transfers through is a path under `scratch` that nothing binds.
+    ///   Only snapshot uploads use it: restore, fork, cleanup and the
+    ///   btrfs-send capability probe still dial the host's fixed
+    ///   volume-manager socket;
     /// - the host-control socket is only passed through to node-manager's
     ///   `Launch`, and also sits under `scratch`, so it names no live host
     ///   service;
@@ -69,6 +74,7 @@ impl SandboxManagerServiceOptions {
             node_manager: crate::node_manager_transport::fake::unbound(
                 &scratch.join("absent-node-manager.sock"),
             ),
+            volume_manager_socket_path: scratch.join("absent-volume-manager.sock"),
             template_resolver: crate::template_resolver::fake::unbound(
                 &scratch.join("absent-template-manager.sock"),
             ),

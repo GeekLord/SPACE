@@ -5,10 +5,61 @@ use super::*;
 
 pub(in crate::service) const SUSPEND_TRIGGER_METADATA: &str = "x-space-suspend-trigger";
 
-pub(in crate::service) fn teardown_backup_failure_requires_new_attempt(
+/// What a teardown suspend that needs an artifact's backup does with the
+/// newest upload under the artifact's key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::service) enum KeyedUploadUse {
+    /// Wait for it. An active upload owns the backup; a terminal one answers
+    /// the wait at once with its outcome, a failure included.
+    Join,
+    /// Start a new attempt, which the key admits once the newest upload is no
+    /// longer active.
+    NewAttempt,
+}
+
+/// How many of an artifact's uploads may fail permanently before a teardown
+/// stops starting new ones: the original upload, which may have met an outage
+/// such as a transfer vol-mgr gave up on, and one recovery attempt. A failure
+/// that recurs on a fresh attempt is treated as the artifact's own.
+pub(in crate::service) const PERMANENTLY_FAILED_UPLOAD_LIMIT: u64 = 2;
+
+/// The teardown's rule for the newest upload under the artifact's key, in
+/// `status` with `failure` and the `scope` its worker recorded, given
+/// `permanently_failed` uploads under the key so far, by any caller:
+///
+/// - an active or completed upload is joined;
+/// - a retriable failure only ran out of attempts, so a new attempt follows;
+/// - a permanent failure of the artifact itself (see
+///   [`crate::snapshot_upload::UploadFailureScope`]) is final;
+/// - a permanent failure of an attempt gets a new attempt while fewer than
+///   [`PERMANENTLY_FAILED_UPLOAD_LIMIT`] uploads have failed permanently, and
+///   is final after that.
+///
+/// The limit bounds the attempt-scoped rule, so a failure recorded as the
+/// attempt's that is really the artifact's still ends. The failed jobs it
+/// counts persist across restarts until the jobs retention pruner removes
+/// them.
+pub(in crate::service) fn teardown_keyed_upload_use(
+    status: pplx_space_common_jobs::JobStatus,
     failure: Option<pplx_space_common_jobs::JobFailure>,
-) -> bool {
-    matches!(failure, Some(pplx_space_common_jobs::JobFailure::Retriable))
+    scope: crate::snapshot_upload::UploadFailureScope,
+    permanently_failed: u64,
+) -> KeyedUploadUse {
+    use crate::snapshot_upload::UploadFailureScope;
+    use pplx_space_common_jobs::JobFailure;
+    if !status.is_terminal() {
+        return KeyedUploadUse::Join;
+    }
+    match (failure, scope) {
+        (None, _) => KeyedUploadUse::Join,
+        (Some(JobFailure::Retriable), _) => KeyedUploadUse::NewAttempt,
+        (Some(JobFailure::Permanent { .. }), UploadFailureScope::Attempt)
+            if permanently_failed < PERMANENTLY_FAILED_UPLOAD_LIMIT =>
+        {
+            KeyedUploadUse::NewAttempt
+        }
+        (Some(JobFailure::Permanent { .. }), _) => KeyedUploadUse::Join,
+    }
 }
 
 fn teardown_suspend_event_details(
@@ -792,7 +843,7 @@ impl SandboxManagerService {
     ) -> Option<crate::snapshot_upload::SnapshotUploadJobs> {
         let job = match self.snapshot_upload_worker.find_job_by_dedup_key(
             crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
-            &staged_artifact.to_string(),
+            &crate::snapshot_upload_jobs::artifact_backup_dedup_key(staged_artifact),
         ) {
             // A live job still owns its attempt: its own Begin will meet the
             // same refusal and make the job terminal, and the next drive probes.
@@ -1158,9 +1209,10 @@ impl SandboxManagerService {
     /// Record that a teardown suspend's durable backup is over, on the row
     /// the shim keeps polling.
     ///
-    /// A permanent job failure ends the artifact's upload for good:
-    /// [`teardown_backup_failure_requires_new_attempt`] refuses a fresh
-    /// attempt for it, so every later poll rejoins the same terminal job.
+    /// A permanent job failure the teardown can't retry ends the artifact's
+    /// upload for good: [`teardown_keyed_upload_use`] refuses a fresh
+    /// attempt for it, so every later poll rejoins the same terminal job. A
+    /// permanent failure that still gets a new attempt is not marked.
     /// The suspend therefore can never publish, the row can never leave
     /// `suspending`, and nothing on this node distinguishes it from a suspend
     /// still uploading — a distinction the cluster-deleted eviction needs
@@ -1211,10 +1263,11 @@ impl SandboxManagerService {
         sandbox: &crate::db::SandboxRow,
         backup: TeardownSuspendBackup<'_>,
     ) -> Result<(), Status> {
-        let artifact_dedup_key = backup.artifact.local_artifact_id.to_string();
         let persisted_job = self.snapshot_upload_worker.find_job_by_dedup_key(
             crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
-            &artifact_dedup_key,
+            &crate::snapshot_upload_jobs::artifact_backup_dedup_key(
+                backup.artifact.local_artifact_id,
+            ),
         )?;
         // An active local upload still owns its completion. Only probe before
         // enqueueing or joining a terminal job: a restored artifact can already
@@ -1229,21 +1282,22 @@ impl SandboxManagerService {
         {
             return self.verify_teardown_suspend_backup_ownership(sandbox, &backup);
         }
+        let joined = match persisted_job {
+            Some(job) => match self.teardown_use_of_upload(&backup, &job)? {
+                KeyedUploadUse::Join => Some(job.job_id),
+                KeyedUploadUse::NewAttempt => None,
+            },
+            None => None,
+        };
         let submission = async {
-            match persisted_job {
-                Some(job)
-                    if !job.is_terminal()
-                        || !teardown_backup_failure_requires_new_attempt(job.failure) =>
-                {
-                    Ok(job.job_id)
-                }
-                _ => match self
+            match joined {
+                Some(job_id) => Ok(job_id),
+                None => match self
                     .enqueue_suspend_artifact_backup(
                         sandbox,
                         backup.artifact.local_artifact_id,
                         &backup.artifact.local_path,
                         backup.format,
-                        Some(&artifact_dedup_key),
                         backup.registration_generation(),
                     )
                     .await
@@ -1264,10 +1318,16 @@ impl SandboxManagerService {
             .submit_and_wait(submission, self.snapshot_upload_worker.worst_case_runtime())
             .await?;
         if !job.is_terminal() || job.failure.is_some() {
+            // Only a failure the next drive would rejoin is final. One that
+            // gets a new attempt leaves the row unmarked, and so does a failed
+            // lookup of that rule: the next drive rejoins and marks it then.
             if matches!(
                 job.failure,
                 Some(pplx_space_common_jobs::JobFailure::Permanent { .. })
-            ) {
+            ) && self
+                .teardown_use_of_upload(&backup, &job)
+                .is_ok_and(|then| then == KeyedUploadUse::Join)
+            {
                 self.record_teardown_suspend_backup_permanent_failure(
                     &sandbox.id,
                     backup.artifact.local_artifact_id,
@@ -1298,6 +1358,46 @@ impl SandboxManagerService {
         self.verify_teardown_suspend_backup_ownership(sandbox, &backup)
     }
 
+    /// [`teardown_keyed_upload_use`] for `job`, the newest upload under the
+    /// artifact's key.
+    fn teardown_use_of_upload(
+        &self,
+        backup: &TeardownSuspendBackup<'_>,
+        job: &pplx_space_common_jobs::Job,
+    ) -> Result<KeyedUploadUse, Status> {
+        #[derive(serde::Deserialize)]
+        struct RecordedScope {
+            #[serde(default)]
+            failure_scope: crate::snapshot_upload::UploadFailureScope,
+        }
+        let status = job
+            .status
+            .parse::<pplx_space_common_jobs::JobStatus>()
+            .map_err(|error| {
+                Status::internal(format!(
+                    "persisted artifact backup status is invalid for {}: {error}",
+                    backup.artifact.local_artifact_id
+                ))
+            })?;
+        // Unreadable means unrecorded, and an unrecorded scope is the attempt's.
+        let scope = job
+            .payload_as::<RecordedScope>()
+            .map_or_else(|_| Default::default(), |recorded| recorded.failure_scope);
+        let permanently_failed = self.snapshot_upload_worker.count_failed_jobs_by_dedup_key(
+            crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+            &crate::snapshot_upload_jobs::artifact_backup_dedup_key(
+                backup.artifact.local_artifact_id,
+            ),
+            pplx_space_common_jobs::JobFailureKind::Permanent,
+        )?;
+        Ok(teardown_keyed_upload_use(
+            status,
+            job.failure,
+            scope,
+            permanently_failed,
+        ))
+    }
+
     fn verify_teardown_suspend_backup_ownership(
         &self,
         sandbox: &crate::db::SandboxRow,
@@ -1308,11 +1408,16 @@ impl SandboxManagerService {
             crate::db::teardown_suspend_status(&db, &sandbox.id)
                 .map_err(|error| Status::internal(format!("db error: {error}")))?
                 .is_some_and(|status| {
+                    // Once the artifact is stamped, the next PrepareTeardownSuspend
+                    // poll can complete this generation before this waiter sees
+                    // its upload finish. That completion is this suspend's.
+                    let completed_here = status.is_durable_for(backup.execution_generation);
                     status.backup_completed
-                        && status.operation.is_some_and(|operation| {
-                            operation.status.is_active()
-                                && operation.execution_generation == backup.execution_generation
-                        })
+                        && (completed_here
+                            || status.operation.as_ref().is_some_and(|operation| {
+                                operation.status.is_active()
+                                    && operation.execution_generation == backup.execution_generation
+                            }))
                         && status.artifact.is_some_and(|artifact| {
                             artifact.local_artifact_id == backup.artifact.local_artifact_id
                         })

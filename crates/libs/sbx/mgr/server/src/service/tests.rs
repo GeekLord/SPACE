@@ -256,8 +256,8 @@ pub(crate) mod service_tests {
         SynchronousCleanupRequest,
     };
     use crate::service::grpc_lifecycle::{
-        SubmitSuspendSnapshotOutcome, SuspendRequestContext, SuspendSnapshotStagingDisposition,
-        teardown_backup_failure_requires_new_attempt,
+        KeyedUploadUse, SubmitSuspendSnapshotOutcome, SuspendRequestContext,
+        SuspendSnapshotStagingDisposition, teardown_keyed_upload_use,
     };
     use crate::service::recovery::SuspendSnapshotPublicationRecoveryOrigin;
     use crate::service::suspend_snapshot_publication::{
@@ -12585,7 +12585,6 @@ pub(crate) mod service_tests {
             "s3://test-bucket/prefix?region=us-east-1",
         )
         .unwrap();
-        let dedup_key = local_artifact_id.to_string();
         let first_attempt = pplx_space_common_core::types::BackupAttemptId::new();
 
         let first = service
@@ -12594,7 +12593,6 @@ pub(crate) mod service_tests {
                 (local_artifact_id, first_attempt),
                 snapshot_dir.to_str().unwrap(),
                 &upload_config,
-                &dedup_key,
                 false,
             )
             .await
@@ -12606,7 +12604,6 @@ pub(crate) mod service_tests {
                 (local_artifact_id, second_attempt),
                 snapshot_dir.to_str().unwrap(),
                 &upload_config,
-                &dedup_key,
                 false,
             )
             .await
@@ -12660,7 +12657,6 @@ pub(crate) mod service_tests {
                 (local_artifact_id, attempt_id),
                 snapshot_dir.to_str().unwrap(),
                 &upload_config,
-                &local_artifact_id.to_string(),
                 true,
             )
             .await
@@ -12690,22 +12686,42 @@ pub(crate) mod service_tests {
     }
 
     #[test]
-    fn teardown_backup_retries_only_retriable_terminal_failures() {
+    fn teardown_joins_a_keyed_upload_unless_a_new_attempt_can_succeed() {
+        use crate::snapshot_upload::UploadFailureScope::{Artifact, Attempt};
+        use KeyedUploadUse::{Join, NewAttempt};
+        use pplx_space_common_jobs::JobStatus::{
+            Cancelled, Cancelling, Completed, Failed, Pending, Running,
+        };
+        let retriable = Some(pplx_space_common_jobs::JobFailure::Retriable);
+        let permanent = Some(pplx_space_common_jobs::JobFailure::Permanent { reason: None });
+        // The last column but one counts the artifact's permanently failed
+        // uploads, the newest included when it is one of them.
         let cases = [
-            (None, false),
-            (
-                Some(pplx_space_common_jobs::JobFailure::Permanent { reason: None }),
-                false,
-            ),
-            (Some(pplx_space_common_jobs::JobFailure::Retriable), true),
+            // An active upload owns the backup.
+            (Pending, None, Attempt, 0, Join),
+            (Running, None, Artifact, 1, Join),
+            (Cancelling, None, Attempt, 2, Join),
+            // An upload that ended without a failure answers at once.
+            (Completed, None, Attempt, 0, Join),
+            (Completed, None, Attempt, 2, Join),
+            (Cancelled, None, Attempt, 0, Join),
+            // A retriable failure only ran out of attempts.
+            (Failed, retriable, Attempt, 0, NewAttempt),
+            (Failed, retriable, Attempt, 2, NewAttempt),
+            // An attempt's permanent failure gets one recovery attempt: the
+            // original and its recovery may fail, and no more.
+            (Failed, permanent, Attempt, 1, NewAttempt),
+            (Failed, permanent, Attempt, 2, Join),
+            (Failed, permanent, Attempt, 3, Join),
+            // A permanent failure of the artifact itself is final.
+            (Failed, permanent, Artifact, 1, Join),
         ];
 
-        for (failure, expected) in cases {
-            let actual = teardown_backup_failure_requires_new_attempt(failure);
-
+        for (status, failure, scope, permanently_failed, expected) in cases {
             assert_eq!(
-                actual, expected,
-                "unexpected retry decision for {failure:?}"
+                teardown_keyed_upload_use(status, failure, scope, permanently_failed),
+                expected,
+                "{status:?} {failure:?} {scope:?} {permanently_failed}"
             );
         }
     }
