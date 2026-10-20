@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,6 +19,9 @@ use tonic::{Status, transport::Channel};
 use crate::identity::GuestAccount;
 
 use super::super::{FilesystemWorkerService, WORKER_PROTOCOL_VERSION};
+
+// Fit Linux's 15-byte comm limit so task name and argv[0] agree.
+const WORKER_PROCESS_NAME: &std::ffi::CStr = c"spaced-fsworker";
 
 const WORKER_MODE_ENV: &str = "SPACE_SPACED_FILESYSTEM_WORKER";
 const WORKER_USER_ENV: &str = "SPACE_SPACED_FILESYSTEM_WORKER_USER";
@@ -169,6 +173,7 @@ enum ClientAcquisition {
 
 #[derive(Clone)]
 pub(crate) struct WorkerPool {
+    executable: crate::WorkerExecutable,
     guest_cgroups: Option<Arc<crate::ExecutionCgroups>>,
     shutdown: CancellationToken,
     workers: Arc<Mutex<HashMap<GuestUserName, WorkerEntry>>>,
@@ -261,8 +266,10 @@ impl WorkerPool {
     pub(crate) fn new(
         shutdown: CancellationToken,
         guest_cgroups: Option<Arc<crate::ExecutionCgroups>>,
+        executable: crate::WorkerExecutable,
     ) -> Self {
         Self {
+            executable,
             guest_cgroups,
             shutdown,
             workers: Arc::new(Mutex::new(HashMap::new())),
@@ -624,8 +631,8 @@ impl WorkerPool {
         )
         .map_err(|error| worker_io_status(io::Error::from(error)))?;
         let worker_raw_fd = worker_fd.as_raw_fd();
-        let executable = std::env::current_exe().map_err(worker_io_status)?;
-        let mut command = worker_command(&executable, user, worker_raw_fd);
+        let executable = self.executable.clone();
+        let mut command = worker_command(&executable.path(), user, worker_raw_fd);
         // The socketpair is CLOEXEC by default. Clear it only in the forked
         // worker so concurrent user process spawns cannot inherit this fd.
         // SAFETY: `pre_exec` installs a closure that runs in the forked child
@@ -656,6 +663,8 @@ impl WorkerPool {
             let child = command.spawn();
             // Closes this process's copy of the worker's socket.
             drop(command);
+            // Keep the selected inode alive through exec, even if the service is dropped.
+            drop(executable);
             child
         })
         .await
@@ -755,7 +764,9 @@ fn worker_command_from_environment(
     env: &dyn pplx_space_common_core::env::Environment,
 ) -> ChildCommand {
     let mut command = ChildCommand::new(executable);
+    // Executing /proc/self/fd/N otherwise exposes the descriptor as argv[0].
     command
+        .arg0(std::ffi::OsStr::from_bytes(WORKER_PROCESS_NAME.to_bytes()))
         .env_clear()
         .env(WORKER_MODE_ENV, "1")
         .env(WORKER_USER_ENV, user.as_str())
@@ -841,6 +852,8 @@ fn supervise_worker(
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum FilesystemWorkerError {
+    #[error("failed to set filesystem worker process name: {0}")]
+    SetProcessName(#[source] nix::errno::Errno),
     #[error("filesystem worker user is missing: {0}")]
     MissingUser(#[source] std::env::VarError),
     #[error("filesystem worker user is invalid: {0}")]
@@ -870,6 +883,10 @@ pub(crate) fn run_from_environment() -> Result<bool, FilesystemWorkerError> {
     if std::env::var_os(WORKER_MODE_ENV).is_none() {
         return Ok(false);
     }
+    // exec resets comm to the executable path's basename, even with arg0 set.
+    // Name the main thread before the runtime and telemetry create more threads.
+    nix::sys::prctl::set_name(WORKER_PROCESS_NAME)
+        .map_err(FilesystemWorkerError::SetProcessName)?;
     let user = std::env::var(WORKER_USER_ENV).map_err(FilesystemWorkerError::MissingUser)?;
     let user = GuestUserName::parse(user).map_err(FilesystemWorkerError::InvalidUser)?;
     let raw_fd = std::env::var(WORKER_FD_ENV)

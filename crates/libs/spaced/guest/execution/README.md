@@ -14,10 +14,30 @@ execution metadata.
 
 ## Guest process requirements
 
-- Linux filesystem workers re-execute the daemon binary. Its entrypoint must
-  dispatch `run_filesystem_worker_from_environment()` before ordinary application
-  initialization or runtime threads. The supported daemon entrypoint supplies
-  that dispatch; arbitrary executables are not supported worker launchers.
+- Linux identity workers require `ExecutionServiceConfig::worker_executable`.
+  Select a trusted native ELF artifact with `WorkerExecutable::open(absolute_path)`;
+  the service never infers the hosting application's executable. The opened inode
+  stays pinned across path replacement. The caller must protect its contents,
+  loader and libraries; file validation and the protocol handshake do not establish
+  trust. The caller needs read access for ELF inspection as well as execute
+  permission at launch; execute-only files are insufficient without a read-access
+  override. Scripts are unsupported. Linux `/proc` must be mounted.
+- The daemon explicitly selects its running executable and dispatches worker mode
+  before application initialization. Other hosts can build the dedicated worker
+  with `cargo build -p pplx-space-spaced-guest-worker` and select the resulting
+  `spaced-filesystem-worker` binary. It runs worker mode only and requires an
+  execution service's inherited channel and identity configuration.
+  The standalone build has telemetry disabled by default. Add `--features otel`
+  (or `--features datadog`) when building the worker to enable its exporters.
+  Host features and forwarded environment variables cannot enable exporters in
+  a separately built worker that lacks them.
+- Execution and daemon constructors return typed errors. Missing worker
+  configuration fails construction; incompatible worker protocols fail startup
+  without dispatching filesystem operations. IdentityWorkers on non-Linux returns
+  an error; Direct remains the non-Linux default. The daemon validates its
+  executable during construction: an unreadable or invalid `/proc/self/exe`
+  intentionally fails startup before readiness, rather than deferring that
+  failure to the first filesystem request.
 - Linux identity workers require the daemon's privilege to install the requested
   OS account's groups and IDs; an unprivileged worker host is unsupported. Direct mode
   runs filesystem syscalls with the daemon's credentials; its `user` selects path
@@ -38,9 +58,18 @@ execution metadata.
   service does not establish that every descendant has exited.
 
 This crate retains the daemon contract. General application embedding requires
-an explicit worker launcher, credential/capability policy, native admission and
-shutdown semantics, descendant ownership, and an integration exercising those
-requirements before exposing a separate supported API.
+credential/capability policy, native admission and shutdown semantics, and
+stronger descendant ownership. Explicit launching alone does not establish those
+guarantees or advertise general embedding support.
+
+The Linux `embedding` integration in the worker app uses the execution crate
+without the guest server. It covers a separate worker artifact, atomic path
+replacement, account-specific writes, idempotency, process output, failed startup,
+cancelled callers and worker reaping. Run it as root in a disposable environment
+with a provisioned `nobody` account using
+`cargo test -p pplx-space-spaced-guest-worker --test embedding`.
+CI assigns it to the privileged test group. Broader embedding acceptance remains
+tracked by the RFC.
 
 The proposed support profile, ownership contract, and implementation acceptance
 criteria are in the [embedding RFC](../../../../../docs/space/rfcs/2026-10-06-guest-execution-embedding.md).
