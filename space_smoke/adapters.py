@@ -507,6 +507,11 @@ APISERVER_PARKED_MANIFEST = "/etc/kubernetes/kube-apiserver.yaml.space-smoke-par
 KIND_WORKER_ROLE = "space-worker"
 KIND_BUILDER_ROLE = "space-builder"
 NODE_SANDBOX_MANAGER = "sandbox-manager"
+NODE_MANAGER = "node-manager"
+# The OTLP metric export interval and the SDKs' default for it
+# (docs/observability.md).
+OTEL_METRIC_EXPORT_INTERVAL_ENV = "OTEL_METRIC_EXPORT_INTERVAL"
+OTEL_METRIC_EXPORT_DEFAULT_SECONDS = 10.0
 NODE_TEMPLATE_MANAGER = "template-manager"
 NODE_VOLUME_MANAGER = "volume-manager"
 NODE_CTL = "node-ctl"
@@ -2255,6 +2260,27 @@ ON CONFLICT (key_hash) DO NOTHING;
             if isinstance(entry, dict) and isinstance(entry.get("name"), str)
         }
 
+    def metric_export_interval_seconds(self, node_name: str, component: str) -> float:
+        """The OTLP metric export interval a node service's pod on `node_name` runs with.
+
+        `OTEL_METRIC_EXPORT_INTERVAL` in milliseconds; unset, the SDKs' 10 s.
+        """
+
+        raw = self._node_service_env(node_name, component).get(OTEL_METRIC_EXPORT_INTERVAL_ENV)
+        if raw is None or not raw.strip():
+            return OTEL_METRIC_EXPORT_DEFAULT_SECONDS
+        try:
+            millis = int(raw.strip())
+        except ValueError:
+            raise SmokeConfigurationError(
+                f"{component} on {node_name} sets {OTEL_METRIC_EXPORT_INTERVAL_ENV}={raw!r}, not milliseconds"
+            ) from None
+        if millis <= 0:
+            raise SmokeConfigurationError(
+                f"{component} on {node_name} sets {OTEL_METRIC_EXPORT_INTERVAL_ENV}={raw!r}, not positive"
+            )
+        return millis / 1000
+
     def template_cache_gc_config(self, node_name: str) -> TemplateCacheGcConfig:
         return _template_cache_gc_config_from_env(
             self._node_service_env(node_name, NODE_TEMPLATE_MANAGER)
@@ -2618,6 +2644,36 @@ ON CONFLICT (key_hash) DO NOTHING;
             script,
             timeout=timeout,
         )
+
+    def publish_node_ctl_facet(self, node_name: str, facet: str) -> str | None:
+        """Have node-ctl on `node_name` publish an outbound facet now (`space-nodectl facet publish`).
+
+        Marks the whole facet dirty through node-ctl's own `MarkFacetDirty`, so
+        its next outbound sync is the same publication its poll would make:
+        `sandbox-inventory` a Full census, `template-inventory` with the node's
+        Kubernetes object reconciles.
+
+        Returns None once node-ctl has the request, or why it does not: a
+        failed exec or RPC (node-ctl restarting, a kubectl blip) is the
+        caller's to record and retry, since node-ctl's poll still publishes the
+        facet. A bench that is not an isolated Kind stack, or a node without
+        exactly one operator shell, still raises `SmokeConfigurationError`.
+        """
+
+        try:
+            result = self._node_shell_exec(
+                node_name, f"space-nodectl facet publish {shlex.quote(facet)}", timeout=30
+            )
+        except SmokeConfigurationError:
+            raise
+        except RuntimeError as error:
+            return f"publish node-ctl facet {facet} on {node_name}: {error}"
+        if result.returncode != 0:
+            return (
+                f"publish node-ctl facet {facet} on {node_name} failed "
+                f"({result.returncode}): {result.detail() or '<no output>'}"
+            )
+        return None
 
     def register_unpinned_template(
         self, node_name: str, template: str, size_bytes: int
