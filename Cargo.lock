@@ -5376,8 +5376,8 @@ dependencies = [
  "nix 0.31.3",
  "pplx-space-env-vars",
  "pplx-space-net-common",
+ "pplx-space-semver",
  "rusqlite",
- "semver",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -6906,6 +6906,16 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-common-svc",
  "pplx-space-sbx-mgr",
+]
+
+[[package]]
+name = "pplx-space-semver"
+version = "0.8.0"
+dependencies = [
+ "semver",
+ "serde",
+ "sqlx",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
