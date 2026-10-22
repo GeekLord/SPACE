@@ -76,9 +76,11 @@ impl ClusterApiService {
     /// `caller_org_id` on the lookup requests is caller-asserted and the node
     /// pull path omits it, so it cannot authorize anything. A node-scoped
     /// caller (every TokenReview identity, and the static token once
-    /// TokenReview is configured) is instead bound to the nodes registered at
-    /// its remote address, the same binding `validate_origin_remote_addr`
-    /// applies to node-bound RPCs; a caller with no registered node resolves
+    /// TokenReview is configured) is instead bound to registered nodes. Pod-bound
+    /// tokens with complete claims use the reviewed node name and UID. Missing
+    /// claims and static-token callers retain the registered-address binding;
+    /// malformed claims or a mismatched UID never fall back. A caller with no
+    /// matching registered node resolves
     /// generic templates only. A request that reached the handler without the
     /// auth layer (tests, local simulators) is unscoped, matching how the
     /// other narrow authorities treat a missing extension.
@@ -88,17 +90,49 @@ impl ClusterApiService {
     ) -> Result<super::template_releases_store::TemplateReadScope, Status> {
         use super::template_releases_store::TemplateReadScope;
         use pplx_space_common_svc::auth::{
-            NodeApiAuthenticatedCaller, TemplateReleaseReadAuthority,
+            AuthenticatedNodeIdentity, NodeApiAuthenticatedCaller, TemplateReleaseReadAuthority,
         };
+        use pplx_space_metrics::auth::{TemplateNodeBinding, template_node_binding};
 
-        let node_scoped = request
-            .extensions()
-            .get::<NodeApiAuthenticatedCaller>()
-            .is_some_and(|caller| {
-                caller.template_release_read_authority() == TemplateReleaseReadAuthority::NodeScoped
-            });
-        if !node_scoped {
+        let Some(caller) = request.extensions().get::<NodeApiAuthenticatedCaller>() else {
             return Ok(TemplateReadScope::Unscoped);
+        };
+        if caller.template_release_read_authority() == TemplateReleaseReadAuthority::Unscoped {
+            return Ok(TemplateReadScope::Unscoped);
+        }
+        match caller.node_identity() {
+            AuthenticatedNodeIdentity::Kubernetes(node) => {
+                let scope = self
+                    .template_releases_store
+                    .node_scope_for_identity(node)
+                    .await
+                    .map_err(|err| {
+                        Status::internal(format!("resolve caller node identity: {err}"))
+                    })?;
+                if matches!(&scope, TemplateReadScope::NodeScoped { node_ids } if node_ids.is_empty())
+                {
+                    template_node_binding(TemplateNodeBinding::NoInventoryMatch);
+                    tracing::warn!(node_name = %node.name(), node_uid = %node.uid(),
+                        "template catalog node identity has no live inventory match; private templates are unavailable");
+                } else {
+                    template_node_binding(TemplateNodeBinding::Bound);
+                }
+                return Ok(scope);
+            }
+            AuthenticatedNodeIdentity::MalformedKubernetesClaims => {
+                template_node_binding(TemplateNodeBinding::Unbound);
+                tracing::warn!(
+                    peer_addr = ?request.remote_addr(),
+                    "template catalog caller has malformed pod/node claims; private templates are unavailable"
+                );
+                return Ok(TemplateReadScope::NodeScoped {
+                    node_ids: Vec::new(),
+                });
+            }
+            AuthenticatedNodeIdentity::MissingKubernetesClaims => {
+                template_node_binding(TemplateNodeBinding::AddressFallback);
+            }
+            AuthenticatedNodeIdentity::RemoteAddress => {}
         }
         let Some(remote_addr) = request.remote_addr() else {
             return Ok(TemplateReadScope::NodeScoped {
