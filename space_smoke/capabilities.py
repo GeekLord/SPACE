@@ -223,10 +223,19 @@ class ProcessInfo:
     process_id: str
     pid: int
     command: tuple[str, ...]
+    # The native API can report a recently exited process, with its exit.
+    state: str = "running"
+    exit_status: str | None = None
+    signal: int | None = None
 
 
 class ProcessSandbox(CommandSandbox, Protocol):
     """Protocol-neutral background process control used by the shared smoke."""
+
+    @property
+    def reports_exited_processes(self) -> bool:
+        """Whether the smoke requires `get_process` to report a recently exited process."""
+        ...
 
     def start_background(self, command: str, *, timeout: int = 60) -> ProcessHandle: ...
 

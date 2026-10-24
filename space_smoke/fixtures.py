@@ -1296,6 +1296,12 @@ class CommandSandboxFixture:
     def kill_process(self, process_id: str) -> bool:
         return self._process_sandbox().kill_process(process_id)
 
+    @property
+    def reports_exited_processes(self) -> bool:
+        """Whether the smoke requires `get_process` to report a recently exited process."""
+
+        return self._process_sandbox().reports_exited_processes
+
     def wait_until_process_stopped(
         self, process_id: str
     ) -> tuple[tuple[ProcessInfo, ...], ProcessInfo | None]:
@@ -1303,9 +1309,8 @@ class CommandSandboxFixture:
         while True:
             processes = self.list_processes()
             process = self.get_process(process_id)
-            if (
-                not any(item.process_id == process_id for item in processes)
-                and process is None
+            if not any(item.process_id == process_id for item in processes) and (
+                process is None or process.state == "exited"
             ):
                 return processes, process
             remaining = deadline - time.monotonic()
