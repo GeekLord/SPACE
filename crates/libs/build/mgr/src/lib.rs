@@ -192,6 +192,8 @@ pub enum BuildError {
     Ssh(#[from] SshError),
     #[error(transparent)]
     OciImageAssembly(#[from] oci::OciImageAssemblyError),
+    #[error(transparent)]
+    OciGuestSeed(#[from] oci::GuestSeedError),
     #[error("invalid spaced version {version}: {source}")]
     InvalidSpacedVersion {
         version: String,
@@ -232,9 +234,10 @@ impl BuildError {
     /// error's type alone: its message can carry recipe or image content.
     pub fn error_kind(&self) -> TemplateBuildErrorKind {
         match self {
-            Self::Environment(_) | Self::Recipe(_) | Self::TemplateRef(_) => {
-                TemplateBuildErrorKind::Recipe
-            }
+            Self::Environment(_)
+            | Self::Recipe(_)
+            | Self::TemplateRef(_)
+            | Self::OciGuestSeed(_) => TemplateBuildErrorKind::Recipe,
             Self::Ssh(error) => error.error_kind(),
             Self::Step { source, .. } => source.recipe_step_error_kind(),
             Self::OciImageAssembly(error) => error.error_kind(),
@@ -636,6 +639,9 @@ impl TemplateBuilder {
         template_id: &str,
         job_id: &JobId,
     ) -> Result<BuildOutcome, BuildError> {
+        // OciRootfs owns cleanup on early return or cancellation. Successful
+        // assembly consumes this same mount and explicitly awaits its unmount.
+        let mut mounted_image = None;
         let recipe = prepared.recipe();
         let (base, base_raw, oci_image) = match &recipe.origin {
             Origin::FromScratch { .. } => {
@@ -653,7 +659,31 @@ impl TemplateBuilder {
                 base,
                 base_raw,
                 reference,
-            } => (base.clone(), base_raw.clone(), Some(reference.clone())),
+            } => {
+                let seeds = oci::GuestSeeds::from_env()?;
+                let selected = if seeds.applies_to(base) {
+                    let image = oci::mount(oci::OciMountRequest {
+                        cache_dir: Path::new(
+                            pplx_space_common_core::host::linux::paths::FIRECRACKER_CACHE_DIR,
+                        )
+                        .join("builds/oci"),
+                        reference: reference.clone(),
+                    })
+                    .await
+                    .map_err(oci::OciImageAssemblyError::from)?;
+                    let selected = seeds.select(image.path(), base)?;
+                    mounted_image = Some(image);
+                    selected
+                } else {
+                    base.clone()
+                };
+                let selected_raw = if selected == *base {
+                    base_raw.clone()
+                } else {
+                    selected.to_string()
+                };
+                (selected, selected_raw, Some(reference.clone()))
+            }
         };
         let vcpu = recipe.build_config.vcpu.unwrap_or(4);
         let mem_mib = recipe.build_config.memory_mib.unwrap_or(4096);
@@ -842,7 +872,7 @@ impl TemplateBuilder {
                     .map_err(|error| BuildError::RootfsReservation(Box::new(error)))?
                     .into_inner()
                     .rootfs_path;
-                let assembly_result = oci::assemble_from_image(oci::OciImageAssemblyRequest {
+                let assembly_request = oci::OciImageAssemblyRequest {
                     seed_rootfs: PathBuf::from(seed_rootfs),
                     target_rootfs: PathBuf::from(target_rootfs),
                     target_rootfs_size_mib: build_rootfs_size_mib,
@@ -850,8 +880,11 @@ impl TemplateBuilder {
                     cache_dir,
                     guest_bin_dir,
                     bundle_version,
-                })
-                .await;
+                };
+                let assembly_result = match mounted_image.take() {
+                    Some(image) => oci::assemble_from_mounted_image(assembly_request, image).await,
+                    None => oci::assemble_from_image(assembly_request).await,
+                };
                 if let Err(error) = assembly_result {
                     complete_prepared_rootfs_best_effort(
                         &mut node,
