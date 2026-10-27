@@ -39,7 +39,13 @@ use time::OffsetDateTime;
 use crate::{
     controllers::{
         ControllerError,
-        sandbox::{AdmissionPoolPlan, SandboxController, fetch_sandbox},
+        sandbox::{
+            AdmissionPoolPlan, SandboxController, fetch_sandbox,
+            list_page::{
+                ListPage, MAX_SANDBOX_LIST_PAGE_BYTES, PageWalkParams,
+                SANDBOX_LIST_ROW_OVERHEAD_BYTES, page_rows_cte,
+            },
+        },
         substrate::AdmissionPoolClaim,
     },
     middleware::auth::{AuthFederatedOwner, AuthOrg, AuthUser},
@@ -521,22 +527,8 @@ fn prepare_native_create_request(
     let idle_timeout_secs = request
         .idle_timeout_secs()
         .map_err(|error| PublicApiError::bad_request(error.to_string()))?;
-    if let Some(vcpu) = request
-        .resources
-        .as_ref()
-        .and_then(|resources| resources.vcpu)
-    {
-        pplx_space_common_core::types::VcpuCount::try_from_u32(vcpu)
-            .map_err(|error| PublicApiError::bad_request(format!("vcpu: {error}")))?;
-    }
-    if let Some(size_mib) = request
-        .resources
-        .as_ref()
-        .and_then(|resources| resources.disk_mib)
-    {
-        pplx_space_common_core::sandbox_storage::validate_rootfs_mib(size_mib)
-            .map_err(|error| PublicApiError::bad_request(format!("disk_mib: {error}")))?;
-    }
+    pplx_space_public_api::limits::validate_create_request(&request)
+        .map_err(PublicApiError::request_limit)?;
     // Hash the parsed client request before applying server defaults. This keeps
     // idempotent retries stable across rolling deploys where older API replicas
     // still hash the omitted policy as null.
@@ -705,14 +697,14 @@ fn sandbox_metrics_stream(
     )
 }
 
+/// Builds a page from the rows `fetch_sandboxes_page` returned: at most
+/// `limit` sandboxes, with a cursor when more follow them.
 fn sandboxes_page(
-    mut rows: Vec<PublicSandboxRow>,
+    rows: Vec<PublicSandboxRow>,
     limit: u16,
 ) -> Result<PublicPage<PublicSandbox>, PublicApiError> {
-    let has_more = rows.len() > usize::from(limit);
-    if has_more {
-        rows.truncate(usize::from(limit));
-    }
+    let ListPage { rows, has_more } =
+        ListPage::from_rows(rows, usize::from(limit), |row| row.has_next);
     let next_cursor = if has_more {
         rows.last()
             .map(|sandbox| sandbox_cursor(sandbox.created_at, sandbox.id))
@@ -1069,6 +1061,9 @@ struct PublicSandboxRow {
     auto_lifecycle: SqlJson<AutoLifecyclePolicy>,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
+    /// A page row is followed by another sandbox in list order, whether or
+    /// not the page's byte budget let it in.
+    has_next: bool,
 }
 
 const PUBLIC_SANDBOX_SELECT: &str = "SELECT s.id,
@@ -1120,9 +1115,10 @@ const PUBLIC_SANDBOX_SELECT: &str = "SELECT s.id,
             s.next_auto_event_at,
             s.auto_lifecycle_json AS auto_lifecycle,
             s.created_at,
-            s.updated_at
-     FROM sandboxes s
-     LEFT JOIN sandbox_direct_route_identities direct_route
+            s.updated_at";
+
+/// The joins of a public sandbox row onto `s`.
+const PUBLIC_SANDBOX_JOINS: &str = "LEFT JOIN sandbox_direct_route_identities direct_route
        ON direct_route.sandbox_id = s.id
      LEFT JOIN sandbox_observed_states sos
        ON sos.sandbox_id = s.id
@@ -1131,6 +1127,31 @@ const PUBLIC_SANDBOX_SELECT: &str = "SELECT s.id,
        ON failure_observation.node_id = COALESCE(direct_route.current_node_id, s.active_node_id)
       AND failure_observation.facet = $1
       AND failure_observation.element = s.id::TEXT";
+
+/// The sandboxes the list shows after the cursor: the org's live sandboxes,
+/// owned by subject $12 or, without one, by a local user.
+const PAGE_CANDIDATE_ROWS: &str = "SELECT s.id, s.created_at
+    FROM sandboxes s
+    WHERE s.org_id = $8
+      AND s.lifecycle <> 'deleted'
+      AND (($12::UUID IS NOT NULL AND s.user_id = $12)
+        OR ($12::UUID IS NULL AND EXISTS (
+            SELECT 1 FROM users owner WHERE owner.id = s.user_id
+              AND owner.owner_source = 'local'
+        )))
+      AND {after_cursor}
+    ORDER BY s.created_at DESC, s.id DESC
+    LIMIT {max_rows}";
+
+const PAGE_WALK_PARAMS: PageWalkParams = PageWalkParams {
+    cursor_created_at: "$9",
+    cursor_id: "$10",
+    max_rows: "$11",
+    max_bytes: "$13",
+    row_overhead_bytes: "$14",
+    // The public sandbox has no env.
+    lists_env: false,
+};
 
 #[derive(Clone, Copy)]
 enum PublicSandboxQuery {
@@ -1141,27 +1162,24 @@ enum PublicSandboxQuery {
 fn public_sandbox_query(query: PublicSandboxQuery) -> sqlx::AssertSqlSafe<String> {
     // Control-plane retention keeps deleted tombstones, but deleted public
     // resources are NotFound and must not consume a list page's lookahead.
-    let suffix = match query {
-        PublicSandboxQuery::ById => {
-            "WHERE s.id = $8 AND s.org_id = $9 AND s.lifecycle <> 'deleted'"
-        }
-        PublicSandboxQuery::Page => {
-            "WHERE s.org_id = $8
-               AND s.lifecycle <> 'deleted'
-               AND (($12::UUID IS NOT NULL AND s.user_id = $12)
-                 OR ($12::UUID IS NULL AND EXISTS (
-                     SELECT 1 FROM users owner WHERE owner.id = s.user_id
-                       AND owner.owner_source = 'local'
-                 )))
-               AND (
-                   $9::TIMESTAMPTZ IS NULL
-                   OR (s.created_at, s.id) < ($9::TIMESTAMPTZ, $10::UUID)
-               )
-             ORDER BY s.created_at DESC, s.id DESC
-             LIMIT $11"
-        }
+    let sql = match query {
+        PublicSandboxQuery::ById => format!(
+            "{PUBLIC_SANDBOX_SELECT}, FALSE AS has_next
+             FROM sandboxes s
+             {PUBLIC_SANDBOX_JOINS}
+             WHERE s.id = $8 AND s.org_id = $9 AND s.lifecycle <> 'deleted'"
+        ),
+        PublicSandboxQuery::Page => format!(
+            "{page_rows}
+             {PUBLIC_SANDBOX_SELECT}, page.has_next
+             FROM page_rows page
+             JOIN sandboxes s ON s.id = page.id
+             {PUBLIC_SANDBOX_JOINS}
+             ORDER BY page.position",
+            page_rows = page_rows_cte(PAGE_CANDIDATE_ROWS, &PAGE_WALK_PARAMS),
+        ),
     };
-    sqlx::AssertSqlSafe(sql!(format!("{PUBLIC_SANDBOX_SELECT}\n{suffix}")))
+    sqlx::AssertSqlSafe(sql!(sql))
 }
 
 async fn fetch_public_sandbox(
@@ -1206,6 +1224,8 @@ async fn fetch_sandboxes_page(
         .bind(cursor_id)
         .bind(i64::from(limit) + 1)
         .bind(subject_id)
+        .bind(MAX_SANDBOX_LIST_PAGE_BYTES)
+        .bind(SANDBOX_LIST_ROW_OVERHEAD_BYTES)
         .fetch_all(pool)
         .await
 }
@@ -1231,17 +1251,16 @@ async fn sandbox_operation_response(
     })
 }
 
-pub(super) fn idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, PublicApiError> {
-    let Some(value) = headers
-        .get(IDEMPOTENCY_KEY_HEADER)
-        .and_then(|value| value.to_str().ok())
-    else {
+/// The native `Idempotency-Key` header, shared by every `/v1` route that
+/// requires one so all of them match the published parameter.
+pub(crate) fn idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, PublicApiError> {
+    let Some(value) = headers.get(IDEMPOTENCY_KEY_HEADER) else {
         return Err(PublicApiError::bad_request(
             "Idempotency-Key header is required",
         ));
     };
-    IdempotencyKey::parse(value)
-        .map_err(|error| PublicApiError::bad_request(format!("invalid Idempotency-Key: {error}")))
+    IdempotencyKey::parse_header(value.as_bytes())
+        .map_err(|error| PublicApiError::bad_request(error.to_string()))
 }
 
 fn validate_update_request(request: &UpdateSandboxRequest) -> Result<(), PublicApiError> {
@@ -1255,7 +1274,8 @@ fn validate_update_request(request: &UpdateSandboxRequest) -> Result<(), PublicA
             "disk_mib is not mutable in place; recreate or restore the sandbox with the new disk size",
         ));
     }
-    Ok(())
+    pplx_space_public_api::limits::validate_update_request(request)
+        .map_err(PublicApiError::request_limit)
 }
 
 fn request_fingerprint(
