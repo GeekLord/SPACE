@@ -73,7 +73,9 @@ pub(super) struct PassReport {
     /// Reconcilable configs the pass reconciled.
     pub(super) configs: usize,
     /// Of those, the configs whose reconcile failed or skipped a required
-    /// operation, as `warm_pool.reconcile.config_state` reports them.
+    /// operation, as `warm_pool.reconcile.config_state` reports them, plus the
+    /// invalid config rows that the pass did not reconcile. `configs` also
+    /// counts those rows.
     pub(super) failed_configs: usize,
 }
 

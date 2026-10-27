@@ -384,6 +384,18 @@ pub fn reconcile_tick_duration(started_at: Instant) {
     );
 }
 
+/// Count one invalid pool config row that a reconcile read did not return as a
+/// config (for example, a hash that does not parse or a shape that is not
+/// supported). The pass continues with the other configs. Thus this counter,
+/// not `warm_pool.reconcile.tick`, shows that one template has no pool.
+pub fn config_decode_failed(read: &str, template: &str) {
+    counter(
+        "warm_pool.reconcile.config_decode_failed",
+        1,
+        &[tag("read", read), tag("template", template)],
+    );
+}
+
 pub fn reconcile_tick(result_ok: bool) {
     counter(
         "warm_pool.reconcile.tick",

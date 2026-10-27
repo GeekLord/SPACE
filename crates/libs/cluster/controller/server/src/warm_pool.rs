@@ -26,7 +26,8 @@ use pplx_space_api::node_group_placement::{
     ResolvePath as NodeGroupResolvePath, ResolvedPlacement,
 };
 use pplx_space_cluster_pool::{
-    NewPoolSlot, PoolConfig, PoolSlot, PoolSlotCounts, PoolSlotState, WarmPoolStore,
+    InvalidPoolConfigRow, NewPoolSlot, PoolConfig, PoolSlot, PoolSlotCounts, PoolSlotState,
+    WarmPoolStore,
 };
 use pplx_space_common_core::kubernetes::NodeGroupPlacement;
 use pplx_space_common_core::{
@@ -940,16 +941,25 @@ impl Reconciler {
                 self.store.autoscale_configs(&self.namespace),
             )
             .await?;
-        let mut configs = self
+        let reconcilable = self
             .timed_postgres("reconcilable-configs", self.store.reconcilable_configs())
             .await?;
-        let recently_disabled_configs = self
+        let recently_disabled = self
             .timed_postgres(
                 "recently-disabled-configs",
                 self.store
                     .recently_disabled_configs(RECONCILE_CONFIG_RETIREMENT_GRACE),
             )
             .await?;
+        // Do not stop the pass for an invalid config row. Report the row and
+        // reconcile the other configs.
+        report_invalid_config_rows("autoscale-configs", &deleted_configs.invalid_rows);
+        report_invalid_config_rows("reconcilable-configs", &reconcilable.invalid_rows);
+        report_invalid_config_rows("recently-disabled-configs", &recently_disabled.invalid_rows);
+        let invalid_reconcilable_rows = reconcilable.invalid_rows.len();
+        let deleted_configs = deleted_configs.configs;
+        let mut configs = reconcilable.configs;
+        let recently_disabled_configs = recently_disabled.configs;
         let inventory_config_ids = configs
             .iter()
             .chain(&recently_disabled_configs)
@@ -996,11 +1006,12 @@ impl Reconciler {
         .await;
         {
             let mut report = self.pass_report();
-            report.configs = config_results.len();
+            report.configs = config_results.len() + invalid_reconcilable_rows;
             report.failed_configs = config_results
                 .iter()
                 .filter(|result| !result.succeeded())
-                .count();
+                .count()
+                + invalid_reconcilable_rows;
         }
         for config_result in config_results {
             self.emit_config_result(&config_result, Instant::now());
@@ -2705,6 +2716,22 @@ fn emit_reconcile_config_states(config: &PoolConfig, succeeded: bool) {
         "succeeded",
         state.succeeded,
     );
+}
+
+/// Log and count each invalid config row that a read did not return as a config.
+fn report_invalid_config_rows(read: &'static str, rows: &[InvalidPoolConfigRow]) {
+    for row in rows {
+        tracing::error!(
+            read,
+            config_id = %row.id,
+            template_release_id = %row.template_release_id,
+            template = %row.template_name,
+            content_hash = %row.content_hash,
+            error = %row.error,
+            "warm pool: config row is not valid; skipping it and continuing with remaining configs"
+        );
+        pplx_space_metrics::warm_pool::config_decode_failed(read, &row.template_name);
+    }
 }
 
 fn retired_configs_to_emit(

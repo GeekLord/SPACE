@@ -39,6 +39,32 @@ pub struct PoolConfig {
     pub updated_at: OffsetDateTime,
 }
 
+/// A `kubernetes_pool_configs` row that is not a valid [`PoolConfig`].
+///
+/// The fields keep the raw values from the row, because a raw value is the
+/// value that did not parse. `error` gives the first field that did not parse.
+#[derive(Debug)]
+pub struct InvalidPoolConfigRow {
+    pub id: Uuid,
+    pub template_release_id: Uuid,
+    pub template_name: String,
+    pub content_hash: String,
+    pub error: PoolError,
+}
+
+/// The result of one config read.
+///
+/// A read does not fail because of one invalid row. It puts each valid row in
+/// `configs` and each invalid row in `invalid_rows`. Thus one bad release or
+/// shape cannot stop the reconciler for all other templates.
+#[derive(Debug, Default)]
+pub struct PoolConfigRead {
+    /// The rows that parsed into a [`PoolConfig`].
+    pub configs: Vec<PoolConfig>,
+    /// The rows that did not parse. The caller must report them.
+    pub invalid_rows: Vec<InvalidPoolConfigRow>,
+}
+
 /// A pool config joined with its live slot counts, as served by the
 /// cluster-pool admin API. Numeric fields keep their storage types and
 /// `template_name`/`content_hash` stay raw strings: this is a read model for
