@@ -851,6 +851,7 @@ async fn native_start_overwrites_a_stopped_written_mid_flight_without_a_retry() 
         attempts: 1,
         claim_generation: 1,
         traceparent: None,
+        age_at_first_claim_secs: None,
     };
     let executor = SandboxLifecycleOperationExecutor::new(pool.clone(), direct_controller(pool));
 
@@ -1190,6 +1191,7 @@ async fn a_command_wake_operation_runs_only_while_the_policy_allows_it() -> Test
             attempts: 1,
             claim_generation: 1,
             traceparent: None,
+            age_at_first_claim_secs: None,
         };
 
         let result = executor.execute(&operation).await;
