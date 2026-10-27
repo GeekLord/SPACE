@@ -79,6 +79,9 @@ pub(crate) async fn resolve_session_route(
         );
         let sandbox_id = row.sandbox_id;
         let restoring = row.sandbox_lifecycle == SandboxLifecycle::Restoring;
+        let unplaced =
+            row.sandbox_active_node_id.is_none() || resolve_backend_endpoint(&row).is_none();
+        let org_id = row.org_id;
         let result = async {
             refuse_restoring_route(row.sandbox_lifecycle)?;
             if matches!(
@@ -90,6 +93,9 @@ pub(crate) async fn resolve_session_route(
             let current_node_id = row.sandbox_active_node_id.ok_or_else(|| {
                 Status::failed_precondition("data-plane session sandbox is not assigned to a node")
             })?;
+            if !ingress {
+                hold_route_for_activation(pool, org_id, sandbox_id, row.sandbox_lifecycle).await?;
+            }
             let backend_endpoint = resolve_backend_endpoint(&row).ok_or_else(|| {
                 Status::failed_precondition(missing_backend_endpoint_message(
                     "data-plane session",
@@ -205,9 +211,20 @@ pub(crate) async fn resolve_session_route(
             })
         }
         .await;
-        let error = match result {
+        let error: Status = match result {
             Ok(response) => return Ok(response),
             Err(error) => error,
+        };
+        let at_rest = if !ingress && error.code() == tonic::Code::FailedPrecondition && unplaced {
+            route_at_rest(pool, org_id, sandbox_id).await
+        } else {
+            None
+        };
+        let error = match at_rest {
+            Some(lifecycle) => {
+                pplx_space_common_grpc::mark_session_route_at_rest(error, sandbox_id, lifecycle)
+            }
+            None => error,
         };
         let Some(owner) = activation
             .filter(|_| !activated && (restoring || activation_may_repair(ingress, &error)))
@@ -228,6 +245,84 @@ pub(crate) async fn resolve_session_route(
         }
         activated = true;
         // Re-read identity and authorization after activation; never replay bytes.
+    }
+}
+
+/// The sandbox's lifecycle when nothing is about to give the session's
+/// sandbox a node: it is not heading to running and no start, resume, restore
+/// or wake is queued or running for it. The lifecycle is read again with the
+/// operations, so one that just finished is not paired with the state it left.
+/// A failed read answers `None`, which keeps the attach retryable as it always
+/// was.
+pub(super) async fn route_at_rest(
+    pool: &sqlx::PgPool,
+    org_id: OrgId,
+    sandbox_id: SandboxId,
+) -> Option<SandboxLifecycle> {
+    let target_id = pplx_space_public_api::PublicSandboxId::from(sandbox_id).to_string();
+    let observed = match pplx_space_sandbox_store::activation_observation(
+        pool, org_id, sandbox_id, &target_id,
+    )
+    .await
+    {
+        Ok(observed) => observed?,
+        Err(error) => {
+            tracing::warn!(%sandbox_id, %error, "could not read pending wakes for a session route");
+            return None;
+        }
+    };
+    let lifecycle = observed.lifecycle.parse::<SandboxLifecycle>().ok()?;
+    (!heading_to_running(lifecycle) && !observed.activation_pending).then_some(lifecycle)
+}
+
+/// Running, or on its way there with nothing more to ask for.
+fn heading_to_running(lifecycle: SandboxLifecycle) -> bool {
+    matches!(
+        lifecycle,
+        SandboxLifecycle::Started
+            | SandboxLifecycle::Creating
+            | SandboxLifecycle::Starting
+            | SandboxLifecycle::Resuming
+            | SandboxLifecycle::Restoring
+            | SandboxLifecycle::Checkpointing
+    )
+}
+
+/// Hold the route of a sandbox that still has a node but is not heading to
+/// running while a start, resume, restore or wake is queued or running for
+/// it. The node refuses work on a stopped sandbox, or on a paused one its
+/// policy does not wake, as final, though the activation is about to make it
+/// run; held, the attach waits for it as for any placement on its way. A
+/// failed read routes as before.
+pub(super) async fn hold_route_for_activation(
+    pool: &sqlx::PgPool,
+    org_id: OrgId,
+    sandbox_id: SandboxId,
+    lifecycle: SandboxLifecycle,
+) -> Result<(), Status> {
+    if heading_to_running(lifecycle) {
+        return Ok(());
+    }
+    let target_id = pplx_space_public_api::PublicSandboxId::from(sandbox_id).to_string();
+    match pplx_space_sandbox_store::activation_observation(pool, org_id, sandbox_id, &target_id)
+        .await
+    {
+        Ok(Some(observed))
+            if observed.activation_pending
+                && observed
+                    .lifecycle
+                    .parse::<SandboxLifecycle>()
+                    .is_ok_and(|lifecycle| !heading_to_running(lifecycle)) =>
+        {
+            Err(Status::failed_precondition(
+                "data-plane session sandbox is about to be activated",
+            ))
+        }
+        Ok(_) => Ok(()),
+        Err(error) => {
+            tracing::warn!(%sandbox_id, %error, "could not read pending activations for a session route");
+            Ok(())
+        }
     }
 }
 

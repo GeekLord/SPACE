@@ -36,6 +36,7 @@ pub(crate) async fn handle_socket(
     header_token: Option<String>,
     mut socket: WebSocket,
 ) {
+    let attach_deadline = tokio::time::Instant::now() + state.attach_deadline;
     let Ok(_guard) = state.unauthenticated.try_register(source_ip) else {
         pplx_space_metrics::data_plane::attach(
             session_id.kind().as_str(),
@@ -57,7 +58,13 @@ pub(crate) async fn handle_socket(
     let attached = tokio::select! {
         biased;
         () = state.drain_started.cancelled() => None,
-        attached = authenticate_native_socket(&state, session_id, header_token, &mut socket) => {
+        attached = authenticate_native_socket(
+            &state,
+            session_id,
+            header_token,
+            &mut socket,
+            attach_deadline,
+        ) => {
             match attached {
                 Some(attached) => Some(attached),
                 None => return,
@@ -115,42 +122,71 @@ pub(crate) async fn handle_socket(
     revocation_cache.forget(session_id);
 }
 
-/// Authenticate a native WebSocket and resolve its session route. On failure
-/// the client already has its error frame and the socket is closed.
+/// Authenticate a native WebSocket and resolve its session route by
+/// `deadline`. On failure the client already has its error frame and the
+/// socket is closed.
 pub(super) async fn authenticate_native_socket(
     state: &DataPlaneState,
     session_id: DataPlaneSessionId,
     header_token: Option<String>,
     socket: &mut WebSocket,
+    deadline: tokio::time::Instant,
 ) -> Option<AttachedSession> {
-    let token = match header_token {
-        Some(token) => token,
-        None => match first_frame_attach_token(socket, state.attach_deadline).await {
-            Ok(token) => token,
-            Err(error) => {
-                pplx_space_metrics::data_plane::attach(session_id.kind().as_str(), error.as_str());
-                let _ = socket.send(Message::Text(error_json(error).into())).await;
-                let _ = socket.close().await;
-                return None;
-            }
-        },
-    };
-
-    let attached = match resolve_session_route(state, session_id, &token).await {
-        Ok(attached) => attached,
-        Err(error) => {
+    let attached =
+        attach_token_and_route(header_token, socket.recv(), deadline, |token| async move {
+            resolve_session_route(state, session_id, &token).await
+        })
+        .await;
+    let frame = match attached {
+        Ok(attached) => return Some(attached),
+        Err(AttachRefused::Token(error)) => {
+            pplx_space_metrics::data_plane::attach(session_id.kind().as_str(), error.as_str());
+            error_json(error)
+        }
+        Err(AttachRefused::Route(error)) => {
             pplx_space_metrics::data_plane::attach(
                 session_id.kind().as_str(),
                 error.metric_label(),
             );
-            let _ = socket
-                .send(Message::Text(error_json(error.frame_code()).into()))
-                .await;
-            let _ = socket.close().await;
-            return None;
+            route_resolution_error_json(error)
         }
     };
-    Some(attached)
+    let _ = socket.send(Message::Text(frame.into())).await;
+    let _ = socket.close().await;
+    None
+}
+
+/// Why a WebSocket attach ended before it had a route.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum AttachRefused {
+    Token(DataPlaneErrorCode),
+    Route(RouteResolutionError),
+}
+
+/// The attach's token, from its header or else its first frame, then its
+/// route, waiting while the sandbox is being placed: both by one `deadline`
+/// counted from accept, so a client slow to send its token has that much
+/// less to wait for the route.
+pub(super) async fn attach_token_and_route<T, Recv, E, Resolve, Fut>(
+    header_token: Option<String>,
+    first_frame: Recv,
+    deadline: tokio::time::Instant,
+    mut resolve: Resolve,
+) -> Result<T, AttachRefused>
+where
+    Recv: Future<Output = Option<Result<Message, E>>>,
+    Resolve: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<T, RouteResolutionError>>,
+{
+    let token = match header_token {
+        Some(token) => token,
+        None => first_frame_attach_token_from_recv(first_frame, deadline)
+            .await
+            .map_err(AttachRefused::Token)?,
+    };
+    retry_not_ready_until(deadline, || resolve(token.clone()))
+        .await
+        .map_err(AttachRefused::Route)
 }
 
 pub(crate) async fn bridge_attached_session(
@@ -359,6 +395,7 @@ pub(crate) async fn close_with_error(
                 message: code.as_str().to_string(),
                 code,
                 retryable,
+                details: Vec::new(),
             })
             .into(),
         ))
@@ -465,6 +502,7 @@ pub(crate) async fn bridge_process_session(
 ) -> Result<BridgeEnd, StreamBridgeError> {
     let shutdown_token = state.stream_shutdown_token.child_token();
     let (mut sink, mut source) = socket.split();
+    let sandbox_id = attached.sandbox_id;
     let open = open_native_process_stream(
         &state,
         session_id,
@@ -496,6 +534,7 @@ pub(crate) async fn bridge_process_session(
                     code: DataPlaneErrorCode::SessionNotReady,
                     message: "too many client frames before the session was ready".to_string(),
                     retryable: false,
+                    details: Vec::new(),
                 },
             )
             .await;
@@ -507,7 +546,9 @@ pub(crate) async fn bridge_process_session(
     let mut stream = match initial {
         Ok((_client, initial)) => initial,
         Err(error) => {
-            let _ = send_server_frame(&mut sink, &stream_start_error_frame(&error)).await;
+            forget_route_of_refused_sandbox(&state.route_cache, session_id, &error);
+            let _ =
+                send_server_frame(&mut sink, &stream_start_error_frame(&error, sandbox_id)).await;
             let _ = sink.close().await;
             return Err(error);
         }
@@ -668,6 +709,7 @@ pub(crate) async fn bridge_process_session(
                                     code: DataPlaneErrorCode::BackendStreamError,
                                     message: PROCESS_STREAM_FAILED.to_string(),
                                     retryable: backend_stream_status_retryable(&status),
+                                    details: Vec::new(),
                                 },
                             )
                             .await;
@@ -770,6 +812,7 @@ pub(crate) async fn bridge_process_session(
                                     code: DataPlaneErrorCode::BinaryClientFramesNotSupported,
                                     message: "binary client frames are not supported".to_string(),
                                     retryable: false,
+                                    details: Vec::new(),
                                 },
                             )
                             .await
@@ -820,7 +863,12 @@ pub(crate) async fn bridge_file_watch_session(
     let (_client, mut stream) = match opened {
         Ok(opened) => opened,
         Err(error) => {
-            let _ = send_server_frame(&mut sink, &stream_start_error_frame(&error)).await;
+            forget_route_of_refused_sandbox(&state.route_cache, session_id, &error);
+            let _ = send_server_frame(
+                &mut sink,
+                &stream_start_error_frame(&error, attached.sandbox_id),
+            )
+            .await;
             let _ = sink.close().await;
             return Err(error);
         }
@@ -936,6 +984,7 @@ pub(crate) async fn bridge_file_watch_session(
                                     code: DataPlaneErrorCode::BackendStreamError,
                                     message: FILE_WATCH_STREAM_FAILED.to_string(),
                                     retryable: backend_stream_status_retryable(&status),
+                                    details: Vec::new(),
                                 },
                             )
                             .await;
@@ -968,6 +1017,7 @@ pub(crate) async fn bridge_file_watch_session(
                                     code: DataPlaneErrorCode::BinaryClientFramesNotSupported,
                                     message: "binary client frames are not supported".to_string(),
                                     retryable: false,
+                                    details: Vec::new(),
                                 },
                             )
                             .await
@@ -1019,6 +1069,7 @@ where
                     code: DataPlaneErrorCode::AlreadyAttached,
                     message: "session is already attached".to_string(),
                     retryable: false,
+                    details: Vec::new(),
                 },
             )
             .await
@@ -1033,6 +1084,7 @@ where
                         code: DataPlaneErrorCode::ProcessNotStarted,
                         message: "process has not started yet".to_string(),
                         retryable: true,
+                        details: Vec::new(),
                     },
                 )
                 .await
@@ -1070,6 +1122,7 @@ where
                         code: DataPlaneErrorCode::ProcessNotStarted,
                         message: "process has not started yet".to_string(),
                         retryable: true,
+                        details: Vec::new(),
                     },
                 )
                 .await
@@ -1083,6 +1136,7 @@ where
                         code: DataPlaneErrorCode::InvalidResize,
                         message: "terminal resize rows and cols must be non-zero".to_string(),
                         retryable: false,
+                        details: Vec::new(),
                     },
                 )
                 .await
@@ -1117,6 +1171,7 @@ where
                             code: DataPlaneErrorCode::ResizeNotSupported,
                             message: RESIZE_REFUSED.to_string(),
                             retryable: false,
+                            details: Vec::new(),
                         },
                     )
                     .await
@@ -1134,6 +1189,7 @@ where
                         code: DataPlaneErrorCode::ProcessNotStarted,
                         message: "process has not started yet".to_string(),
                         retryable: true,
+                        details: Vec::new(),
                     },
                 )
                 .await
@@ -1166,6 +1222,7 @@ where
                         code: DataPlaneErrorCode::ProcessNotStarted,
                         message: "process has not started yet".to_string(),
                         retryable: true,
+                        details: Vec::new(),
                     },
                 )
                 .await
@@ -1226,6 +1283,7 @@ where
                     code: DataPlaneErrorCode::AlreadyAttached,
                     message: "session is already attached".to_string(),
                     retryable: false,
+                    details: Vec::new(),
                 },
             )
             .await
@@ -1240,6 +1298,7 @@ where
                     message: "interactive stdin is not supported by this backend stream"
                         .to_string(),
                     retryable: false,
+                    details: Vec::new(),
                 },
             )
             .await
@@ -1253,6 +1312,7 @@ where
                     code: DataPlaneErrorCode::InputNotSupported,
                     message: "process control is not supported by this backend stream".to_string(),
                     retryable: false,
+                    details: Vec::new(),
                 },
             )
             .await
@@ -1272,6 +1332,7 @@ where
                     code: DataPlaneErrorCode::ResizeNotSupported,
                     message: "terminal resize is not supported by this backend stream".to_string(),
                     retryable: false,
+                    details: Vec::new(),
                 },
             )
             .await

@@ -2,6 +2,8 @@
 //! WebSocket and SSE paths share.
 
 use super::*;
+use pplx_space_common_core::types::SandboxLifecycle;
+use pplx_space_public_api::SandboxLifecycleState;
 
 /// What the attach that may start a process can do with its input.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -202,7 +204,67 @@ pub(super) fn guest_storage_full(status: &tonic::Status) -> bool {
             == Some(pplx_space_common_core::spaced::GUEST_STORAGE_FULL)
 }
 
-pub(super) fn process_stream_start_http_error(error: &StreamBridgeError) -> Response {
+/// The refusal when the backend would not start work because the sandbox is
+/// not running and this attach may not wake it (see
+/// [`pplx_space_common_grpc::mark_sandbox_not_running`]).
+fn sandbox_not_running(
+    error: &StreamBridgeError,
+    sandbox_id: SandboxId,
+) -> Option<SandboxNotRunning> {
+    let StreamBridgeError::BackendStatus(status) = error else {
+        return None;
+    };
+    let state = pplx_space_common_grpc::sandbox_not_running_state(status)?;
+    // A node-local state the cluster has no name for (cleanup) is a sandbox
+    // that will not run again.
+    let state = state
+        .parse::<SandboxLifecycle>()
+        .map_or(SandboxLifecycleState::Failed, SandboxLifecycleState::from);
+    Some(SandboxNotRunning::new(sandbox_id, &state))
+}
+
+/// After the node refuses work because the sandbox is not running, forget the
+/// session's cached route: the answer tells the client to wake or start the
+/// sandbox, and the attach that follows that hint must reach the resolver,
+/// which holds the route while the activation it queued is on its way.
+pub(super) fn forget_route_of_refused_sandbox(
+    route_cache: &RouteCache,
+    session_id: DataPlaneSessionId,
+    error: &StreamBridgeError,
+) {
+    if let StreamBridgeError::BackendStatus(status) = error
+        && pplx_space_common_grpc::sandbox_not_running_state(status).is_some()
+    {
+        route_cache.forget_native_session(session_id);
+    }
+}
+
+pub(super) fn file_watch_stream_start_http_error(
+    error: &StreamBridgeError,
+    sandbox_id: SandboxId,
+) -> Response {
+    if let Some(response) = backend_refusal_http_error(error) {
+        return response;
+    }
+    // As for a process: the watch cannot open until the caller wakes or
+    // starts the sandbox, so retrying the attach alone would never succeed.
+    if let Some(refusal) = sandbox_not_running(error, sandbox_id) {
+        return refusal.http_error(ResponseOrigin::Node, ResponseKind::BackendStatus);
+    }
+    data_plane_http_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        DataPlaneHttpErrorCode::StreamUnavailable,
+        "file-watch stream is not available",
+        true,
+        ResponseOrigin::Node,
+        ResponseKind::BackendTransport,
+    )
+}
+
+pub(super) fn process_stream_start_http_error(
+    error: &StreamBridgeError,
+    sandbox_id: SandboxId,
+) -> Response {
     if let Some(response) = backend_refusal_http_error(error) {
         return response;
     }
@@ -215,6 +277,12 @@ pub(super) fn process_stream_start_http_error(error: &StreamBridgeError) -> Resp
             ResponseOrigin::Node,
             ResponseKind::BackendStatus,
         );
+    }
+    // Retrying the attach cannot start the command until the caller wakes the
+    // sandbox, so answer as createCommand does rather than as a stream that is
+    // not available yet.
+    if let Some(refusal) = sandbox_not_running(error, sandbox_id) {
+        return refusal.http_error(ResponseOrigin::Node, ResponseKind::BackendStatus);
     }
     // The sandbox's disk or quota is full: not retryable until space is freed,
     // and named as such rather than as a generic start failure.
@@ -286,7 +354,13 @@ pub(super) const STREAM_OPEN_FAILED: &str = "event stream could not be opened";
 pub(super) const STREAM_OPEN_REFUSED: &str = "this request was refused";
 pub(super) const RESIZE_REFUSED: &str = "terminal resize is not supported by this process";
 
-pub(super) fn stream_start_error_frame(error: &StreamBridgeError) -> DataPlaneServerFrame {
+pub(super) fn stream_start_error_frame(
+    error: &StreamBridgeError,
+    sandbox_id: SandboxId,
+) -> DataPlaneServerFrame {
+    if let Some(refusal) = sandbox_not_running(error, sandbox_id) {
+        return refusal.frame();
+    }
     // A refusal made before anything started is retryable here as on SSE.
     if let StreamBridgeError::BackendStatus(status) = error
         && pplx_space_common_grpc::is_refused_before_start(status)
@@ -295,6 +369,7 @@ pub(super) fn stream_start_error_frame(error: &StreamBridgeError) -> DataPlaneSe
             code: DataPlaneErrorCode::BackendStreamError,
             message: STREAM_OPEN_REFUSED.to_string(),
             retryable: true,
+            details: Vec::new(),
         };
     }
     let retryable = matches!(
@@ -312,6 +387,7 @@ pub(super) fn stream_start_error_frame(error: &StreamBridgeError) -> DataPlaneSe
         }
         .to_string(),
         retryable,
+        details: Vec::new(),
     }
 }
 

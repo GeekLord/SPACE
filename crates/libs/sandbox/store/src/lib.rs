@@ -505,6 +505,49 @@ pub async fn restore_owner_active(
     .unwrap_or(false))
 }
 
+/// A sandbox's stored lifecycle and whether something is about to activate it.
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct SandboxActivationObservation {
+    /// The stored value, a `String` as on [`SandboxRecord::lifecycle`].
+    pub lifecycle: String,
+    /// An operation that brings the sandbox back to running (start, resume,
+    /// restore or wake) is queued or running for it.
+    pub activation_pending: bool,
+}
+
+/// Observe the org's sandbox's lifecycle and pending activation, the sandbox
+/// also named by its operation `target_id`. One statement, so an activation
+/// that finishes meanwhile is seen with the lifecycle it left behind, never
+/// as an old lifecycle with no activation coming. `None` when the org has no
+/// such sandbox. Observation only: it never claims the work.
+pub async fn activation_observation(
+    executor: impl sqlx::PgExecutor<'_>,
+    org_id: OrgId,
+    sandbox_id: SandboxId,
+    target_id: &str,
+) -> Result<Option<SandboxActivationObservation>, SandboxStoreError> {
+    Ok(sqlx::query_as::<_, SandboxActivationObservation>(sql!(
+        "SELECT s.lifecycle,
+                EXISTS (
+                    SELECT 1
+                      FROM public_operations
+                     WHERE org_id = s.org_id
+                       AND target_type = 'sandbox'
+                       AND target_id = $3
+                       AND kind IN ('start_sandbox', 'resume_sandbox', 'restore_sandbox', 'wake_sandbox')
+                       AND state IN ('queued', 'running')
+                ) AS activation_pending
+           FROM sandboxes s
+          WHERE s.id = $1
+            AND s.org_id = $2"
+    ))
+    .bind(sandbox_id)
+    .bind(org_id)
+    .bind(target_id)
+    .fetch_optional(executor)
+    .await?)
+}
+
 /// Replace desired lifecycle policy and clear its stale published observation.
 pub async fn set_auto_lifecycle_policy(
     executor: impl sqlx::PgExecutor<'_>,

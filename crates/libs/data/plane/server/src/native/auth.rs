@@ -1,21 +1,14 @@
 use super::*;
 use std::future::Future;
 
-pub(crate) async fn first_frame_attach_token(
-    socket: &mut WebSocket,
-    deadline: Duration,
-) -> Result<String, DataPlaneErrorCode> {
-    first_frame_attach_token_from_recv(socket.recv(), deadline).await
-}
-
 pub(crate) async fn first_frame_attach_token_from_recv<F, E>(
     recv: F,
-    deadline: Duration,
+    deadline: tokio::time::Instant,
 ) -> Result<String, DataPlaneErrorCode>
 where
     F: Future<Output = Option<Result<Message, E>>>,
 {
-    let message = tokio::time::timeout(deadline, recv)
+    let message = tokio::time::timeout_at(deadline, recv)
         .await
         .map_err(|_| DataPlaneErrorCode::AttachDeadlineExceeded)?
         .ok_or(DataPlaneErrorCode::AttachRequired)?
@@ -139,7 +132,11 @@ pub(crate) enum RouteResolutionError {
     Unauthenticated,
     Forbidden,
     SessionNotFound,
+    /// The sandbox has no route yet, and something is about to give it one.
     SessionNotReady,
+    /// The sandbox has no route and nothing is about to give it one: it is
+    /// at rest and no wake is queued for it.
+    SessionAtRest(pplx_space_common_grpc::SessionRouteAtRest),
     ResolutionFailed,
     RouteStateInvalid,
 }
@@ -151,6 +148,7 @@ impl RouteResolutionError {
             Self::Forbidden => "forbidden",
             Self::SessionNotFound => "session_not_found",
             Self::SessionNotReady => "session_not_ready",
+            Self::SessionAtRest(_) => "sandbox_not_running",
             Self::ResolutionFailed => "route_resolution_failed",
             Self::RouteStateInvalid => "route_state_invalid",
         }
@@ -162,6 +160,8 @@ impl RouteResolutionError {
             Self::Forbidden => DataPlaneErrorCode::Forbidden,
             Self::SessionNotFound => DataPlaneErrorCode::SessionNotFound,
             Self::SessionNotReady => DataPlaneErrorCode::SessionNotReady,
+            // As the node's refusal to start work on a sandbox not running.
+            Self::SessionAtRest(_) => DataPlaneErrorCode::BackendStreamError,
             Self::ResolutionFailed => DataPlaneErrorCode::RouteResolutionFailed,
             Self::RouteStateInvalid => DataPlaneErrorCode::RouteStateInvalid,
         }
@@ -172,8 +172,80 @@ impl RouteResolutionError {
             Self::Unauthenticated | Self::Forbidden => (ResponseOrigin::Client, ResponseKind::Auth),
             Self::SessionNotFound => (ResponseOrigin::Client, ResponseKind::Validation),
             Self::SessionNotReady => (ResponseOrigin::Cluster, ResponseKind::RouteNotReady),
+            Self::SessionAtRest(_) => (ResponseOrigin::Cluster, ResponseKind::RouteUnavailable),
             Self::ResolutionFailed => (ResponseOrigin::Cluster, ResponseKind::RouteResolution),
             Self::RouteStateInvalid => (ResponseOrigin::DataPlane, ResponseKind::Internal),
+        }
+    }
+}
+
+/// Delay a client should wait before attaching again to a session whose
+/// sandbox is still being placed, for example by a wake.
+pub(crate) const SESSION_NOT_READY_RETRY_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(2);
+
+/// An attach whose sandbox is not running and will not be woken for it:
+/// createCommand's `sandbox_not_running` refusal. The node refusing to start
+/// the work and the resolver finding the route at rest answer it the same
+/// way, so `retryable`, the status and the frame agree whichever hop saw it.
+pub(crate) struct SandboxNotRunning {
+    message: String,
+    details: Vec<pplx_space_public_api::PublicErrorDetail>,
+}
+
+impl SandboxNotRunning {
+    pub(crate) fn new(
+        sandbox_id: SandboxId,
+        state: &pplx_space_public_api::SandboxLifecycleState,
+    ) -> Self {
+        Self {
+            message: format!("sandbox is {}, not running", state.as_str()),
+            details: pplx_space_public_api::sandbox_not_running_details(
+                pplx_space_public_api::PublicSandboxId::from(sandbox_id),
+                state,
+            ),
+        }
+    }
+
+    /// For an at-rest route; with no details when the mark lost its sandbox
+    /// or state.
+    pub(crate) fn at_rest(at_rest: pplx_space_common_grpc::SessionRouteAtRest) -> Self {
+        match (at_rest.sandbox_id, at_rest.state) {
+            (Some(sandbox_id), Some(state)) => Self::new(
+                sandbox_id,
+                &pplx_space_public_api::SandboxLifecycleState::from(state),
+            ),
+            _ => Self {
+                message: "sandbox is not running".to_string(),
+                details: Vec::new(),
+            },
+        }
+    }
+
+    /// The SSE answer: a 409 `conflict`, not retryable.
+    pub(crate) fn http_error(self, origin: ResponseOrigin, kind: ResponseKind) -> Response {
+        observe_data_plane_http_error(StatusCode::CONFLICT, origin, kind);
+        (
+            StatusCode::CONFLICT,
+            Json(DataPlaneHttpErrorEnvelope {
+                error: DataPlaneHttpError {
+                    code: DataPlaneHttpErrorCode::Conflict,
+                    message: self.message,
+                    retryable: false,
+                    details: self.details,
+                },
+            }),
+        )
+            .into_response()
+    }
+
+    /// The WebSocket answer: a `backend_stream_error` frame, not retryable.
+    pub(crate) fn frame(self) -> DataPlaneServerFrame {
+        DataPlaneServerFrame::Error {
+            code: DataPlaneErrorCode::BackendStreamError,
+            message: self.message,
+            retryable: false,
+            details: self.details,
         }
     }
 }
@@ -205,14 +277,21 @@ pub(crate) fn route_resolution_http_error(error: RouteResolutionError) -> Respon
             origin,
             kind,
         ),
-        RouteResolutionError::SessionNotReady => data_plane_http_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            DataPlaneHttpErrorCode::NotReady,
-            "session route is not ready",
-            true,
-            origin,
-            kind,
-        ),
+        RouteResolutionError::SessionNotReady => {
+            let mut response = data_plane_http_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                DataPlaneHttpErrorCode::NotReady,
+                "session route is not ready",
+                true,
+                origin,
+                kind,
+            );
+            insert_retry_after(&mut response, Some(SESSION_NOT_READY_RETRY_AFTER));
+            response
+        }
+        RouteResolutionError::SessionAtRest(at_rest) => {
+            SandboxNotRunning::at_rest(at_rest).http_error(origin, kind)
+        }
         RouteResolutionError::ResolutionFailed => data_plane_http_error(
             StatusCode::SERVICE_UNAVAILABLE,
             DataPlaneHttpErrorCode::ServiceUnavailable,
@@ -249,6 +328,7 @@ pub(crate) fn data_plane_http_error(
                 code,
                 message: message.to_string(),
                 retryable,
+                details: Vec::new(),
             },
         }),
     )

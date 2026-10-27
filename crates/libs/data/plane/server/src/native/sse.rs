@@ -68,7 +68,7 @@ pub(crate) async fn session_events(
         }
     };
 
-    let attached = match resolve_session_route(&state, session_id, &token).await {
+    let attached = match resolve_attach_route(&state, session_id, &token).await {
         Ok(attached) => attached,
         Err(error) => {
             pplx_space_metrics::data_plane::attach(
@@ -92,6 +92,7 @@ pub(crate) async fn session_events(
             return too_many_attached_streams_response(limit);
         }
     };
+    let sandbox_id = attached.sandbox_id;
     let stream_state = match attached.kind {
         SessionKind::Process => {
             // Only a forged id leaves no later id to number the stream with.
@@ -155,6 +156,7 @@ pub(crate) async fn session_events(
                 (attached, ProcessInput::Closed)
             };
             let stream_shutdown_token = state.stream_shutdown_token.clone();
+            let route_cache = Arc::clone(&state.route_cache);
             let opened = before_stream_deadline(
                 &stream_shutdown_token,
                 ProcessSseState::new(
@@ -193,12 +195,14 @@ pub(crate) async fn session_events(
                     let result = stream_bridge_error_label(&error);
                     pplx_space_metrics::data_plane::attach(session_id.kind().as_str(), result);
                     tracing::warn!(%error, "failed to start process event stream");
-                    return process_stream_start_http_error(&error);
+                    forget_route_of_refused_sandbox(&route_cache, session_id, &error);
+                    return process_stream_start_http_error(&error, sandbox_id);
                 }
             }
         }
         SessionKind::FileWatch => {
             let stream_shutdown_token = state.stream_shutdown_token.clone();
+            let route_cache = Arc::clone(&state.route_cache);
             let opened = before_stream_deadline(
                 &stream_shutdown_token,
                 FileWatchSseState::new(state, session_id, attached, last_event_id, stream_permit),
@@ -213,17 +217,8 @@ pub(crate) async fn session_events(
                     let result = stream_bridge_error_label(&error);
                     pplx_space_metrics::data_plane::attach(session_id.kind().as_str(), result);
                     tracing::warn!(%error, "failed to start file-watch event stream");
-                    if let Some(response) = backend_refusal_http_error(&error) {
-                        return response;
-                    }
-                    return data_plane_http_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        DataPlaneHttpErrorCode::StreamUnavailable,
-                        "file-watch stream is not available",
-                        true,
-                        ResponseOrigin::Node,
-                        ResponseKind::BackendTransport,
-                    );
+                    forget_route_of_refused_sandbox(&route_cache, session_id, &error);
+                    return file_watch_stream_start_http_error(&error, sandbox_id);
                 }
             }
         }
@@ -649,6 +644,7 @@ impl ProcessSseState {
             .to_string(),
             // A reattach cannot bring back a process the guest let go of.
             retryable: !matches!(error, StreamBridgeError::ProcessNotRetained),
+            details: Vec::new(),
         });
     }
 
@@ -1139,6 +1135,7 @@ impl FileWatchSseState {
             code: DataPlaneErrorCode::BackendStreamError,
             message: FILE_WATCH_STREAM_FAILED.to_string(),
             retryable: true,
+            details: Vec::new(),
         });
     }
 }
