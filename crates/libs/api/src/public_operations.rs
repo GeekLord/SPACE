@@ -1,6 +1,7 @@
 use pplx_space_common_core::types::{OrgId, UserId};
 
 use pplx_space_common_core::sql;
+use std::num::NonZeroU32;
 use std::str::FromStr;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -14,10 +15,11 @@ use pplx_space_public_api::{
 };
 use pplx_space_sandbox_store as sandbox_store;
 use sha2::{Digest, Sha256};
-use sqlx::{FromRow, PgPool, Postgres, Transaction, types::Json};
+use sqlx::{FromRow, PgPool, Postgres, Row, Transaction, types::Json};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::public_operation_driver::with_carried_error;
 use crate::public_store::{InvalidStoredEnum, parse_stored_enum};
 use pplx_space_sandbox_store::fork_source_lifecycle::lock_fork_source_lifecycle;
 
@@ -583,8 +585,9 @@ impl PublicOperationStore {
         let kind = input.kind;
         let target_type = input.target_type.clone();
         let mut tx = self.pool.begin().await?;
-        let result = create_operation_tx(&mut tx, input).await?;
+        let (result, superseded) = create_operation_tx(&mut tx, input).await?;
         tx.commit().await?;
+        superseded.record();
         if matches!(result, CreatePublicOperationResult::Created(_)) {
             pplx_space_metrics::operations::created(
                 api_product.as_str(),
@@ -727,7 +730,7 @@ impl PublicOperationStore {
                 OperationId::from_uuid(operation_id),
             ));
         }
-        let result = create_operation_tx(
+        let (result, superseded) = create_operation_tx(
             &mut tx,
             CreatePublicOperation {
                 org_id,
@@ -745,6 +748,7 @@ impl PublicOperationStore {
         )
         .await?;
         tx.commit().await?;
+        superseded.record();
         if matches!(result, CreatePublicOperationResult::Created(_)) {
             pplx_space_metrics::operations::created(
                 ApiProduct::Native.as_str(),
@@ -816,7 +820,8 @@ impl PublicOperationStore {
         let target_type = input.target_type.clone();
 
         let mut tx = self.pool.begin().await?;
-        let operation_id = match create_operation_tx(&mut tx, input).await? {
+        let (created, superseded) = create_operation_tx(&mut tx, input).await?;
+        let operation_id = match created {
             CreatePublicOperationResult::Created(operation_id) => operation_id,
             CreatePublicOperationResult::Existing(operation_id) => {
                 tx.commit().await?;
@@ -839,6 +844,7 @@ impl PublicOperationStore {
         };
         let (claim_token, operation) = claim_created_operation_tx(&mut tx, operation_id).await?;
         tx.commit().await?;
+        superseded.record();
 
         pplx_space_metrics::operations::created(
             api_product.as_str(),
@@ -934,10 +940,14 @@ impl PublicOperationStore {
         expire_overdue_queued_operations(&self.pool, input, expiry).await
     }
 
+    /// Requeue a claimed operation, or with `input.cancel_if_superseded`,
+    /// cancel a create instead when a delete of its sandbox requested after
+    /// it is still active, so the delete need not wait out the create's
+    /// retries and the create never runs after it.
     pub async fn release_claimed_operation(
         &self,
         input: ReleaseClaimedPublicOperation,
-    ) -> Result<bool, PublicOperationStoreError> {
+    ) -> Result<ReleasedClaim, PublicOperationStoreError> {
         release_claimed_operation(&self.pool, input).await
     }
 
@@ -1076,7 +1086,7 @@ async fn claim_created_operation_tx(
     tx: &mut Transaction<'_, Postgres>,
     operation_id: OperationId,
 ) -> Result<(String, ClaimedPublicOperation), PublicOperationStoreError> {
-    let claim_token = new_claim_token();
+    let claim_token = new_admission_claim_token();
     let row = sqlx::query_as::<_, ClaimedPublicOperationRow>(sql!(
         "UPDATE public_operations
          SET state = $3,
@@ -1161,8 +1171,9 @@ impl PublicOperationAdmission {
         let api_product = input.api_product;
         let kind = input.kind;
         let target_type = input.target_type.clone();
-        let result = create_operation_tx(&mut self.tx, input).await?;
+        let (result, superseded) = create_operation_tx(&mut self.tx, input).await?;
         self.tx.commit().await?;
+        superseded.record();
         if matches!(result, CreatePublicOperationResult::Created(_)) {
             pplx_space_metrics::operations::created(
                 api_product.as_str(),
@@ -1198,12 +1209,13 @@ impl PublicOperationAdmission {
         let api_product = input.api_product;
         let kind = input.kind;
         let target_type = input.target_type.clone();
-        let result = create_operation_tx(&mut self.tx, input).await?;
+        let (result, superseded) = create_operation_tx(&mut self.tx, input).await?;
         if !matches!(result, CreatePublicOperationResult::Created(_)) {
             self.tx.rollback().await?;
             return Ok(result);
         }
         self.tx.commit().await?;
+        superseded.record();
         pplx_space_metrics::operations::created(
             api_product.as_str(),
             kind.as_str(),
@@ -1226,7 +1238,8 @@ impl PublicOperationAdmission {
         let api_product = input.api_product;
         let kind = input.kind;
         let target_type = input.target_type.clone();
-        let operation_id = match create_operation_tx(&mut self.tx, input).await? {
+        let (created, superseded) = create_operation_tx(&mut self.tx, input).await?;
+        let operation_id = match created {
             CreatePublicOperationResult::Created(operation_id) => operation_id,
             CreatePublicOperationResult::Existing(operation_id) => {
                 self.tx.rollback().await?;
@@ -1250,6 +1263,7 @@ impl PublicOperationAdmission {
         let (claim_token, operation) =
             claim_created_operation_tx(&mut self.tx, operation_id).await?;
         self.tx.commit().await?;
+        superseded.record();
         pplx_space_metrics::operations::created(
             api_product.as_str(),
             kind.as_str(),
@@ -1310,6 +1324,26 @@ pub struct ClaimLimits {
     /// are not taken by teardowns. When the other pick is empty, including
     /// when `non_teardown` is 0, teardowns may take all `total`.
     pub teardown_while_other_due: u32,
+    /// The most operations other than teardowns that one organization may
+    /// have running under a live claim, counting those it already has,
+    /// across every dispatcher. One claimed as it was created, which the
+    /// process that created it runs, is not counted. `None` sets no such
+    /// limit.
+    pub per_org_non_teardown: Option<OrgSlotLimit>,
+}
+
+/// How many operations other than teardowns one organization may have
+/// running at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrgSlotLimit {
+    /// While another organization is waiting: has such work due and holds
+    /// fewer than this many.
+    pub contended: NonZeroU32,
+    /// While no other organization is waiting, organizations may go past
+    /// `contended`, but the claim leaves this many of its `non_teardown`
+    /// limit, the free slots open to other work, untaken by operations past
+    /// it, so work another organization submits later can start.
+    pub headroom: u32,
 }
 
 impl ClaimLimits {
@@ -1319,6 +1353,7 @@ impl ClaimLimits {
             total,
             non_teardown: total,
             teardown_while_other_due: total,
+            per_org_non_teardown: None,
         }
     }
 }
@@ -1337,6 +1372,12 @@ pub struct ListAdminPublicOperations {
 pub struct PublicOperationClaim {
     pub claim_token: String,
     pub operations: Vec<ClaimedPublicOperation>,
+    /// The claim found due operations other than teardowns, and its
+    /// organization limit held back every one of them, so until an execution
+    /// ends or another organization's work arrives, claiming again takes
+    /// none of them either. Work held back only by earlier work on its
+    /// sandbox, or by a row another transaction has locked, does not count.
+    pub org_limit_held_back: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1497,6 +1538,25 @@ pub struct ReleaseClaimedPublicOperation {
     /// The operation then still reads as never started, so it can expire
     /// unrun past its deadline.
     pub undo_first_start: bool,
+    /// Whether a create ends `canceled` instead of requeued when a delete of
+    /// its sandbox requested after it is still active. `false` for a create
+    /// whose execution may still be running, since the delete would then
+    /// no longer wait for it.
+    pub cancel_if_superseded: bool,
+    /// The attempt's error, recorded under the cancel's own fields if the
+    /// release cancels a superseded create.
+    pub carried_error: Option<serde_json::Value>,
+}
+
+/// What a release did with its claimed operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleasedClaim {
+    /// Requeued, to be claimed again.
+    Requeued,
+    /// A create canceled instead, superseded by this delete of its sandbox.
+    Superseded { delete_id: OperationId },
+    /// The claim was lost; the operation is unchanged.
+    Lost,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1542,10 +1602,29 @@ impl PublicOperationGcReport {
     }
 }
 
+/// Creates that a delete created in a transaction canceled, to be counted
+/// once that transaction commits.
+#[must_use]
+#[derive(Debug, Default)]
+pub struct SupersededCreates(Vec<ApiProduct>);
+
+impl SupersededCreates {
+    /// Count the canceled creates; call after the transaction commits.
+    pub fn record(self) {
+        for api_product in self.0 {
+            pplx_space_metrics::operations::completed(
+                api_product.as_str(),
+                OperationKind::CreateSandbox.as_str(),
+                OperationState::Canceled.as_str(),
+            );
+        }
+    }
+}
+
 pub async fn create_operation_tx(
     tx: &mut Transaction<'_, Postgres>,
     input: CreatePublicOperation<'_>,
-) -> Result<CreatePublicOperationResult, PublicOperationStoreError> {
+) -> Result<(CreatePublicOperationResult, SupersededCreates), PublicOperationStoreError> {
     if let Some(idempotency) = input.idempotency.as_ref() {
         lock_idempotency_key(tx, input.org_id, input.api_product, idempotency).await?;
         if let Some(existing) =
@@ -1554,12 +1633,18 @@ pub async fn create_operation_tx(
             if existing.request_fingerprint == *idempotency.request_fingerprint
                 && let Some(operation_id) = existing.operation_id
             {
-                return Ok(CreatePublicOperationResult::Existing(operation_id));
+                return Ok((
+                    CreatePublicOperationResult::Existing(operation_id),
+                    SupersededCreates::default(),
+                ));
             }
-            return Ok(CreatePublicOperationResult::IdempotencyConflict {
-                operation_id: existing.operation_id,
-                expected_fingerprint: existing.request_fingerprint,
-            });
+            return Ok((
+                CreatePublicOperationResult::IdempotencyConflict {
+                    operation_id: existing.operation_id,
+                    expected_fingerprint: existing.request_fingerprint,
+                },
+                SupersededCreates::default(),
+            ));
         }
         delete_expired_idempotency_record_tx(
             tx,
@@ -1626,6 +1711,16 @@ pub async fn create_operation_tx(
     )
     .await?;
 
+    let mut superseded = SupersededCreates::default();
+    if input.kind == OperationKind::DeleteSandbox
+        && input.target_type == Some(OperationTargetType::Sandbox)
+        && let Some(target_id) = input.target_id
+    {
+        superseded =
+            cancel_creates_superseded_by_delete_tx(tx, input.org_id, target_id, operation_id)
+                .await?;
+    }
+
     if let Some(idempotency) = input.idempotency.as_ref() {
         sqlx::query(sql!(
             "INSERT INTO public_idempotency_records (
@@ -1657,11 +1752,172 @@ pub async fn create_operation_tx(
         .await?;
     }
 
-    Ok(CreatePublicOperationResult::Created(operation_id))
+    Ok((
+        CreatePublicOperationResult::Created(operation_id),
+        superseded,
+    ))
+}
+
+/// The terminal record of a create canceled because a delete of its sandbox
+/// was requested before it could finish.
+fn superseded_create(
+    create_id: OperationId,
+    delete_id: OperationId,
+    carried_error: Option<serde_json::Value>,
+) -> (String, PublicErrorCode, serde_json::Value) {
+    (
+        "Superseded by a delete of the same sandbox requested before the create finished."
+            .to_owned(),
+        PublicErrorCode::OperationFailed,
+        with_carried_error(
+            serde_json::json!({
+                "operation_id": create_id.to_string(),
+                "kind": OperationKind::CreateSandbox.as_str(),
+                "reason": "superseded_by_delete",
+                "delete_operation_id": delete_id.to_string(),
+            }),
+            carried_error,
+        ),
+    )
+}
+
+/// Record `create_id`, whose row this transaction has locked, `canceled` as
+/// superseded by `delete_id`.
+async fn cancel_superseded_create_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    create_id: OperationId,
+    delete_id: OperationId,
+    carried_error: Option<serde_json::Value>,
+) -> Result<(), PublicOperationStoreError> {
+    let (progress_message, code, error) = superseded_create(create_id, delete_id, carried_error);
+    sqlx::query(sql!(
+        "UPDATE public_operations
+         SET state = $2,
+             claim_token = '',
+             completed_at = NOW(),
+             progress_message = $3,
+             terminal_error_code = $4,
+             terminal_error_json = $5,
+             payload_json = payload_json #- '{federated_create,service_grant_base64}'::text[],
+             updated_at = NOW()
+         WHERE operation_id = $1"
+    ))
+    .bind(create_id.as_uuid())
+    .bind(OperationState::Canceled.as_str())
+    .bind(&progress_message)
+    .bind(code.as_str())
+    .bind(Json(error.clone()))
+    .execute(&mut **tx)
+    .await?;
+    append_operation_event_tx(
+        tx,
+        create_id,
+        PublicOperationEventType::Canceled,
+        serde_json::json!({
+            "state": OperationState::Canceled.as_str(),
+            "code": code.as_str(),
+            "error": error,
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Cancel the queued, unclaimed creates of `target_id` that `delete_id`, a
+/// delete of the same sandbox just requested in this transaction,
+/// supersedes, so it need not wait for them to run out their retries. A
+/// create under a claim, live or stale, is left alone: its execution may be
+/// building the sandbox, and it is canceled instead of requeued when its
+/// attempt ends.
+///
+/// Every active create is locked first, waiting for a claim or a release
+/// that holds one, so none slips past both cancels: a release that requeues
+/// a create without seeing this delete has locked the row first, and this
+/// then sees the requeued create once the release commits.
+async fn cancel_creates_superseded_by_delete_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    org_id: OrgId,
+    target_id: &str,
+    delete_id: OperationId,
+) -> Result<SupersededCreates, PublicOperationStoreError> {
+    let active = sqlx::query_as::<_, (Uuid, String, bool)>(sql!(
+        "SELECT operation_id, api_product, state = $5 AND claim_token = ''
+         FROM public_operations
+         WHERE org_id = $1
+           AND target_type = $2
+           AND target_id = $3
+           AND kind = $4
+           AND state IN ($5, $6)
+           AND requested_at <= NOW()
+         ORDER BY requested_at, operation_id
+         FOR UPDATE"
+    ))
+    .bind(org_id)
+    .bind(OperationTargetType::Sandbox.as_str())
+    .bind(target_id)
+    .bind(OperationKind::CreateSandbox.as_str())
+    .bind(OperationState::Queued.as_str())
+    .bind(OperationState::Running.as_str())
+    .fetch_all(&mut **tx)
+    .await?;
+    let creates = active
+        .into_iter()
+        .filter_map(|(create, api_product, unclaimed)| unclaimed.then_some((create, api_product)));
+    let mut superseded = SupersededCreates::default();
+    for (create, api_product) in creates {
+        superseded
+            .0
+            .push(parse_stored_enum("api_product", &api_product)?);
+        cancel_superseded_create_tx(tx, OperationId::from_uuid(create), delete_id, None).await?;
+    }
+    Ok(superseded)
+}
+
+/// The earliest delete of `create_id`'s sandbox requested after it that is
+/// still active, if `create_id` is a sandbox create.
+async fn superseding_delete_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    create_id: OperationId,
+) -> Result<Option<OperationId>, PublicOperationStoreError> {
+    let delete = sqlx::query_scalar::<_, Uuid>(sql!(
+        "SELECT delete_op.operation_id
+         FROM public_operations create_op
+         JOIN public_operations delete_op
+           ON delete_op.org_id = create_op.org_id
+          AND delete_op.target_type = create_op.target_type
+          AND delete_op.target_id = create_op.target_id
+         WHERE create_op.operation_id = $1
+           AND create_op.kind = $2
+           AND create_op.target_type = $3
+           AND delete_op.kind = $4
+           AND delete_op.state IN ($5, $6)
+           AND (delete_op.requested_at, delete_op.operation_id)
+               > (create_op.requested_at, create_op.operation_id)
+         ORDER BY delete_op.requested_at, delete_op.operation_id
+         LIMIT 1"
+    ))
+    .bind(create_id.as_uuid())
+    .bind(OperationKind::CreateSandbox.as_str())
+    .bind(OperationTargetType::Sandbox.as_str())
+    .bind(OperationKind::DeleteSandbox.as_str())
+    .bind(OperationState::Queued.as_str())
+    .bind(OperationState::Running.as_str())
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(delete.map(OperationId::from_uuid))
 }
 
 fn new_claim_token() -> String {
     format!("public-operation-{}", Uuid::now_v7())
+}
+
+/// How the claim token of an operation claimed as it is created begins. The
+/// process that created it runs it, in no dispatcher slot, so the
+/// per-organization slot limit does not count it.
+const ADMISSION_CLAIM_TOKEN_PREFIX: &str = "public-operation-admission-";
+
+fn new_admission_claim_token() -> String {
+    format!("{ADMISSION_CLAIM_TOKEN_PREFIX}{}", Uuid::now_v7())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1679,6 +1935,7 @@ async fn claim_operations(
         return Ok(PublicOperationClaim {
             claim_token: new_claim_token(),
             operations: Vec::new(),
+            org_limit_held_back: false,
         });
     }
 
@@ -1715,6 +1972,7 @@ async fn claim_operations(
             return Ok(PublicOperationClaim {
                 claim_token,
                 operations: Vec::new(),
+                org_limit_held_back: false,
             });
         }
     }
@@ -1740,8 +1998,35 @@ async fn claim_operations(
     // their rows before that last `LIMIT`, so up to `$12 + $13 - $1` rows stay
     // locked but unclaimed until this transaction commits. A concurrent
     // unkeyed claim skips them meanwhile, and a keyed one does not run while
-    // this claim holds the claim lock.
-    let rows = sqlx::query_as::<_, DispatcherClaimRow>(sql!(
+    // this claim holds the claim lock. With `$15` above zero, it limits each
+    // organization's operations other than teardowns: `org_slots` counts the
+    // ones it runs under a live claim, except one claimed as it was created
+    // (`$17`), which the process that created it runs, and, in claim order,
+    // the ones this claim would add. An organization is waiting while it has
+    // such work due and holds fewer than `$15`. While another one is
+    // waiting, an organization gets no more than `$15`. While none is, it may
+    // go past `$15`, but operations past their organization's limit are taken
+    // only among the first `$12 - $16` admissible ones in claim order, so
+    // that `$16` of the free slots open to other work stay free for work
+    // another organization submits later. Organizations all at their limit
+    // share that one budget.
+    // No more than `2 * $12` of an organization's due operations can be
+    // admitted, so the rank reads only those: `due_other` reads every due
+    // one once, an organization with more gets a top-N pass of its own, and
+    // the others' go to the window whole, which keeps one organization's
+    // backlog out of the sort.
+    // That rank needs a window, which cannot share a level with `FOR
+    // UPDATE`, so `first_other` admits up to `2 * $12` and `picked_other`
+    // locks the first `$12` of them it can by key, re-checking that each is
+    // still claimable. Admitting more than it takes keeps a row another
+    // transaction has locked from shrinking the claim, unless more than `$12`
+    // of the admitted ones are. A locked row still counts toward its
+    // organization's limit and the headroom budget in this claim, since
+    // finding it locked takes the lock, so work admitted only past it waits
+    // for the next claim. When it claims nothing, the statement returns
+    // one row with no operation, whose `org_limit_held_back` says whether
+    // other work was due and the organization limit held all of it back.
+    let rows = sqlx::query(sql!(
         "WITH shared AS (
              SELECT org_id, target_id
              FROM public_operations
@@ -1801,8 +2086,21 @@ async fn claim_operations(
                 OR (NOT sandbox_stale AND head_due AND position > 1)
                 OR (NOT sandbox_stale AND NOT head_due AND NOT first_free_delete)
          ),
-         picked_other AS (
+         org_live AS (
+             SELECT org_id, COUNT(*) AS live
+             FROM public_operations
+             WHERE $15::BIGINT > 0
+               AND state = $5
+               AND claim_token <> ''
+               AND NOT starts_with(claim_token, $17)
+               AND claimed_at > NOW() - make_interval(secs => $2::BIGINT)
+               AND kind = ANY($6)
+               AND kind <> ALL($14)
+             GROUP BY org_id
+         ),
+         due_other AS MATERIALIZED (
              SELECT candidate.operation_id,
+                    candidate.org_id,
                     candidate.next_attempt_at,
                     candidate.requested_at,
                     GREATEST(candidate.requested_at, candidate.next_attempt_at) AS claimable_at,
@@ -1818,7 +2116,84 @@ async fn claim_operations(
                    OR candidate.claimed_at <= NOW() - make_interval(secs => $2::BIGINT)
                )
                AND candidate.operation_id NOT IN (SELECT operation_id FROM blocked)
-             ORDER BY candidate.next_attempt_at ASC, candidate.requested_at ASC, candidate.operation_id ASC
+         ),
+         due_orgs AS (
+             SELECT org_id, COUNT(*) AS due
+             FROM due_other
+             GROUP BY org_id
+         ),
+         org_first AS (
+             SELECT due_other.*
+             FROM due_other
+             JOIN due_orgs ON due_orgs.org_id = due_other.org_id
+             WHERE due_orgs.due <= 2 * $12
+             UNION ALL
+             SELECT first.*
+             FROM due_orgs
+             CROSS JOIN LATERAL (
+                 SELECT *
+                 FROM due_other
+                 WHERE due_other.org_id = due_orgs.org_id
+                 ORDER BY next_attempt_at, requested_at, operation_id
+                 LIMIT 2 * $12
+             ) first
+             WHERE due_orgs.due > 2 * $12
+         ),
+         other_candidates AS (
+             SELECT org_first.*,
+                    COALESCE(org_live.live, 0) AS org_held,
+                    COALESCE(org_live.live, 0) + ROW_NUMBER() OVER (
+                        PARTITION BY org_first.org_id
+                        ORDER BY org_first.next_attempt_at, org_first.requested_at, org_first.operation_id
+                    ) AS org_slots
+             FROM org_first
+             LEFT JOIN org_live ON org_live.org_id = org_first.org_id
+         ),
+         waiting AS (
+             SELECT COUNT(*) AS orgs
+             FROM due_orgs
+             LEFT JOIN org_live ON org_live.org_id = due_orgs.org_id
+             WHERE COALESCE(org_live.live, 0) < $15
+         ),
+         admissible AS (
+             SELECT other.*,
+                    ROW_NUMBER() OVER (
+                        ORDER BY other.next_attempt_at, other.requested_at, other.operation_id
+                    ) AS admissible_rank
+             FROM other_candidates other
+             WHERE $15::BIGINT = 0
+                OR other.org_slots <= $15
+                -- Past its limit only while no other organization waits.
+                OR (SELECT orgs FROM waiting) = CASE WHEN other.org_held < $15 THEN 1 ELSE 0 END
+         ),
+         first_other AS (
+             SELECT operation_id, next_attempt_at, requested_at, claimable_at, reclaimed, first_start
+             FROM admissible
+             WHERE $15::BIGINT = 0
+                OR org_slots <= $15
+                OR admissible_rank <= $12 - $16
+             ORDER BY next_attempt_at ASC, requested_at ASC, operation_id ASC
+             LIMIT 2 * $12
+         ),
+         picked_other AS (
+             SELECT candidate.operation_id,
+                    first_other.next_attempt_at,
+                    first_other.requested_at,
+                    first_other.claimable_at,
+                    first_other.reclaimed,
+                    first_other.first_start
+             FROM first_other
+             JOIN public_operations candidate
+               ON candidate.operation_id = first_other.operation_id
+             WHERE candidate.state IN ($4, $5)
+               AND candidate.next_attempt_at <= NOW()
+               AND (
+                   candidate.claim_token = ''
+                   OR candidate.claimed_at <= NOW() - make_interval(secs => $2::BIGINT)
+               )
+             ORDER BY first_other.next_attempt_at ASC,
+                      first_other.requested_at ASC,
+                      first_other.operation_id ASC
              LIMIT $12
              FOR UPDATE OF candidate SKIP LOCKED
          ),
@@ -1852,38 +2227,47 @@ async fn claim_operations(
              ) claimable
              ORDER BY next_attempt_at ASC, requested_at ASC, operation_id ASC
              LIMIT $1
+         ),
+         claimed AS (
+             UPDATE public_operations o
+             SET state = $5,
+                 attempts = o.attempts + 1,
+                 claim_token = $3,
+                 claim_generation = o.claim_generation + 1,
+                 claimed_at = NOW(),
+                 started_at = COALESCE(o.started_at, NOW()),
+                 progress_message = CASE
+                     WHEN o.progress_message = '' THEN 'operation claimed'
+                     ELSE o.progress_message
+                 END,
+                 updated_at = NOW()
+             FROM picked
+             WHERE o.operation_id = picked.operation_id
+             RETURNING o.operation_id,
+                       o.org_id,
+                       o.actor_user_id,
+                       o.api_product,
+                       o.kind,
+                       o.target_type,
+                       o.target_id,
+                       o.payload_json,
+                       o.attempts,
+                       o.claim_generation,
+                       o.traceparent,
+                       CASE WHEN picked.first_start
+                           THEN FLOOR(EXTRACT(EPOCH FROM NOW() - o.created_at))::BIGINT
+                       END AS age_at_first_claim_secs,
+                       (EXTRACT(EPOCH FROM NOW() - picked.claimable_at) * 1000)::DOUBLE PRECISION
+                           AS queue_wait_ms,
+                       picked.reclaimed
          )
-         UPDATE public_operations o
-         SET state = $5,
-             attempts = o.attempts + 1,
-             claim_token = $3,
-             claim_generation = o.claim_generation + 1,
-             claimed_at = NOW(),
-             started_at = COALESCE(o.started_at, NOW()),
-             progress_message = CASE
-                 WHEN o.progress_message = '' THEN 'operation claimed'
-                 ELSE o.progress_message
-             END,
-             updated_at = NOW()
-         FROM picked
-         WHERE o.operation_id = picked.operation_id
-         RETURNING o.operation_id,
-                   o.org_id,
-                   o.actor_user_id,
-                   o.api_product,
-                   o.kind,
-                   o.target_type,
-                   o.target_id,
-                   o.payload_json,
-                   o.attempts,
-                   o.claim_generation,
-                   o.traceparent,
-                   CASE WHEN picked.first_start
-                       THEN FLOOR(EXTRACT(EPOCH FROM NOW() - o.created_at))::BIGINT
-                   END AS age_at_first_claim_secs,
-                   (EXTRACT(EPOCH FROM NOW() - picked.claimable_at) * 1000)::DOUBLE PRECISION
-                       AS queue_wait_ms,
-                   picked.reclaimed"
+         SELECT claimed.*, summary.org_limit_held_back
+         FROM (
+             SELECT $12::BIGINT > 0
+                    AND NOT EXISTS (SELECT 1 FROM first_other)
+                    AND EXISTS (SELECT 1 FROM other_candidates) AS org_limit_held_back
+         ) summary
+         LEFT JOIN claimed ON TRUE"
     ))
     .bind(i64::from(input.limits.total))
     .bind(duration_secs_i64(input.claim_stale_after))
@@ -1904,12 +2288,31 @@ async fn claim_operations(
             .min(input.limits.total),
     ))
     .bind(&teardown_labels)
+    .bind(
+        input
+            .limits
+            .per_org_non_teardown
+            .map_or(0, |limit| i64::from(limit.contended.get())),
+    )
+    .bind(
+        input
+            .limits
+            .per_org_non_teardown
+            .map_or(0, |limit| i64::from(limit.headroom)),
+    )
+    .bind(ADMISSION_CLAIM_TOKEN_PREFIX)
     .fetch_all(&mut *tx)
     .await?;
 
     let mut operations = Vec::with_capacity(rows.len());
     let mut queue_waits = Vec::with_capacity(rows.len());
+    let mut org_limit_held_back = false;
     for row in rows {
+        if row.try_get::<Option<Uuid>, _>("operation_id")?.is_none() {
+            org_limit_held_back = row.try_get("org_limit_held_back")?;
+            continue;
+        }
+        let row = DispatcherClaimRow::from_row(&row)?;
         let operation = ClaimedPublicOperation::try_from(row.operation)?;
         // A stale reclaim was already running, so its wait is not queue time.
         queue_waits.push((!row.reclaimed).then_some(row.queue_wait_ms));
@@ -1945,6 +2348,7 @@ async fn claim_operations(
     Ok(PublicOperationClaim {
         claim_token,
         operations,
+        org_limit_held_back,
     })
 }
 
@@ -2214,8 +2618,37 @@ async fn expire_overdue_queued_operations(
 async fn release_claimed_operation(
     pool: &PgPool,
     input: ReleaseClaimedPublicOperation,
-) -> Result<bool, PublicOperationStoreError> {
+) -> Result<ReleasedClaim, PublicOperationStoreError> {
     let mut tx = pool.begin().await?;
+    // Locked before looking for a delete, so one committing meanwhile is
+    // either seen below or, waiting on this row, sees the requeued create
+    // and cancels it itself.
+    let kind = sqlx::query_scalar::<_, String>(sql!(
+        "SELECT kind
+         FROM public_operations
+         WHERE operation_id = $1
+           AND claim_token = $2
+           AND state = $3
+         FOR UPDATE"
+    ))
+    .bind(input.operation_id.as_uuid())
+    .bind(&input.claim_token)
+    .bind(OperationState::Running.as_str())
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(kind) = kind else {
+        tx.rollback().await?;
+        return Ok(ReleasedClaim::Lost);
+    };
+    if input.cancel_if_superseded
+        && kind == OperationKind::CreateSandbox.as_str()
+        && let Some(delete_id) = superseding_delete_tx(&mut tx, input.operation_id).await?
+    {
+        cancel_superseded_create_tx(&mut tx, input.operation_id, delete_id, input.carried_error)
+            .await?;
+        tx.commit().await?;
+        return Ok(ReleasedClaim::Superseded { delete_id });
+    }
     let updated = sqlx::query_scalar::<_, Uuid>(sql!(
         "UPDATE public_operations
          SET state = $3,
@@ -2254,7 +2687,11 @@ async fn release_claimed_operation(
         .await?;
     }
     tx.commit().await?;
-    Ok(updated.is_some())
+    Ok(if updated.is_some() {
+        ReleasedClaim::Requeued
+    } else {
+        ReleasedClaim::Lost
+    })
 }
 
 async fn gc_expired(

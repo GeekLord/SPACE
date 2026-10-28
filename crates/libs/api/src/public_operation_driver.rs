@@ -16,7 +16,7 @@ use tokio::time::MissedTickBehavior;
 use crate::public_operations::{
     ApiProduct, ClaimedPublicOperation, CompleteClaimedPublicOperation, ExpirePublicOperation,
     FailClaimedPublicOperation, OverdueQueuedPublicOperations, PublicOperationRequeueReason,
-    PublicOperationStore, PublicOperationStoreError, ReleaseClaimedPublicOperation,
+    PublicOperationStore, PublicOperationStoreError, ReleaseClaimedPublicOperation, ReleasedClaim,
 };
 use crate::public_sandbox_operations::PublicOperationExecutionResult;
 
@@ -178,6 +178,7 @@ pub struct TickReport {
     pub retried: usize,
     pub stale_claims: usize,
     pub expired: usize,
+    pub canceled: usize,
 }
 
 impl TickReport {
@@ -188,6 +189,7 @@ impl TickReport {
         self.retried += other.retried;
         self.stale_claims += other.stale_claims;
         self.expired += other.expired;
+        self.canceled += other.canceled;
     }
 }
 
@@ -545,7 +547,7 @@ where
                     }
                     None => retry_hint,
                 };
-                let updated = store
+                let released = store
                     .release_claimed_operation(ReleaseClaimedPublicOperation {
                         claim_token,
                         operation_id,
@@ -555,17 +557,42 @@ where
                         // waits do not consume the transient-failure budget.
                         count_attempt: !preserve_retry_budget,
                         undo_first_start: false,
+                        // A create a later delete supersedes ends rather than
+                        // retrying, so the delete need not wait out its
+                        // retries and the create never runs after it.
+                        cancel_if_superseded: true,
+                        carried_error: Some(with_carried_error(
+                            serde_json::json!({ "last_progress_message": last_progress_message }),
+                            result.terminal_error_json,
+                        )),
                     })
                     .await?;
-                if updated {
-                    report.retried += 1;
-                    pplx_space_metrics::operations::requeued(
-                        api_product_label,
-                        kind.as_str(),
-                        retry_reason,
-                    );
+                match released {
+                    ReleasedClaim::Requeued => {
+                        report.retried += 1;
+                        pplx_space_metrics::operations::requeued(
+                            api_product_label,
+                            kind.as_str(),
+                            retry_reason,
+                        );
+                    }
+                    ReleasedClaim::Superseded { delete_id } => {
+                        report.canceled += 1;
+                        pplx_space_metrics::operations::completed_by(
+                            api_product_label,
+                            kind.as_str(),
+                            OperationState::Canceled.as_str(),
+                            executor_label,
+                        );
+                        tracing::info!(
+                            operation_id = %operation_id,
+                            delete_operation_id = %delete_id,
+                            "public create canceled instead of retried: a later delete supersedes it"
+                        );
+                    }
+                    ReleasedClaim::Lost => {}
                 }
-                updated
+                released != ReleasedClaim::Lost
             }
         }
     };
@@ -581,7 +608,7 @@ where
 /// any fields of the error the requeue `carried` that the evidence lacks. The
 /// carried code replaces the driver's own; see
 /// [`PublicOperationExecutionResult`].
-fn with_carried_error(
+pub(crate) fn with_carried_error(
     mut evidence: serde_json::Value,
     carried: Option<serde_json::Value>,
 ) -> serde_json::Value {

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -14,9 +15,9 @@ use pplx_space_api::public_operation_driver::{
 };
 pub use pplx_space_api::public_operation_driver::{OperationExecutionResult, TickReport};
 use pplx_space_api::public_operations::{
-    ClaimLimits, ClaimPublicOperations, ClaimedPublicOperation, PublicOperationClaim,
+    ClaimLimits, ClaimPublicOperations, ClaimedPublicOperation, OrgSlotLimit, PublicOperationClaim,
     PublicOperationRequeueReason, PublicOperationStore, ReleaseClaimedPublicOperation,
-    TEARDOWN_KINDS,
+    ReleasedClaim, TEARDOWN_KINDS,
 };
 use pplx_space_api::public_sandbox_operations::{
     CreateSandboxOperationExecutor, SandboxLifecycleOperationExecutor,
@@ -62,10 +63,22 @@ const TEARDOWN_RESERVED_SLOTS_ENV: &str =
 /// slots teardowns and other work already hold.
 const DEFAULT_OTHER_RESERVED_SLOTS: u32 = 2;
 const OTHER_RESERVED_SLOTS_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_OTHER_RESERVED_SLOTS";
-/// After a claim that took nothing while only slots kept for teardowns were
-/// free, how long the loop waits before claiming again, unless an execution
-/// finishes first. Other work cannot start in those slots, so until a
-/// teardown is due such a claim reads the whole backlog for nothing.
+/// The most execution slots one organization's operations other than
+/// teardowns may hold while another organization has such work waiting, so
+/// one organization's stuck work cannot hold every slot open to the others.
+const DEFAULT_ORG_SLOT_LIMIT: u32 = 8;
+const ORG_SLOT_LIMIT_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_ORG_SLOT_LIMIT";
+/// While no other organization has work waiting, one organization may go
+/// past its limit, but leaves this many of the free slots open to other
+/// work free, so another organization's work that arrives later can start
+/// without waiting for the first one's executions to end.
+const DEFAULT_ORG_SLOT_HEADROOM: u32 = 2;
+const ORG_SLOT_HEADROOM_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_ORG_SLOT_HEADROOM";
+/// After a claim that took nothing because the organization limit held back
+/// every due operation other than a teardown, or while only slots kept for
+/// teardowns were free, how long the loop waits before claiming again,
+/// unless an execution finishes first. Until then such a claim reads the
+/// whole backlog for nothing.
 const HELD_BACK_CLAIM_BACKOFF: Duration = Duration::from_millis(250);
 const M1_MAX_AGE_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_M1_MAX_AGE_SECS";
 /// How soon an operation handed back because its key is already executing
@@ -87,6 +100,13 @@ pub struct ReconcilerConfig {
     /// while other work is due, however many other work already holds; with
     /// none due, teardowns may use them.
     pub other_reserved_slots: usize,
+    /// The most slots one organization's operations other than teardowns
+    /// may hold while another organization has such work waiting; `None`
+    /// sets no limit.
+    pub org_slot_limit: Option<NonZeroU32>,
+    /// Of the slots open to other work, how many an organization past its
+    /// limit leaves free while no other organization has work waiting.
+    pub org_slot_headroom: usize,
     pub claim_stale_after: Duration,
     pub retry_after: Duration,
     pub max_retry_attempts: i32,
@@ -107,6 +127,8 @@ impl Default for ReconcilerConfig {
             execution_concurrency: DEFAULT_EXECUTION_CONCURRENCY,
             teardown_reserved_slots: DEFAULT_TEARDOWN_RESERVED_SLOTS as usize,
             other_reserved_slots: DEFAULT_OTHER_RESERVED_SLOTS as usize,
+            org_slot_limit: NonZeroU32::new(DEFAULT_ORG_SLOT_LIMIT),
+            org_slot_headroom: DEFAULT_ORG_SLOT_HEADROOM as usize,
             claim_stale_after: DEFAULT_CLAIM_STALE_AFTER,
             retry_after: DEFAULT_RETRY_AFTER,
             max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
@@ -153,6 +175,16 @@ impl ReconcilerConfig {
             other_reserved_slots: config.bounded_u32_allow_zero(
                 OTHER_RESERVED_SLOTS_ENV,
                 DEFAULT_OTHER_RESERVED_SLOTS,
+                MAX_EXECUTION_CONCURRENCY as u32,
+            ) as usize,
+            org_slot_limit: NonZeroU32::new(config.bounded_u32_allow_zero(
+                ORG_SLOT_LIMIT_ENV,
+                DEFAULT_ORG_SLOT_LIMIT,
+                MAX_EXECUTION_CONCURRENCY as u32,
+            )),
+            org_slot_headroom: config.bounded_u32_allow_zero(
+                ORG_SLOT_HEADROOM_ENV,
+                DEFAULT_ORG_SLOT_HEADROOM,
                 MAX_EXECUTION_CONCURRENCY as u32,
             ) as usize,
             claim_stale_after: config.test_duration_secs(
@@ -381,6 +413,8 @@ pub async fn run<E>(
         execution_concurrency = config.execution_concurrency,
         teardown_reserved_slots = slots.teardown_reserved,
         other_reserved_slots = slots.other_reserved,
+        org_slot_limit = config.org_slot_limit.map_or(0, NonZeroU32::get),
+        org_slot_headroom = config.org_slot_headroom,
         keyed_claim_enabled = config.keyed_claim_enabled,
         retry_deferral_enabled = config.retry_deferral_enabled,
         "starting public-operation-dispatcher"
@@ -459,8 +493,11 @@ pub async fn run<E>(
                             finished_meanwhile = true;
                         }
                         let claimed = claim.operations.len();
-                        // Only a teardown could start, and none was due.
-                        claim_backoff_until = (claimed == 0 && claim_slots.free_other == 0 && !finished_meanwhile)
+                        // The organization limit held back all other work,
+                        // or only a teardown could start and none was due.
+                        claim_backoff_until = (claimed == 0
+                            && (claim.org_limit_held_back || claim_slots.free_other == 0)
+                            && !finished_meanwhile)
                             .then(|| Instant::now() + HELD_BACK_CLAIM_BACKOFF);
                         for operation in claim.operations {
                             let key = config
@@ -470,7 +507,8 @@ pub async fn run<E>(
                             if let Some(key) = &key
                                 && let Some(&running) = busy_keys.get(key)
                             {
-                                let retry_after = if running == operation.id {
+                                let executing_here = running == operation.id;
+                                let retry_after = if executing_here {
                                     stale_reclaim_retry_after
                                 } else {
                                     BUSY_KEY_RETRY_AFTER
@@ -480,6 +518,7 @@ pub async fn run<E>(
                                     claim.claim_token.clone(),
                                     operation,
                                     retry_after,
+                                    executing_here,
                                 ));
                                 continue;
                             }
@@ -574,11 +613,14 @@ fn finish_execution(
 
 /// Requeue an operation this process cannot start because another of its
 /// key's operations is still executing here, without charging an attempt.
+/// A create a later delete supersedes ends canceled instead, unless its own
+/// earlier execution, which lost the claim, is what still executes here.
 async fn hand_back_busy_key(
     store: PublicOperationStore,
     claim_token: String,
     operation: ClaimedPublicOperation,
     retry_after: Duration,
+    executing_here: bool,
 ) {
     tracing::warn!(
         operation_id = %operation.id,
@@ -587,7 +629,7 @@ async fn hand_back_busy_key(
         "public-operation-dispatcher claimed an operation whose sandbox is still executing \
          locally; handing it back"
     );
-    if let Err(error) = store
+    match store
         .release_claimed_operation(ReleaseClaimedPublicOperation {
             claim_token,
             operation_id: operation.id,
@@ -595,15 +637,31 @@ async fn hand_back_busy_key(
             retry_after,
             count_attempt: false,
             undo_first_start: operation.is_first_start(),
+            cancel_if_superseded: !executing_here,
+            carried_error: None,
         })
         .await
     {
-        tracing::warn!(
+        Ok(ReleasedClaim::Superseded { delete_id }) => {
+            // Not an execution, so counted as a cancel at enqueue is.
+            pplx_space_metrics::operations::completed(
+                operation.api_product.as_str(),
+                operation.kind.as_str(),
+                OperationState::Canceled.as_str(),
+            );
+            tracing::info!(
+                operation_id = %operation.id,
+                delete_operation_id = %delete_id,
+                "public create canceled instead of handed back: a later delete supersedes it"
+            );
+        }
+        Ok(ReleasedClaim::Requeued | ReleasedClaim::Lost) => {}
+        Err(error) => tracing::warn!(
             operation_id = %operation.id,
             error = %error,
             "public-operation-dispatcher could not hand back a busy-key claim; \
              it becomes claimable once the claim goes stale"
-        );
+        ),
     }
 }
 
@@ -633,7 +691,7 @@ fn log_execution_outcome(
 }
 
 /// How the dispatcher's execution slots are shared between teardowns
-/// (sandbox deletes and kills) and other work.
+/// (sandbox deletes and kills) and other work, and between organizations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SlotPolicy {
     /// Execution slots; at least one.
@@ -646,6 +704,8 @@ struct SlotPolicy {
     /// holds. At most `concurrency` minus `teardown_reserved`, or minus one
     /// without a reservation, so at least one slot stays open to teardowns.
     other_reserved: usize,
+    /// How many slots open to other work one organization may hold.
+    org_slot_limit: Option<OrgSlotLimit>,
 }
 
 impl SlotPolicy {
@@ -659,6 +719,10 @@ impl SlotPolicy {
             other_reserved: config
                 .other_reserved_slots
                 .min(concurrency - teardown_reserved.max(1)),
+            org_slot_limit: config.org_slot_limit.map(|contended| OrgSlotLimit {
+                contended,
+                headroom: u32::try_from(config.org_slot_headroom).unwrap_or(u32::MAX),
+            }),
         }
     }
 
@@ -687,6 +751,7 @@ impl SlotPolicy {
                 .saturating_sub(other_in_flight)
                 .min(free),
             free_teardown_while_other_due: free - self.other_reserved.min(free - owed_to_teardowns),
+            org_slot_limit: self.org_slot_limit,
         }
     }
 }
@@ -700,6 +765,7 @@ struct ClaimSlots {
     free_other: usize,
     /// Free slots teardowns may use while other work is due.
     free_teardown_while_other_due: usize,
+    org_slot_limit: Option<OrgSlotLimit>,
 }
 
 impl ClaimSlots {
@@ -709,6 +775,7 @@ impl ClaimSlots {
         free: usize::MAX,
         free_other: usize::MAX,
         free_teardown_while_other_due: usize::MAX,
+        org_slot_limit: None,
     };
 }
 
@@ -728,6 +795,7 @@ where
             total,
             non_teardown: limit(slots.free_other, total),
             teardown_while_other_due: limit(slots.free_teardown_while_other_due, total),
+            per_org_non_teardown: slots.org_slot_limit,
         },
         claim_stale_after: config.claim_stale_after,
         claimable_kinds: executor.supported_kinds(),
