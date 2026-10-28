@@ -136,12 +136,12 @@ async fn authorize_request(state: &AppState, request: Request) -> Result<Request
             },
             None => SandboxAccessScope::LocalOrg { org_id },
         };
-        let sandbox = state
+        let mut sandbox = state
             .sandbox_controller
             .scoped_sandbox(&state.pool, &scope, sandbox_id.into())
             .await
             .map_err(super::sandboxes::controller_error)?;
-        let Some(sandbox) = sandbox else {
+        if sandbox.is_none() {
             let matched = parts
                 .extensions
                 .get::<axum::extract::MatchedPath>()
@@ -154,24 +154,55 @@ async fn authorize_request(state: &AppState, request: Request) -> Result<Request
                 && relative
                     == Some(pplx_space_public_api::routes::DELETE_SANDBOX.relative_runtime_path())
             {
-                // Deleted targets have no live owner row. Only an exact replay
-                // of an operation in the caller's owner scope may pass; the
-                // handler rechecks idempotency under its admission lock.
-                if let Some(subject_id) = subject_id {
-                    namespace_idempotency_key(&mut parts.headers, subject_id)?;
+                // Deleted targets have no live owner row, and neither has a
+                // target whose create has yet to record it. Only an exact
+                // replay of an operation in the caller's owner scope, or a
+                // create in flight there, may pass. The handler rechecks the
+                // replay under its admission lock and the create org-wide.
+                let namespaced = subject_id
+                    .map(|subject_id| {
+                        let mut headers = parts.headers.clone();
+                        namespace_idempotency_key(&mut headers, subject_id).map(|()| headers)
+                    })
+                    .transpose()?;
+                let headers = namespaced.as_ref().unwrap_or(&parts.headers);
+                let replay = async || {
+                    super::sandboxes::delete_replay_in_owner_scope(
+                        &state.pool,
+                        org_id,
+                        subject_id,
+                        headers,
+                        sandbox_id,
+                    )
+                    .await
+                };
+                let mut admitted = replay().await?
+                    || PublicOperationStore::new(state.pool.clone())
+                        .sandbox_create_in_flight_in_owner_scope(org_id, subject_id, sandbox_id)
+                        .await?;
+                if !admitted {
+                    // A create that succeeds commits its row before it leaves
+                    // queued or running, so one that finished since the first
+                    // read has a row by now.
+                    sandbox = state
+                        .sandbox_controller
+                        .scoped_sandbox(&state.pool, &scope, sandbox_id.into())
+                        .await
+                        .map_err(super::sandboxes::controller_error)?;
+                    // A delete with this key that canceled the create recorded
+                    // the key in the same commit, so a retry that saw the
+                    // create end sees the key.
+                    admitted = sandbox.is_none() && replay().await?;
                 }
-                if super::sandboxes::delete_replay_in_owner_scope(
-                    &state.pool,
-                    org_id,
-                    subject_id,
-                    &parts.headers,
-                    sandbox_id,
-                )
-                .await?
-                {
+                if admitted {
+                    if let Some(headers) = namespaced {
+                        parts.headers = headers;
+                    }
                     return Ok(Request::from_parts(parts, body));
                 }
             }
+        }
+        let Some(sandbox) = sandbox else {
             return Err(PublicApiError::not_found("sandbox not found"));
         };
         if owner.is_some() && sandbox.owner_source != SandboxOwnerSource::FederatedIdentity {

@@ -1125,3 +1125,460 @@ fn federated_idempotency_key_is_checked_before_it_is_hashed() {
     assert!(namespace_idempotency_key(&mut rejected, subject_id).is_err());
     assert_eq!(rejected["idempotency-key"].len(), max + 1, "left unhashed");
 }
+
+async fn operation_outcome(
+    pool: &sqlx::PgPool,
+    operation_id: &Value,
+) -> TestDbResult<(String, Option<Value>)> {
+    let operation_id: OperationId = operation_id.as_str().unwrap().parse()?;
+    let (state, error): (String, Option<sqlx::types::Json<Value>>) = sqlx::query_as(sql!(
+        "SELECT state, terminal_error_json FROM public_operations WHERE operation_id = $1"
+    ))
+    .bind(operation_id.as_uuid())
+    .fetch_one(pool)
+    .await?;
+    Ok((state, error.map(|error| error.0)))
+}
+
+/// A delete that arrives before its sandbox's create has recorded the
+/// sandbox row is admitted, not answered as an unknown sandbox. It cancels
+/// the create, which never runs, and then succeeds with nothing to delete.
+/// Its key replays it before and after it runs; once the create is gone, a
+/// new delete is unknown again.
+#[tokio::test]
+async fn a_delete_before_its_sandboxs_row_exists_cancels_the_create() -> TestDbResult<()> {
+    use crate::controllers::sandbox::SandboxController;
+    use crate::public_operation_driver::{
+        OperationExecutionConfig, OperationExecutor, drive_claimed_operation,
+    };
+    use crate::public_operations::{ClaimLimits, ClaimPublicOperations};
+    use crate::public_sandbox_operations::SandboxLifecycleOperationExecutor;
+    use pplx_space_public_api::OperationKind;
+    use std::time::Duration;
+
+    for owner in [HeaderMap::new(), owner_headers(ORG, "101")] {
+        let fixture = fixture().await?;
+        let pool = &fixture.db.pool;
+        let (status, created) = send(
+            &fixture.app,
+            Method::POST,
+            "/v1/sandboxes",
+            grant_headers(owner.clone()),
+            json!({"template":"seed:latest"}),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::ACCEPTED, "{created}");
+        let path = format!("/v1/sandboxes/{}", created["sandbox_id"].as_str().unwrap());
+        let (status, deleted) = send(
+            &fixture.app,
+            Method::DELETE,
+            &path,
+            owner.clone(),
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::ACCEPTED, "{deleted}");
+        assert_eq!(deleted["sandbox_id"], created["sandbox_id"]);
+        assert_ne!(deleted["operation_id"], created["operation_id"]);
+        let (state, error) = operation_outcome(pool, &created["operation_id"]).await?;
+        assert_eq!(state, "canceled");
+        let error = error.expect("a canceled create carries its error");
+        assert_eq!(error["reason"], "superseded_by_delete");
+        assert_eq!(error["delete_operation_id"], deleted["operation_id"]);
+        let (status, replay) = send(
+            &fixture.app,
+            Method::DELETE,
+            &path,
+            owner.clone(),
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::ACCEPTED, "{replay}");
+        assert_eq!(replay["operation_id"], deleted["operation_id"]);
+
+        let store = PublicOperationStore::new(pool.clone());
+        let mut claim = store
+            .claim_operations(ClaimPublicOperations {
+                limits: ClaimLimits::any(8),
+                claim_stale_after: Duration::from_secs(60),
+                claimable_kinds: &[OperationKind::CreateSandbox, OperationKind::DeleteSandbox],
+            })
+            .await?;
+        let operation = claim.operations.pop().expect("the delete is claimable");
+        assert!(
+            claim.operations.is_empty(),
+            "the canceled create never runs"
+        );
+        assert_eq!(json!(operation.id), deleted["operation_id"]);
+        let executor = SandboxLifecycleOperationExecutor::new(
+            pool.clone(),
+            SandboxController::new(crate::test_support::direct_substrate(pool)),
+        );
+        drive_claimed_operation(
+            store,
+            claim.claim_token,
+            OperationExecutionConfig::default(),
+            operation.clone(),
+            OperationExecutor::Dispatcher,
+            async move { executor.execute(&operation).await.into() },
+        )
+        .await?;
+        let (state, _) = operation_outcome(pool, &deleted["operation_id"]).await?;
+        assert_eq!(state, "succeeded");
+        let rows: i64 = sqlx::query_scalar(sql!("SELECT COUNT(*) FROM sandboxes"))
+            .fetch_one(pool)
+            .await?;
+        assert_eq!(rows, 0);
+
+        let (status, replay) = send(
+            &fixture.app,
+            Method::DELETE,
+            &path,
+            owner.clone(),
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::ACCEPTED, "{replay}");
+        assert_eq!(replay["operation_id"], deleted["operation_id"]);
+        let mut fresh = owner.clone();
+        fresh.insert("idempotency-key", "new-delete".parse()?);
+        let (status, response) =
+            send(&fixture.app, Method::DELETE, &path, fresh, Value::Null).await?;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{response}");
+    }
+    Ok(())
+}
+
+/// A create still in flight lets only its own owner scope delete its
+/// sandbox: every other caller gets the unknown sandbox's 404, and the
+/// create stays queued.
+#[tokio::test]
+async fn a_create_in_flight_is_deletable_only_in_its_owner_scope() -> TestDbResult<()> {
+    let fixture = fixture().await?;
+    let created = create(&fixture, ORG, "101").await?;
+    let path = format!("/v1/sandboxes/{}", created["sandbox_id"].as_str().unwrap());
+    for headers in [
+        owner_headers(ORG, "102"),
+        owner_headers(OTHER_ORG, "101"),
+        HeaderMap::new(),
+    ] {
+        let (status, response) =
+            send(&fixture.app, Method::DELETE, &path, headers, Value::Null).await?;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{response}");
+    }
+    let (state, _) = operation_outcome(&fixture.db.pool, &created["operation_id"]).await?;
+    assert_eq!(state, "queued");
+    Ok(())
+}
+
+/// The create records its row and finishes after the delete's authorization
+/// has missed the row but before it looks for the create, so it finds no
+/// create in flight either. It reads the row again and admits the delete.
+#[tokio::test]
+async fn a_delete_racing_its_creates_row_insert_is_still_admitted() -> TestDbResult<()> {
+    let fixture = fixture().await?;
+    let created = create(&fixture, ORG, "101").await?;
+    let path = format!("/v1/sandboxes/{}", created["sandbox_id"].as_str().unwrap());
+    let app = fixture.app.clone();
+    let (status, deleted) = crate::test_support::finish_create_while_a_request_reads_operations(
+        &fixture.db.pool,
+        created["operation_id"].as_str().unwrap().parse()?,
+        created["sandbox_id"].as_str().unwrap().parse()?,
+        async move {
+            send(
+                &app,
+                Method::DELETE,
+                &path,
+                owner_headers(ORG, "101"),
+                Value::Null,
+            )
+            .await
+        },
+    )
+    .await??;
+    assert_eq!(status, StatusCode::ACCEPTED, "{deleted}");
+    assert_eq!(deleted["sandbox_id"], created["sandbox_id"]);
+    let (state, _) = operation_outcome(&fixture.db.pool, &deleted["operation_id"]).await?;
+    assert_eq!(state, "queued");
+    Ok(())
+}
+
+/// Create a sandbox, claim its create as the dispatcher would, and delete the
+/// sandbox before the create has recorded its row. Answers the create's and
+/// the delete's responses.
+async fn delete_behind_a_running_create(fixture: &Fixture) -> TestDbResult<(Value, Value)> {
+    use crate::public_operations::{ClaimLimits, ClaimPublicOperations};
+    use pplx_space_public_api::OperationKind;
+    use std::time::Duration;
+
+    let created = create(fixture, ORG, "101").await?;
+    let claim = PublicOperationStore::new(fixture.db.pool.clone())
+        .claim_operations(ClaimPublicOperations {
+            limits: ClaimLimits::any(8),
+            claim_stale_after: Duration::from_secs(60),
+            claimable_kinds: &[OperationKind::CreateSandbox],
+        })
+        .await?;
+    assert_eq!(claim.operations.len(), 1, "the create is claimed");
+    let path = format!("/v1/sandboxes/{}", created["sandbox_id"].as_str().unwrap());
+    let (status, deleted) = send(
+        &fixture.app,
+        Method::DELETE,
+        &path,
+        owner_headers(ORG, "101"),
+        Value::Null,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{deleted}");
+    assert_eq!(deleted["sandbox_id"], created["sandbox_id"]);
+    Ok((created, deleted))
+}
+
+/// A delete that arrives while its create runs, before the create has
+/// recorded the sandbox row, is admitted. The running create is left to
+/// finish, and the dispatcher holds the delete behind it.
+#[tokio::test]
+async fn a_delete_while_its_create_runs_before_the_row_exists_waits_for_it() -> TestDbResult<()> {
+    use crate::public_operations::{ClaimLimits, ClaimPublicOperations};
+    use pplx_space_public_api::OperationKind;
+    use std::time::Duration;
+
+    let fixture = fixture().await?;
+    let pool = &fixture.db.pool;
+    let (created, deleted) = delete_behind_a_running_create(&fixture).await?;
+    assert_eq!(
+        operation_outcome(pool, &created["operation_id"]).await?,
+        ("running".to_owned(), None)
+    );
+    let (state, _) = operation_outcome(pool, &deleted["operation_id"]).await?;
+    assert_eq!(state, "queued");
+    let claim = PublicOperationStore::new(pool.clone())
+        .claim_operations(ClaimPublicOperations {
+            limits: ClaimLimits::any(8),
+            claim_stale_after: Duration::from_secs(60),
+            claimable_kinds: &[OperationKind::CreateSandbox, OperationKind::DeleteSandbox],
+        })
+        .await?;
+    assert!(
+        claim.operations.is_empty(),
+        "the delete waits for the running create"
+    );
+    Ok(())
+}
+
+/// Without the keyed claim nothing holds a delete behind its sandbox's
+/// running create. A delete that runs before the create has recorded the
+/// sandbox row must still not finish first, reporting a sandbox the create
+/// then records: it waits, and once the create has recorded the sandbox, it
+/// deletes it.
+#[tokio::test]
+async fn an_unkeyed_delete_waits_for_a_create_yet_to_record_its_row() -> TestDbResult<()> {
+    use crate::controllers::sandbox::SandboxController;
+    use crate::public_operations::{
+        ClaimLimits, ClaimPublicOperations, PublicOperationRequeueReason,
+    };
+    use crate::public_sandbox_operations::SandboxLifecycleOperationExecutor;
+    use pplx_space_public_api::{OperationKind, OperationState};
+    use std::time::Duration;
+
+    let fixture = fixture().await?;
+    let pool = &fixture.db.pool;
+    let (created, deleted) = delete_behind_a_running_create(&fixture).await?;
+    let mut claim = PublicOperationStore::new(pool.clone())
+        .claim_operations_unkeyed(ClaimPublicOperations {
+            limits: ClaimLimits::any(8),
+            claim_stale_after: Duration::from_secs(60),
+            claimable_kinds: &[OperationKind::DeleteSandbox],
+        })
+        .await?;
+    let delete = claim
+        .operations
+        .pop()
+        .expect("the unkeyed claim takes the delete");
+    assert_eq!(json!(delete.id), deleted["operation_id"]);
+    let executor = SandboxLifecycleOperationExecutor::new(
+        pool.clone(),
+        SandboxController::new(crate::test_support::direct_substrate(pool)),
+    );
+
+    let waiting = executor.execute(&delete).await;
+    assert_eq!(
+        waiting.state,
+        OperationState::Queued,
+        "{}",
+        waiting.progress_message
+    );
+    assert_eq!(
+        waiting.requeue_reason,
+        PublicOperationRequeueReason::WorkflowProgress
+    );
+
+    crate::test_support::record_the_row_and_succeed(
+        &mut *pool.acquire().await?,
+        created["operation_id"].as_str().unwrap().parse()?,
+        created["sandbox_id"].as_str().unwrap().parse()?,
+    )
+    .await?;
+    let finished = executor.execute(&delete).await;
+    assert_eq!(
+        finished.state,
+        OperationState::Succeeded,
+        "{}",
+        finished.progress_message
+    );
+    assert_eq!(finished.progress_message, "sandbox delete dispatched");
+    Ok(())
+}
+
+/// As above, but the create records the sandbox and finishes after the
+/// delete's execution has missed the row and before it looks for the create,
+/// so it finds no create in flight either. It reads the row again and
+/// deletes the sandbox, instead of reporting it already deleted.
+#[tokio::test]
+async fn an_unkeyed_delete_racing_its_creates_row_insert_deletes_the_sandbox() -> TestDbResult<()> {
+    use crate::controllers::sandbox::SandboxController;
+    use crate::public_operations::{ClaimLimits, ClaimPublicOperations};
+    use crate::public_sandbox_operations::SandboxLifecycleOperationExecutor;
+    use pplx_space_public_api::{OperationKind, OperationState};
+    use std::time::Duration;
+
+    let fixture = fixture().await?;
+    let pool = &fixture.db.pool;
+    let (created, _) = delete_behind_a_running_create(&fixture).await?;
+    let mut claim = PublicOperationStore::new(pool.clone())
+        .claim_operations_unkeyed(ClaimPublicOperations {
+            limits: ClaimLimits::any(8),
+            claim_stale_after: Duration::from_secs(60),
+            claimable_kinds: &[OperationKind::DeleteSandbox],
+        })
+        .await?;
+    let delete = claim
+        .operations
+        .pop()
+        .expect("the unkeyed claim takes the delete");
+    let executor = SandboxLifecycleOperationExecutor::new(
+        pool.clone(),
+        SandboxController::new(crate::test_support::direct_substrate(pool)),
+    );
+    let finished = crate::test_support::finish_create_while_a_request_reads_operations(
+        pool,
+        created["operation_id"].as_str().unwrap().parse()?,
+        created["sandbox_id"].as_str().unwrap().parse()?,
+        async move { executor.execute(&delete).await },
+    )
+    .await?;
+    assert_eq!(
+        finished.state,
+        OperationState::Succeeded,
+        "{}",
+        finished.progress_message
+    );
+    assert_eq!(finished.progress_message, "sandbox delete dispatched");
+    Ok(())
+}
+
+/// Two requests with one key delete a sandbox whose create has not recorded
+/// its row. The second misses the first's key, then sees the create the
+/// first canceled, and misses the row; it must replay the first, not answer
+/// that the sandbox does not exist.
+#[tokio::test]
+async fn a_same_key_retry_racing_an_early_delete_replays_it() -> TestDbResult<()> {
+    use crate::public_operations::{
+        ApiProduct, CreatePublicOperation, CreatePublicOperationIdempotency,
+        CreatePublicOperationResult,
+    };
+    use crate::public_sandbox_operations::SandboxLifecycleOperationPayload;
+    use crate::routes::public::sandboxes::{
+        lifecycle_method, lifecycle_path_template, lifecycle_request_fingerprint,
+    };
+    use pplx_space_common_core::types::IdempotencyKey;
+    use pplx_space_public_api::{OperationKind, OperationTargetType, SandboxLifecycleAction};
+
+    let fixture = fixture().await?;
+    let pool = &fixture.db.pool;
+    let (status, created) = send(
+        &fixture.app,
+        Method::POST,
+        "/v1/sandboxes",
+        grant_headers(HeaderMap::new()),
+        json!({"template":"seed:latest"}),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{created}");
+    let sandbox_id: PublicSandboxId = created["sandbox_id"].as_str().unwrap().parse()?;
+    let actor: Option<Uuid> = sqlx::query_scalar(sql!(
+        "SELECT actor_user_id FROM public_operations WHERE operation_id = $1"
+    ))
+    .bind(
+        created["operation_id"]
+            .as_str()
+            .unwrap()
+            .parse::<OperationId>()?
+            .as_uuid(),
+    )
+    .fetch_one(pool)
+    .await?;
+
+    // The first delete, admitted in a transaction that holds the operations
+    // locked until the retry waits on them. Outside the pool, which the retry
+    // and the wait draw on.
+    let outside = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with((*pool.connect_options()).clone())
+        .await?;
+    let action = SandboxLifecycleAction::Delete;
+    let key = IdempotencyKey::parse("same-key")?;
+    let fingerprint = lifecycle_request_fingerprint(sandbox_id, action, None)
+        .map_err(|_| "fingerprint the delete")?;
+    let idempotency = CreatePublicOperationIdempotency {
+        method: lifecycle_method(action),
+        path_template: lifecycle_path_template(action),
+        key: &key,
+        request_fingerprint: &fingerprint,
+    };
+    let mut first = PublicOperationStore::new(outside.clone())
+        .begin_operation_admission(
+            OrgId::from_uuid(SEED_ORG_ID),
+            ApiProduct::Native,
+            &idempotency,
+        )
+        .await?;
+    let app = fixture.app.clone();
+    let path = format!("/v1/sandboxes/{sandbox_id}");
+    let retry = crate::test_support::start_a_request_blocked_on_operations(
+        pool,
+        first.transaction(),
+        async move { send(&app, Method::DELETE, &path, HeaderMap::new(), Value::Null).await },
+    )
+    .await?;
+    let target_id = sandbox_id.to_string();
+    let CreatePublicOperationResult::Created(first_id) = first
+        .create(CreatePublicOperation {
+            org_id: OrgId::from_uuid(SEED_ORG_ID),
+            actor_user_id: actor.map(UserId::from_uuid),
+            api_product: ApiProduct::Native,
+            kind: OperationKind::DeleteSandbox,
+            target_type: Some(OperationTargetType::Sandbox),
+            target_id: Some(&target_id),
+            payload_json: SandboxLifecycleOperationPayload {
+                sandbox_id,
+                action,
+                rollback: None,
+            }
+            .into_json(),
+            idempotency: Some(idempotency),
+            traceparent: None,
+        })
+        .await?
+    else {
+        panic!("the first delete is created");
+    };
+
+    outside.close().await;
+    let (status, replay) = retry.await??;
+    assert_eq!(status, StatusCode::ACCEPTED, "{replay}");
+    assert_eq!(replay["operation_id"], json!(first_id));
+    let (state, _) = operation_outcome(pool, &created["operation_id"]).await?;
+    assert_eq!(state, "canceled");
+    Ok(())
+}
