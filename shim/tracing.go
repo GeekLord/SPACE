@@ -24,6 +24,7 @@ type shimSpan interface {
 
 type tracePipeline interface {
 	start(context.Context, string, ...attribute.KeyValue) (shimSpan, context.Context)
+	startChild(context.Context, string, propagation.MapCarrier, ...attribute.KeyValue) (shimSpan, context.Context)
 	// startLinked starts a new root span linked to the context serialized in
 	// the carrier, or an unlinked root when the carrier holds none.
 	startLinked(context.Context, string, propagation.MapCarrier, ...attribute.KeyValue) (shimSpan, context.Context)
@@ -118,6 +119,9 @@ func (disabledTracePipeline) start(ctx context.Context, _ string, _ ...attribute
 func (disabledTracePipeline) startLinked(ctx context.Context, _ string, _ propagation.MapCarrier, _ ...attribute.KeyValue) (shimSpan, context.Context) {
 	return disabledShimSpan{}, ctx
 }
+func (disabledTracePipeline) startChild(ctx context.Context, _ string, _ propagation.MapCarrier, _ ...attribute.KeyValue) (shimSpan, context.Context) {
+	return disabledShimSpan{}, ctx
+}
 func (disabledShimSpan) SetAttributes(...attribute.KeyValue)                 {}
 func (disabledShimSpan) End(error)                                           {}
 func (disabledTracePipeline) inject(context.Context, propagation.MapCarrier) {}
@@ -144,6 +148,10 @@ func initTracer() tracePipeline {
 
 func startSpan(ctx context.Context, name string, attrs ...attribute.KeyValue) (shimSpan, context.Context) {
 	return initTracer().start(ctx, name, attrs...)
+}
+
+func startChildSpan(ctx context.Context, name, traceparent string, attrs ...attribute.KeyValue) (shimSpan, context.Context) {
+	return initTracer().startChild(ctx, name, propagation.MapCarrier{"traceparent": traceparent}, attrs...)
 }
 
 // The span attributes a root that links to its origin records, so a search can

@@ -412,10 +412,9 @@ reaches:
   Each ref saves its latest writer's `traceparent`, except that an unsampled
   writer never replaces a sampled one, and a pass is a root that links to the
   saved contexts of the refs it claimed.
-- Each `shim.create` attempt is a root linked to the context its Pod's
-  annotation carries: kubelet retries a failed pod sandbox with that
-  annotation unchanged, so joining it would collect every attempt in the one
-  trace. The shim's own teardown spans link to their task's create.
+- Each `shim.create` joins its Pod's annotated context; invalid/missing context
+  starts a plain root. Kubelet retries intentionally grow the same trace,
+  distinguished by `task_id`. Teardown still links to its task's create.
 
 The shim's teardown spans, `shim.kill` and `shim.delete` with their
 `shim.sbxmgr.teardown_release` child, wait at most 45 seconds for sbx-manager

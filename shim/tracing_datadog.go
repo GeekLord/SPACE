@@ -117,6 +117,19 @@ func (datadogTracePipeline) startLinked(ctx context.Context, name string, carrie
 	return datadogSpan{span}, tracer.ContextWithSpan(ctx, span)
 }
 
+func (datadogTracePipeline) startChild(ctx context.Context, name string, carrier propagation.MapCarrier, attrs ...attribute.KeyValue) (shimSpan, context.Context) {
+	opts := make([]tracer.StartSpanOption, 0, len(attrs)+1)
+	for _, attr := range attrs {
+		opts = append(opts, tracer.Tag(string(attr.Key), attr.Value.AsInterface()))
+	}
+	if parent, err := tracer.Extract(tracer.TextMapCarrier(carrier)); err == nil && parent != nil {
+		opts = append(opts, tracer.ChildOf(parent))
+	}
+	// Do not inherit an unrelated containerd RPC span when extraction fails.
+	span := tracer.StartSpan(name, opts...)
+	return datadogSpan{span}, tracer.ContextWithSpan(ctx, span)
+}
+
 func (s datadogSpan) SetAttributes(attrs ...attribute.KeyValue) {
 	for _, attr := range attrs {
 		s.span.SetTag(string(attr.Key), attr.Value.AsInterface())

@@ -5,12 +5,15 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"os"
 	"os/exec"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/DataDog/dd-trace-go/v2/ddtrace/ext"
+	"github.com/DataDog/dd-trace-go/v2/ddtrace/tracer"
 	taskAPI "github.com/containerd/containerd/api/runtime/task/v2"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -219,21 +222,24 @@ func exportingOTLPPipeline(t *testing.T, sampler, arg string) (*otlpTracePipelin
 	return &otlpTracePipeline{tracer: provider.Tracer("test"), provider: provider}, exporter
 }
 
-// linkedCreate starts shim.create linked to an origin with the given trace
+// joinedCreate starts shim.create as a child of an origin with the given trace
 // flags, and shim.sbxmgr.create under it, and returns both spans' contexts,
 // the traceparent the child would send on, and the names of the spans
 // exported once both end.
-func linkedCreate(t *testing.T, p *otlpTracePipeline, exporter *tracetest.InMemoryExporter, flags string) (root, child trace.SpanContext, traceparent string, exported []string) {
+func joinedCreate(t *testing.T, p *otlpTracePipeline, exporter *tracetest.InMemoryExporter, flags string) (root, child trace.SpanContext, traceparent string, exported []string) {
 	t.Helper()
 	origin := propagation.MapCarrier{
 		"traceparent": "00-69f2ccfd00000000e88861448bd50939-ea1dc2f49db4d7a9-" + flags,
 	}
-	rootSpan, ctx := p.startLinked(context.Background(), "shim.create", origin)
+	rootSpan, ctx := p.startChild(context.Background(), "shim.create", origin)
 	childSpan, childCtx := p.start(ctx, "shim.sbxmgr.create")
 	outgoing := propagation.MapCarrier{}
 	p.inject(childCtx, outgoing)
 	root = rootSpan.(otlpSpan).SpanContext()
 	child = childSpan.(otlpSpan).SpanContext()
+	if root.TraceID().String() != "69f2ccfd00000000e88861448bd50939" {
+		t.Fatalf("create trace ID %s does not join its origin", root.TraceID())
+	}
 	childSpan.End(nil)
 	rootSpan.End(nil)
 	for _, span := range exporter.GetSpans() {
@@ -251,12 +257,12 @@ func traceparentFlags(t *testing.T, traceparent string) string {
 	return parts[3]
 }
 
-// A sampler that is not parent-based leaves a linked root to its origin and
-// its children to the root: a sampled origin keeps both and sends a sampled
+// A sampler that is not parent-based follows the origin and
+// its children follow create: a sampled origin keeps both and sends a sampled
 // traceparent on.
 func TestAlwaysOnKeepsTheCreateOfASampledOrigin(t *testing.T) {
 	p, exporter := exportingOTLPPipeline(t, "always_on", "")
-	root, child, traceparent, exported := linkedCreate(t, p, exporter, "01")
+	root, child, traceparent, exported := joinedCreate(t, p, exporter, "01")
 	if !root.IsSampled() || !child.IsSampled() {
 		t.Fatalf("root sampled=%t child sampled=%t, want both sampled", root.IsSampled(), child.IsSampled())
 	}
@@ -273,7 +279,7 @@ func TestAlwaysOnKeepsTheCreateOfASampledOrigin(t *testing.T) {
 // send a sampled traceparent to sandbox-manager.
 func TestAlwaysOnKeepsTheCreateOfAnUnsampledOriginUnsampled(t *testing.T) {
 	p, exporter := exportingOTLPPipeline(t, "always_on", "")
-	root, child, traceparent, exported := linkedCreate(t, p, exporter, "00")
+	root, child, traceparent, exported := joinedCreate(t, p, exporter, "00")
 	if root.IsSampled() || child.IsSampled() {
 		t.Fatalf("root sampled=%t child sampled=%t, want neither sampled", root.IsSampled(), child.IsSampled())
 	}
@@ -289,7 +295,7 @@ func TestAlwaysOnKeepsTheCreateOfAnUnsampledOriginUnsampled(t *testing.T) {
 // sample nothing, and keeps its parent's tracestate.
 func TestSampledParentKeepsChildUnderZeroRatio(t *testing.T) {
 	p, exporter := exportingOTLPPipeline(t, "traceidratio", "0")
-	root, ctx := p.startLinked(context.Background(), "shim.create", propagation.MapCarrier{
+	root, ctx := p.startChild(context.Background(), "shim.create", propagation.MapCarrier{
 		"traceparent": "00-69f2ccfd00000000e88861448bd50939-ea1dc2f49db4d7a9-01",
 	})
 	parent := root.(otlpSpan).SpanContext()
@@ -310,6 +316,43 @@ func TestSampledParentKeepsChildUnderZeroRatio(t *testing.T) {
 	}
 	if len(exporter.GetSpans()) != 2 {
 		t.Fatalf("exported %d spans, want root and child", len(exporter.GetSpans()))
+	}
+}
+
+func TestCreateJoinsOrigin(t *testing.T) {
+	t.Setenv("DD_TRACE_ENABLED", "true")
+	t.Setenv("DD_TRACE_PROPAGATION_STYLE", "tracecontext")
+	if err := tracer.Start(tracer.WithAgentAddr("127.0.0.1:1"), tracer.WithLogStartup(false), tracer.WithSendRetries(0)); err != nil {
+		t.Fatal(err)
+	}
+	defer tracer.Stop()
+	otlp, exporter := exportingOTLPPipeline(t, "always_on", "")
+	const origin = "00-11111111111111112222222222222222-3333333333333333-01"
+	for name, p := range map[string]tracePipeline{"otlp": otlp, "datadog": datadogTracePipeline{}} {
+		for _, tc := range []struct{ name, origin, parent string }{
+			{"valid", origin, "3333333333333333"},
+			{"invalid", "invalid", "0000000000000000"},
+			{"missing", "", "0000000000000000"},
+		} {
+			t.Run(name+"/"+tc.name, func(t *testing.T) {
+				exporter.Reset()
+				span, ctx := p.startChild(context.Background(), "shim.create", propagation.MapCarrier{"traceparent": tc.origin})
+				carrier := propagation.MapCarrier{}
+				p.inject(ctx, carrier)
+				span.End(nil)
+				var parent string
+				switch s := span.(type) {
+				case otlpSpan:
+					parent = exporter.GetSpans()[0].Parent.SpanID().String()
+				case datadogSpan:
+					parent = fmt.Sprintf("%016x", s.span.AsMap()[ext.MapSpanParentID])
+				}
+				joined := strings.Contains(carrier["traceparent"], "11111111111111112222222222222222")
+				if parent != tc.parent || joined != (tc.parent != "0000000000000000") {
+					t.Fatalf("parent=%s traceparent=%s", parent, carrier["traceparent"])
+				}
+			})
+		}
 	}
 }
 

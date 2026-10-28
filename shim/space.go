@@ -457,12 +457,9 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 	if requestedSandboxID != nil {
 		createSpanOpts = append(createSpanOpts, attribute.String("sandbox_id", requestedSandboxID.String()))
 	}
-	// Kubelet retries a failed pod sandbox for the same Pod, so every attempt
-	// carries the same annotation context, and nothing the shim receives says
-	// which attempt it is. Each create therefore roots its own trace, linked to
-	// that context, rather than joining it: a crash-looping create is one trace
-	// per attempt, not one trace collecting every attempt.
-	span, ctx := startLinkedSpan(
+	// Every attempt joins the annotated API trace, including kubelet retries.
+	// task_id distinguishes attempts; a crash loop intentionally grows one trace.
+	span, ctx := startChildSpan(
 		ctx,
 		"shim.create",
 		spec.traceparent(),
@@ -2667,7 +2664,7 @@ func parseEgressDestination(destination egressDestinationJSON) (*netpb.EgressDes
 
 // traceparent returns the W3C context of the Rust operation that materialized
 // the Pod. Containerd copies the annotation into the OCI spec so shim.create
-// can link to that trace after asynchronous scheduling.
+// can join that trace after asynchronous scheduling.
 func (s *ociSpec) traceparent() string {
 	return s.Annotations["space.pplx.net/traceparent"]
 }

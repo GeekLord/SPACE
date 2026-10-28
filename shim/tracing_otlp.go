@@ -84,6 +84,12 @@ func (p *otlpTracePipeline) startLinked(ctx context.Context, name string, carrie
 	ctx, span := p.tracer.Start(ctx, name, opts...)
 	return otlpSpan{span}, ctx
 }
+func (p *otlpTracePipeline) startChild(ctx context.Context, name string, carrier propagation.MapCarrier, attrs ...attribute.KeyValue) (shimSpan, context.Context) {
+	parent := trace.SpanContextFromContext(tracePropagation.Extract(context.Background(), carrier))
+	// Mask unrelated spans without discarding caller cancellation.
+	ctx = trace.ContextWithRemoteSpanContext(ctx, parent)
+	return p.start(ctx, name, attrs...)
+}
 func (s otlpSpan) End(err error) {
 	if err != nil {
 		s.RecordError(err)
