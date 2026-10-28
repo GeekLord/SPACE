@@ -184,6 +184,7 @@ pub(crate) fn compressed_rootfs_path(build_dir: &Path) -> PathBuf {
 pub(crate) fn compress_rootfs(
     rootfs_path: &Path,
     compressed_path: &Path,
+    read_mode: crate::file_reader::TemplateReadMode,
 ) -> Result<RootfsZstdStats, RootfsZstdError> {
     let rootfs_size = std::fs::metadata(rootfs_path)
         .map_err(|source| RootfsZstdError::Io {
@@ -222,12 +223,18 @@ pub(crate) fn compress_rootfs(
             operation: "configure compressor workers",
             source,
         })?;
-    let mut reader = BufReader::new(input);
+    let mut reader = read_mode
+        .reader(input)
+        .map_err(|source| RootfsZstdError::Io {
+            operation: "open rootfs reader",
+            path: rootfs_path.display().to_string(),
+            source,
+        })?;
     std::io::copy(&mut reader, &mut encoder).map_err(|source| RootfsZstdError::Zstd {
         operation: "compress rootfs",
         source,
     })?;
-    page_cache::advise_dontneed(reader.get_ref(), rootfs_path, "compress rootfs input");
+    page_cache::advise_dontneed(reader.file(), rootfs_path, "compress rootfs input");
     let mut digesting_output = encoder.finish().map_err(|source| RootfsZstdError::Zstd {
         operation: "finish compressor",
         source,
