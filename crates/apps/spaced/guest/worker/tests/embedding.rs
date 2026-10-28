@@ -2,6 +2,9 @@
 #![cfg(test)]
 
 #[cfg(target_os = "linux")]
+#[path = "embedding/boundary.rs"]
+mod boundary;
+#[cfg(target_os = "linux")]
 #[path = "embedding/identity.rs"]
 mod identity;
 #[cfg(target_os = "linux")]
@@ -10,10 +13,13 @@ mod incompatible;
 #[cfg(target_os = "linux")]
 #[path = "embedding/linux.rs"]
 mod linux;
+#[cfg(target_os = "linux")]
+#[path = "embedding/sigchld.rs"]
+mod sigchld;
 
 #[cfg(target_os = "linux")]
 fn main() {
-    if identity::probe() {
+    if boundary::probe() || identity::probe() {
         return;
     }
     // An intentionally wrong artifact used to test cancellation during startup.
@@ -40,6 +46,8 @@ fn main() {
     if !pplx_space_test_env::root_or_skip("identity-worker embedding") {
         return;
     }
+    // Helper branches above must inspect inherited descriptors before host setup.
+    boundary::isolate_launcher_descriptors();
     let threaded = std::process::Command::new(std::env::current_exe().expect("test executable"))
         .arg("--threaded-worker-probe")
         .env("SPACE_SPACED_FILESYSTEM_WORKER", "1")
@@ -51,13 +59,26 @@ fn main() {
         .status()
         .expect("threaded worker probe");
     assert!(threaded.success(), "late worker dispatch must fail closed");
+    let _caller_handler = sigchld::CallerHandler::install();
+    let boundary = boundary::Boundary::new();
     identity::prepare_host();
     tokio::runtime::Runtime::new()
         .expect("runtime")
-        .block_on(async {
+        .block_on(async move {
+            // Exercise coexistence even on Linux kernels where process waiting
+            // can use pidfds without Tokio's SIGCHLD fallback.
+            let mut child_signals =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
+                    .expect("Tokio SIGCHLD subscription");
             tokio::time::timeout(std::time::Duration::from_secs(30), linux::run())
                 .await
                 .expect("embedding deadline");
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                boundary.run(&mut child_signals),
+            )
+            .await
+            .expect("embedding boundary deadline");
         });
 }
 

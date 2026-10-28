@@ -137,9 +137,11 @@ and error evolution, requires a separate crate-level policy before stabilization
 - `drain()` closes admission and waits up to ten seconds; `drain_with_timeout`
   accepts another duration. Success means admitted operations, physical I/O,
   worker startup/retirement, watch teardown and command supervisors have settled,
-  and owned filesystem workers have been reaped. Passive watches are retired
-  during drain. A caller must continue polling or drop its admitted futures and
-  consume or drop its read/list/process output streams; otherwise graceful drain
+  and owned filesystem workers have been reaped. Long-lived filesystem `watch`
+  streams have no natural completion: worker-backed streams end with recoverable
+  `Unavailable` at close; Direct streams end quietly during drain or cancellation.
+  A caller must continue polling or drop its admitted futures and consume or drop
+  its read/list/process output streams; otherwise graceful drain
   can wait for their input or backpressure. Send required input, close stdin and
   send any signals before closing admission: `send_input`, `close_stdin` and
   `send_signal` are all refused afterward.
@@ -192,11 +194,17 @@ and error evolution, requires a separate crate-level policy before stabilization
 
 This crate retains the running daemon contract. Embedders must provide isolation,
 authorization, account provisioning, final descendant teardown and a Tokio runtime
-with I/O, timers and process support alive through drain. Do not reap owned children
-from another component. Tokio may install a process-wide `SIGCHLD` handler that
-outlives the service; signal-handler neutrality is not promised. The Linux profile
-requires real identity workers and non-root workload accounts. This is not a
-standalone isolation boundary or a portability guarantee.
+with I/O, timers and process support alive through drain. Reap only your own
+child PIDs (for example, with `std::process::Child::wait`), never library-owned
+children or `waitpid(-1, ...)`. A caller notification-only
+`SIGCHLD` handler may be installed before Tokio initializes signal handling;
+Tokio chains it, and callers may also subscribe with `tokio::signal`. Keep that
+handler arrangement intact while the service or its cleanup is alive. Replacing
+it, ignoring or blocking `SIGCHLD`, or setting `SA_NOCLDWAIT` is unsupported.
+Tokio's process-wide handler may outlive the service; signal-handler neutrality
+is not promised. The Linux profile requires real identity workers and non-root
+workload accounts. This is not a standalone isolation boundary or a portability
+guarantee.
 
 The Linux `embedding` integration in the worker app uses the execution crate
 without the guest server. It covers a separate worker artifact, atomic path
@@ -205,7 +213,33 @@ cancelled callers, graceful/repeated drain and worker reaping. It checks child
 IDs/groups and capability sets with and without a PTY, set-ID/file-capability privilege suppression,
 root-account and launcher rejection, working-directory traversal, late worker
 entrypoint rejection, and unchanged authority on every surviving host thread.
-Run it as root in a disposable environment with a provisioned `nobody` account,
+It also checks real cgroup v2 placement for workloads and identity workers,
+PTY/placement/worker descriptors during repeated concurrent worker and PTY
+startup, and caller ownership of unrelated children through drain. Placement
+handles must be opened atomically close-on-exec; `ExecutionCgroups::new` neither
+validates nor changes their flags. The probe checks that precondition, a
+preinstalled SIGCHLD notification handler, a Tokio signal subscriber, and
+PID-specific caller reaping. A redirected descendant survives drain, then exits
+when the caller tears down its workload cgroup.
+
+Before any library work, the single-threaded test host marks launcher-inherited
+descriptors above stderr close-on-exec, keeping them usable in the host. Child
+probes still inspect every inherited descriptor without an allowlist, so newly
+leaked library descriptors remain visible.
+
+The concurrent descriptor check samples unrelated execs during 16 startup
+rounds. It detects leaks only when an exec overlaps the inheritable window; it
+does not guarantee a spawn in each round or detection of microsecond
+open-then-fcntl races. Local negative controls widened the PTY and worker-socket
+windows to 50 ms to verify detection, not to measure detection rates for shorter
+windows.
+
+Run it as root in a disposable container with a private cgroup v2 namespace
+(`--privileged --cgroupns private`) and a writable `/sys/fs/cgroup`. Explicitly
+set `SPACE_TEST_EXECUTION_PRIVATE_CGROUP_NS=1` to authorize creation and
+cleanup of a test-owned subtree; the test never moves the host or kills the root
+cgroup. These prerequisites apply to the whole `embedding` test, including its
+existing identity suite. The environment also needs a provisioned `nobody` account,
 `CAP_NET_RAW` and `CAP_SETFCAP`, and a writable filesystem that supports executable
 set-ID and file capabilities (not `nosuid`), using
 `cargo test -p pplx-space-spaced-guest-worker --test embedding`.
@@ -214,8 +248,13 @@ lookup and filesystem syscalls open across cancellation, assert incomplete drain
 and then release them to observe completion. They cover every closed entrypoint,
 borrowed uploads and output backpressure. Kind/Firecracker covers the daemon
 integration separately; privileged container tests do not replace it. Other Linux
-architectures, real caller cgroup placement and downstream packaging require their
-own acceptance evidence.
+architectures and downstream packaging require their own acceptance evidence.
+The placement unit test uses kernel-authenticated sender credentials on the
+placement write and an executable that cannot be loaded: placement must happen
+in the forked child before exec can fail. The real cgroup probe additionally
+verifies membership by start publication and inherited descendant membership.
+These checks cover placement and caller teardown, not resource limits or
+a complete sandbox isolation policy.
 
 The proposed support profile, ownership contract, and implementation acceptance
 criteria are in the [embedding RFC](../../../../../docs/space/rfcs/2026-10-06-guest-execution-embedding.md).
