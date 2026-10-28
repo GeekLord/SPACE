@@ -589,8 +589,12 @@ pub async fn auto_lifecycle_policy(
 }
 
 /// Ownership evidence for deciding whether a timeout needs a live mutation.
-/// The caller must lock the sandbox row before reading this record and keep
-/// that lock through policy persistence. A missing route alone is not absence.
+/// A caller that persists a policy, or that concludes a `started` row has no
+/// runtime, must lock the sandbox row before this read and hold the lock
+/// through persistence. A read without the lock sees only committed state; a
+/// caller that writes nothing may act on it only if being ordered before any
+/// writer still holding the row lock is acceptable. A missing route alone is
+/// not absence.
 #[derive(Debug, sqlx::FromRow)]
 pub struct AutoLifecycleExecution {
     pub managed_by: String,

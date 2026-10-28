@@ -131,7 +131,7 @@ their last known values across a daemon restart.
 
 ## The flags SPACE reads
 
-Eight keys. The **subject** is what a percentage rollout hashes, so it decides
+The **subject** is what a percentage rollout hashes, so it decides
 what a fractional rule splits on; the **attributes** are what a targeting rule
 can match on beyond the subject.
 
@@ -140,6 +140,7 @@ can match on beyond the subject.
 | `space-cluster-rate-limiter` | boolean | constant `space-cluster` | none | on |
 | `space-api-client-concurrency-limiter` | boolean | constant `space-cluster` | none | on |
 | `space-api-client-concurrency-quotas` | JSON object | constant `space-cluster` | none | env-configured caps |
+| `space-api-timeout-lock-bypass` | boolean | canonical sandbox UUID string | none | off |
 | `space-net-gateway-known-egress-domains` | JSON object | sandbox id | none | the deployment's local list |
 | `space-cluster-api-client-side-balancing` | boolean | `sandbox:`/`session:`/`org:` prefixed id | `cluster_id` | off |
 | `space-native-create-pool-claim` | boolean | constant `space-cluster` | none | off |
@@ -152,6 +153,22 @@ that would enable new behavior fall back **off**. All three JSON keys fall back
 to whatever their deployment configured locally rather than to a value chosen
 here, because an override that resolves nothing should leave local
 configuration standing — see `policy::override_allowed`.
+
+`space-api-timeout-lock-bypass` lets a timeout update that leaves the policy
+unchanged skip the sandbox row lock when one unlocked read settles runtime
+presence: the sandbox is created, paused or suspended, or started with a known
+execution generation. Policy changes, a mismatched expected policy, other
+started rows, transitions and terminal states still take the lock. The API
+reads the flag on every timeout call with the sandbox UUID as subject. Define
+it as a boolean that defaults to `false` in the deployment's provider (the
+flagd reference file already does), then enable it for selected sandbox UUIDs
+before raising the percentage. Setting it back to `false` restores locking once
+the provider serves the change; requests already past the check keep their
+decision. With no provider, an unready provider or no assignment it reads
+`false`; a disconnected provider may keep serving its last configuration. No
+worker rollout or migration is needed. The counter
+`sandbox.api.timeout_update.lock_decision` records, per call, whether the lock
+was skipped and why it was not.
 
 `space-native-hidden-operations` opens hidden native operations to an org, so
 its env master, `SPACE_NATIVE_HIDDEN_OPERATIONS_FLAG_ENABLED` (on by default),
