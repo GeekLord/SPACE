@@ -2967,6 +2967,7 @@ fn check_manifest_digests_for_target(
     Ok(())
 }
 
+#[tracing::instrument(skip_all, err)]
 async fn materialize_rootfs(
     manifest: &pplx_space_common_core::types::TemplateManifest,
     digest_dir: &str,
@@ -3045,13 +3046,16 @@ async fn materialize_rootfs(
     let phase_started = Instant::now();
     let decompress_futs = decompress_jobs.into_iter().map(
         |(compressed, uncompressed, expected_digest, policy)| async move {
+            let span = tracing::Span::current();
             tokio::task::spawn_blocking(move || {
-                crate::rootfs_zstd::decompress_rootfs(
-                    Path::new(&compressed),
-                    Path::new(&uncompressed),
-                    Some(&expected_digest),
-                    policy,
-                )
+                span.in_scope(|| {
+                    crate::rootfs_zstd::decompress_rootfs(
+                        Path::new(&compressed),
+                        Path::new(&uncompressed),
+                        Some(&expected_digest),
+                        policy,
+                    )
+                })
             })
             .await
         },
@@ -3156,15 +3160,18 @@ async fn materialize_rootfs(
         .algorithm();
     let hash_source = rootfs_path.to_string();
     let phase_started = Instant::now();
+    let span = tracing::Span::current();
     let (rootfs_hash, rootfs_size) = match tokio::task::spawn_blocking(move || {
-        backing_policy
-            .prepare_raw(Path::new(&hash_source))
-            .map_err(|source| crate::rootfs_zstd::RootfsZstdError::Io {
-                operation: "set raw rootfs backing policy",
-                path: hash_source.clone(),
-                source,
-            })?;
-        crate::rootfs_zstd::hash_rootfs_file(Path::new(&hash_source), algorithm)
+        span.in_scope(|| {
+            tracing::info_span!("rootfs.raw_setup")
+                .in_scope(|| backing_policy.prepare_raw(Path::new(&hash_source)))
+                .map_err(|source| crate::rootfs_zstd::RootfsZstdError::Io {
+                    operation: "set raw rootfs backing policy",
+                    path: hash_source.clone(),
+                    source,
+                })?;
+            crate::rootfs_zstd::hash_rootfs_file(Path::new(&hash_source), algorithm)
+        })
     })
     .await
     {

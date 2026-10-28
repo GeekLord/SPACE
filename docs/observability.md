@@ -1029,6 +1029,26 @@ settings to that worker does not create a privileged route through the guest
 boundary. Do not open guest access to the Collector just to make its direct
 exporter work; guest telemetry needs an independently reviewed collection path.
 
+## Rootfs materialization
+
+Template pulls trace `materialize_rootfs` under `pull_in_scope`. Its
+`decompress_rootfs` child has `rootfs.setup`, `rootfs.pipeline` (with a
+`rootfs.finalize` child for the tail and thread joins), `rootfs.verify` and
+`rootfs.publish`. The uncompressed path uses `rootfs.raw_setup` and
+`hash_rootfs_file`.
+
+Each concurrent stage gets a `rootfs.stage` span with a `stage` of `decode`,
+`compressed_input`, `compressed_hash`, `decoded_hash`, `writer` or `raw_hash`,
+and records `busy_ms`, `recv_wait_ms`, `send_wait_ms`, `wall_ms` and `bytes`
+when it ends, including on error. Counters are taken once per pooled chunk.
+On success only, the decoder also records `read_ms` (inclusive zstd read
+time; `busy_ms` subtracts the nested compressed-input time), and the writer
+records `data_bytes` and `hole_bytes` (logical sparse classification). A
+failed stage span carries just the common fields.
+
+The stage with high `busy_ms` and low waits is the limiter. Stage wall times
+overlap and must not be added, and busy is elapsed time, not CPU time.
+
 ## Reconnect attribution baseline
 
 Measure ECW reconnects at the API HTTP server span, including both
