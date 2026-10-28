@@ -18,6 +18,7 @@ reflink = ["sparse-read", "dep:tempfile"]
 aead-stream = { workspace = true, features = ["alloc"] }
 aes-gcm = { workspace = true }
 libc = { workspace = true }
+pplx-space-stopwatch = { workspace = true }
 rand = { workspace = true }
 rustix = { workspace = true, features = ["fs"], optional = true }
 thiserror = { workspace = true }
