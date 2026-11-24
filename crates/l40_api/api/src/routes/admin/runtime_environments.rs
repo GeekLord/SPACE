@@ -55,7 +55,7 @@ use time::OffsetDateTime;
 use pplx_space_runtime_upgrade_campaign_store::{self as campaign_store, CampaignId, CampaignKind};
 
 use super::audit::{self, AdminRuntimeEnvironmentAuditEntry};
-use super::node_store::{AdminNodeRow, AdminNodeStore};
+use super::node_store::{self, AdminNodeRow, AdminNodeStore};
 use super::runtime_environment_store as store;
 use super::runtime_upgrade_campaigns::campaign_read_error;
 use super::support::{
@@ -533,12 +533,15 @@ async fn first_default_template_campaign(
     // An environment reference that doesn't parse can't be a campaign's
     // source.
     let mut sources: BTreeSet<EnvironmentReference> =
-        store::template_release_environments(&mut *tx)
-            .await
-            .map_err(|err| Box::new(read_db_error(err)))?
-            .iter()
-            .filter_map(|environment| environment.parse().ok())
-            .collect();
+        pplx_space_template_release_store::lookup::release_environments(
+            &mut *tx,
+            pplx_space_execution_catalog::catalog::initial_environment_reference(),
+        )
+        .await
+        .map_err(|err| Box::new(read_db_error(err)))?
+        .iter()
+        .filter_map(|environment| environment.parse().ok())
+        .collect();
     sources.extend(
         campaign_store::list_unfinished(&mut *tx)
             .await
@@ -1082,7 +1085,7 @@ fn node_status(
     row: AdminNodeRow,
     now: OffsetDateTime,
 ) -> NodeRuntimePolicyStatus {
-    let enforced = row.execution_policy();
+    let enforced = node_store::execution_policy(&row);
     let applied_generation = enforced
         .as_ref()
         .and_then(|(policy, _)| policy.applied_generation());

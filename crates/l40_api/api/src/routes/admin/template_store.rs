@@ -7,11 +7,8 @@
 //! template row so two operators cannot race the in-use guards.
 
 use pplx_space_accounts::OrgId;
-
-use pplx_space_sandbox_portability::failed_repair_revert_eligibility;
-use pplx_space_sql_locator::sql;
-use pplx_space_template_model::{TemplateDesiredState, TemplateName, TemplateVisibility};
-use sqlx::{FromRow, Postgres, Transaction};
+use pplx_space_template_model::{TemplateName, TemplateVisibility};
+use sqlx::{Postgres, Transaction};
 use time::OffsetDateTime;
 
 /// Whether a template row named `template_name` exists and is not deleted:
@@ -20,13 +17,7 @@ pub(super) async fn template_exists(
     executor: impl sqlx::PgExecutor<'_>,
     template_name: &TemplateName,
 ) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(sql!(
-        "SELECT EXISTS (SELECT 1 FROM templates WHERE name = $1 AND desired_state <> $2)"
-    ))
-    .bind(template_name.as_str())
-    .bind(TemplateDesiredState::Deleted.as_str())
-    .fetch_one(executor)
-    .await
+    pplx_space_template_store::templates::exists_not_deleted(executor, template_name).await
 }
 
 /// What an organization's `templates` rows are, as far as deleting the
@@ -55,29 +46,16 @@ pub(super) async fn org_template_rows(
     executor: impl sqlx::PgExecutor<'_>,
     org_id: OrgId,
 ) -> Result<OrgTemplateRows, sqlx::Error> {
-    let (live, held, retained_until) =
-        sqlx::query_as::<_, (Option<bool>, Option<bool>, Option<OffsetDateTime>)>(sql!(
-            "SELECT bool_or(t.desired_state <> $2),
-                    bool_or(
-                        EXISTS (
-                            SELECT 1 FROM template_releases r WHERE r.template_name = t.name
-                        )
-                        OR EXISTS (
-                            SELECT 1
-                              FROM node_template_inventory i
-                             WHERE i.template_name = t.name
-                        )
-                    ),
-                    MAX(COALESCE(t.delete_requested_at, t.updated_at, t.created_at))
-                        + make_interval(secs => $3)
-               FROM templates t
-              WHERE t.org_id = $1"
-        ))
-        .bind(org_id)
-        .bind(TemplateDesiredState::Deleted.as_str())
-        .bind(pplx_space_sandbox_store::DELETED_SANDBOX_RETENTION.as_secs_f64())
-        .fetch_one(executor)
-        .await?;
+    let pplx_space_template_store::templates::OrgTemplates {
+        any_live: live,
+        any_held: held,
+        retained_until,
+    } = pplx_space_template_store::templates::org_templates(
+        executor,
+        org_id,
+        pplx_space_sandbox_store::DELETED_SANDBOX_RETENTION,
+    )
+    .await?;
     Ok(match (live, held, retained_until) {
         (Some(true), _, _) => OrgTemplateRows::Live,
         (Some(false), Some(true), _) => OrgTemplateRows::DeletedOnly {
@@ -88,12 +66,7 @@ pub(super) async fn org_template_rows(
     })
 }
 
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct TemplateVisibilityRow {
-    pub(super) name: String,
-    pub(super) org_id: Option<OrgId>,
-    pub(super) visibility: TemplateVisibility,
-}
+pub(super) type TemplateVisibilityRow = pplx_space_template_store::templates::VisibilityOwner;
 
 /// `SELECT ... FOR UPDATE` — the visibility write and its guards share one
 /// lock window on the template row.
@@ -101,12 +74,7 @@ pub(super) async fn lock_template_for_update(
     tx: &mut Transaction<'_, Postgres>,
     template_name: &str,
 ) -> Result<Option<TemplateVisibilityRow>, sqlx::Error> {
-    sqlx::query_as::<_, TemplateVisibilityRow>(sql!(
-        "SELECT name, org_id, visibility FROM templates WHERE name = $1 FOR UPDATE"
-    ))
-    .bind(template_name)
-    .fetch_optional(&mut **tx)
-    .await
+    pplx_space_template_store::templates::lock_visibility(tx, template_name).await
 }
 
 /// Sandboxes still referencing the template: anything not terminally gone
@@ -135,19 +103,7 @@ pub(super) async fn template_sandboxes_in_use_in_tx(
     // lifecycle/placement stamps a failed transition leaves behind, which the
     // placement-freshness snapshot predicates are not. A `failed` row with no
     // restorable snapshot stays excluded: it is genuinely gone.
-    let eligible = failed_repair_revert_eligibility("s").eligible;
-    let query = format!(
-        "SELECT COUNT(*)::BIGINT
-           FROM sandboxes s
-          WHERE s.template_id = $1
-            AND (
-                 s.lifecycle NOT IN ('failed', 'deleted')
-                 OR (s.lifecycle = 'failed' AND {eligible})
-            )"
-    );
-    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(template_name)
-        .fetch_one(&mut **tx)
+    pplx_space_sandbox_store::template_usage::template_sandboxes_in_use(&mut **tx, template_name)
         .await
 }
 
@@ -161,51 +117,8 @@ pub(super) async fn template_cached_rootfs_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     template_name: &str,
 ) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar::<_, i64>(sql!(
-        "SELECT COUNT(*)::BIGINT FROM node_template_inventory WHERE template_name = $1"
-    ))
-    .bind(template_name)
-    .fetch_one(&mut **tx)
-    .await
-}
-
-/// `true` when the template carries an owner-scoped encryption sidecar —
-/// either the per-template DEK (`template_encrypted_fields`) or a per-release
-/// storage-location DEK (`template_release_storage_location_encrypted_fields`,
-/// reached through the release its location belongs to). Widening such a
-/// template to `generic` would publish content wrapped under one org's key to
-/// every org — the "launchable-but-undecryptable" state the org-scoped
-/// templates RFC forbids. The re-key-on-widen transition is deferred to the
-/// encryption follow-up, so v1 refuses the widen rather than performing it.
-///
-/// Both sidecar tables are credential-fenced: `space_user` (the general
-/// application pool the visibility transaction runs on) has no grant on them,
-/// so this existence check runs on the credential pool as its own read rather
-/// than inside the flip transaction. The sidecars are written at
-/// template-encrypt time and do not change during a visibility flip, so an
-/// unlocked read here is consistent with the flip's other best-effort
-/// quiescence guards.
-pub(super) async fn template_has_owner_encryption(
-    credentials_pool: &sqlx::PgPool,
-    template_name: &str,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(sql!(
-        "SELECT EXISTS (
-                 SELECT 1 FROM template_encrypted_fields WHERE template_name = $1
-             )
-             OR EXISTS (
-                 SELECT 1
-                   FROM template_release_storage_location_encrypted_fields e
-                   JOIN template_release_storage_locations l
-                     ON l.id = e.template_release_storage_location_id
-                   JOIN template_releases r
-                     ON r.id = l.template_release_id
-                  WHERE r.template_name = $1
-             )"
-    ))
-    .bind(template_name)
-    .fetch_one(credentials_pool)
-    .await
+    pplx_space_node_template_inventory_store::template_inventory_rows(&mut **tx, template_name)
+        .await
 }
 
 /// Write the new visibility, assigning an owner in the same statement when
@@ -218,18 +131,13 @@ pub(super) async fn update_template_visibility_in_tx(
     visibility: TemplateVisibility,
     new_org_id: Option<OrgId>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!(
-        "UPDATE templates
-            SET visibility = $2,
-                org_id = COALESCE($3, org_id)
-          WHERE name = $1"
-    ))
-    .bind(template_name)
-    .bind(visibility)
-    .bind(new_org_id)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
+    pplx_space_template_store::templates::update_visibility(
+        &mut **tx,
+        template_name,
+        visibility,
+        new_org_id,
+    )
+    .await
 }
 
 /// After a narrowing flip to owner `owner_org_id`, allowlist rows naming
@@ -243,18 +151,12 @@ pub(super) async fn prune_cross_org_compat_in_tx(
     template_name: &str,
     owner_org_id: OrgId,
 ) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(sql!(
-        "DELETE FROM node_group_template_compat c
-          USING node_groups g
-          WHERE c.node_group_id = g.id
-            AND c.template_name = $1
-            AND g.org_id IS DISTINCT FROM $2"
-    ))
-    .bind(template_name)
-    .bind(owner_org_id)
-    .execute(&mut **tx)
-    .await?;
-    Ok(result.rows_affected())
+    pplx_space_node_group_store::prune_cross_org_template_compat(
+        &mut **tx,
+        template_name,
+        owner_org_id,
+    )
+    .await
 }
 
 /// Postgres-backed regression tests for the visibility-flip guards and the

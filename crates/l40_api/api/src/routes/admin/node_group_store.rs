@@ -2,10 +2,18 @@
 //! endpoints.
 //!
 //! Handlers in [`super::node_groups`] stay focused on HTTP, auth, invariant
-//! orchestration, and audit logging; the SQL strings, row structs, and
-//! transaction-bound helpers live here. Multi-step guarded writes (assign-org,
-//! set-default, delete) lock the group row `FOR UPDATE` and run their residue
-//! checks inside the same transaction so two operators cannot race a guard.
+//! orchestration, and audit logging; the helpers they call live here.
+//! Multi-step guarded writes (assign-org, set-default, delete) lock the group
+//! row `FOR UPDATE` and run their residue checks inside the same transaction so
+//! two operators cannot race a guard. This module keeps no statements of its
+//! own: the template `FOR SHARE` read is `pplx-space-template-store`'s
+//! `templates::share_lock_visibilities`; the node-group and allowlist
+//! statements, the group reads and the group-row and default-row locks among
+//! them, are verbs of `pplx-space-node-group-store`; the cached-template count
+//! is `pplx-space-node-template-inventory-store`'s, the occupancy count is
+//! `pplx-space-sandbox-store`'s and the organization check is
+//! `pplx-space-accounts-store`'s; each runs on the pool or transaction its
+//! helper is given.
 
 use pplx_space_accounts::OrgId;
 
@@ -13,52 +21,14 @@ use std::collections::HashMap;
 
 use pplx_space_node_model::NodeGroupId;
 use pplx_space_node_model::{NodeGroupName, NodeGroupTemplatePolicy};
-use pplx_space_sql_locator::sql;
-use pplx_space_template_model::TemplateVisibility;
-use sqlx::{FromRow, PgPool, Postgres, Transaction};
-use time::OffsetDateTime;
+use sqlx::{PgPool, Postgres, Transaction};
 
 use super::node_store::SandboxOccupancy;
 
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct NodeGroupRow {
-    pub(super) id: NodeGroupId,
-    pub(super) name: NodeGroupName,
-    pub(super) org_id: Option<OrgId>,
-    pub(super) template_policy: NodeGroupTemplatePolicy,
-    pub(super) is_default: bool,
-    pub(super) created_at: OffsetDateTime,
-    pub(super) nodes_count: i64,
-}
+pub(super) use pplx_space_node_group_store::groups::NodeGroupRow;
 
 /// Template fields consulted when validating a `restricted` allowlist entry.
-#[derive(Debug, Clone, FromRow)]
-pub(super) struct CompatTemplateRow {
-    pub(super) name: String,
-    pub(super) visibility: TemplateVisibility,
-    pub(super) org_id: Option<OrgId>,
-}
-
-// `nodes_count` counts worker rows only — node groups are worker pools, and
-// builder/cluster rows always sit at `node_group_id` NULL because the mirror
-// stamps workers only. For the singleton default group the count also
-// includes NULL-membership workers: an unlabeled (or unknown-label) worker
-// mirrors as NULL, which the data model resolves to the default generic
-// group — without the `is_default` arm the shared pool would report zero
-// nodes until every worker is explicitly labeled. (A correlated subquery
-// rather than a GROUP BY join because this SELECT also backs
-// `FOR UPDATE OF g`, which Postgres forbids alongside GROUP BY.)
-const NODE_GROUP_SELECT: &str = "SELECT g.id,
-       g.name,
-       g.org_id,
-       g.template_policy,
-       g.is_default,
-       g.created_at,
-       (SELECT COUNT(*) FROM nodes n
-         WHERE n.role = 'worker'
-           AND (n.node_group_id = g.id
-                OR (g.is_default AND n.node_group_id IS NULL)))::BIGINT AS nodes_count
-FROM node_groups g";
+pub(super) type CompatTemplateRow = pplx_space_template_store::templates::VisibilityOwner;
 
 /// Pool-bound repository for node-group reads. Guarded writes that need a
 /// `FOR UPDATE` lock live as free functions below, since a `Transaction`
@@ -77,20 +47,11 @@ impl AdminNodeGroupStore {
         &self,
         node_group_id: NodeGroupId,
     ) -> Result<Option<NodeGroupRow>, sqlx::Error> {
-        sqlx::query_as::<_, NodeGroupRow>(sqlx::AssertSqlSafe(sql!(format!(
-            "{NODE_GROUP_SELECT}\nWHERE g.id = $1"
-        ))))
-        .bind(node_group_id)
-        .fetch_optional(&self.pool)
-        .await
+        pplx_space_node_group_store::groups::node_group(&self.pool, node_group_id).await
     }
 
     pub(super) async fn list(&self) -> Result<Vec<NodeGroupRow>, sqlx::Error> {
-        sqlx::query_as::<_, NodeGroupRow>(sqlx::AssertSqlSafe(sql!(format!(
-            "{NODE_GROUP_SELECT}\nORDER BY g.name ASC"
-        ))))
-        .fetch_all(&self.pool)
-        .await
+        pplx_space_node_group_store::groups::node_groups(&self.pool).await
     }
 
     /// Allowlist template names per group in one round trip. Groups with no
@@ -102,18 +63,13 @@ impl AdminNodeGroupStore {
         if node_group_ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let rows: Vec<(NodeGroupId, String)> = sqlx::query_as(sql!(
-            "SELECT node_group_id, template_name
-               FROM node_group_template_compat
-              WHERE node_group_id = ANY($1::UUID[])
-              ORDER BY template_name ASC"
-        ))
-        .bind(node_group_ids)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows =
+            pplx_space_node_group_store::compat_templates(&self.pool, node_group_ids).await?;
         let mut map: HashMap<NodeGroupId, Vec<String>> = HashMap::new();
-        for (group_id, template_name) in rows {
-            map.entry(group_id).or_default().push(template_name);
+        for row in rows {
+            map.entry(row.node_group_id)
+                .or_default()
+                .push(row.template_name);
         }
         Ok(map)
     }
@@ -138,12 +94,7 @@ pub(super) fn violated_constraint(err: &sqlx::Error) -> Option<String> {
 /// blocks the seeding permanently, and no admin route can clear it (the default
 /// cannot be deleted or un-defaulted). See the caller.
 pub(super) async fn generic_node_group_exists(pool: &PgPool) -> Result<bool, sqlx::Error> {
-    let count: i64 = sqlx::query_scalar(sql!(
-        "SELECT COUNT(*) FROM node_groups WHERE org_id IS NULL"
-    ))
-    .fetch_one(pool)
-    .await?;
-    Ok(count > 0)
+    pplx_space_node_group_store::generic_node_group_exists(pool).await
 }
 
 /// Insert a new group. The id is an application-generated UUIDv7; all
@@ -159,16 +110,16 @@ pub(super) async fn insert_node_group(
     is_default: bool,
 ) -> Result<NodeGroupId, sqlx::Error> {
     let id = NodeGroupId::new();
-    sqlx::query(sql!(
-        "INSERT INTO node_groups (id, name, org_id, template_policy, is_default)
-         VALUES ($1, $2, $3, $4, $5)"
-    ))
-    .bind(id)
-    .bind(name)
-    .bind(org_id)
-    .bind(template_policy)
-    .bind(is_default)
-    .execute(pool)
+    pplx_space_node_group_store::insert_node_group(
+        pool,
+        pplx_space_node_group_store::NewNodeGroup {
+            id,
+            name,
+            org_id,
+            template_policy,
+            is_default,
+        },
+    )
     .await?;
     Ok(id)
 }
@@ -180,12 +131,7 @@ pub(super) async fn lock_group_for_update(
     tx: &mut Transaction<'_, Postgres>,
     node_group_id: NodeGroupId,
 ) -> Result<Option<NodeGroupRow>, sqlx::Error> {
-    sqlx::query_as::<_, NodeGroupRow>(sqlx::AssertSqlSafe(sql!(format!(
-        "{NODE_GROUP_SELECT}\nWHERE g.id = $1\nFOR UPDATE OF g"
-    ))))
-    .bind(node_group_id)
-    .fetch_optional(&mut **tx)
-    .await
+    pplx_space_node_group_store::groups::lock_node_group(tx, node_group_id).await
 }
 
 /// Lock the current default group's row (if any) and return its id.
@@ -196,11 +142,7 @@ pub(super) async fn lock_group_for_update(
 pub(super) async fn lock_current_default_for_update(
     tx: &mut Transaction<'_, Postgres>,
 ) -> Result<Option<NodeGroupId>, sqlx::Error> {
-    sqlx::query_scalar::<_, NodeGroupId>(sql!(
-        "SELECT id FROM node_groups WHERE is_default FOR UPDATE"
-    ))
-    .fetch_optional(&mut **tx)
-    .await
+    pplx_space_node_group_store::locks::lock_default_node_group(tx).await
 }
 
 /// In-transaction sandbox occupancy across every node currently mirrored
@@ -247,18 +189,11 @@ pub(super) async fn stranded_cached_templates_in_tx(
     node_group_id: NodeGroupId,
     new_org_id: Option<OrgId>,
 ) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar::<_, i64>(sql!(
-        "SELECT COUNT(*)::BIGINT
-           FROM node_template_inventory nti
-           JOIN nodes n ON n.id = nti.node_id
-           JOIN templates t ON t.name = nti.template_name
-          WHERE n.node_group_id = $1
-            AND t.visibility = 'org_specific'
-            AND ($2::UUID IS NULL OR t.org_id IS DISTINCT FROM $2)"
-    ))
-    .bind(node_group_id)
-    .bind(new_org_id)
-    .fetch_one(&mut **tx)
+    pplx_space_node_template_inventory_store::stranded_org_specific_templates(
+        &mut **tx,
+        node_group_id,
+        new_org_id,
+    )
     .await
 }
 
@@ -266,12 +201,7 @@ pub(super) async fn org_exists_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     org_id: OrgId,
 ) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(sql!(
-        "SELECT EXISTS(SELECT 1 FROM organizations WHERE id = $1)"
-    ))
-    .bind(org_id)
-    .fetch_one(&mut **tx)
-    .await
+    pplx_space_accounts_store::organizations::organization_exists(&mut **tx, org_id).await
 }
 
 /// Apply an org assignment/release. When `reset_policy` is set (any org
@@ -287,25 +217,15 @@ pub(super) async fn update_group_org_in_tx(
     reset_policy: bool,
 ) -> Result<(), sqlx::Error> {
     if reset_policy {
-        sqlx::query(sql!(
-            "DELETE FROM node_group_template_compat WHERE node_group_id = $1"
-        ))
-        .bind(node_group_id)
-        .execute(&mut **tx)
-        .await?;
+        pplx_space_node_group_store::clear_template_compat(&mut **tx, node_group_id).await?;
     }
-    sqlx::query(sql!(
-        "UPDATE node_groups
-            SET org_id = $2,
-                template_policy = CASE WHEN $3 THEN 'default' ELSE template_policy END
-          WHERE id = $1"
-    ))
-    .bind(node_group_id)
-    .bind(new_org_id)
-    .bind(reset_policy)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
+    pplx_space_node_group_store::update_node_group_org(
+        &mut **tx,
+        node_group_id,
+        new_org_id,
+        reset_policy,
+    )
+    .await
 }
 
 /// Move the singleton default flag onto `node_group_id`. The caller has
@@ -315,18 +235,8 @@ pub(super) async fn move_default_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     node_group_id: NodeGroupId,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!(
-        "UPDATE node_groups SET is_default = FALSE WHERE is_default"
-    ))
-    .execute(&mut **tx)
-    .await?;
-    sqlx::query(sql!(
-        "UPDATE node_groups SET is_default = TRUE WHERE id = $1"
-    ))
-    .bind(node_group_id)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
+    pplx_space_node_group_store::clear_default_node_group(&mut **tx).await?;
+    pplx_space_node_group_store::set_default_node_group(&mut **tx, node_group_id).await
 }
 
 /// Delete the group row. Compat rows cascade; the `nodes.node_group_id` FK
@@ -335,11 +245,7 @@ pub(super) async fn delete_group_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     node_group_id: NodeGroupId,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!("DELETE FROM node_groups WHERE id = $1"))
-        .bind(node_group_id)
-        .execute(&mut **tx)
-        .await?;
-    Ok(())
+    pplx_space_node_group_store::delete_node_group(&mut **tx, node_group_id).await
 }
 
 /// Set the template policy. Moving to `default` clears the allowlist in the
@@ -351,21 +257,10 @@ pub(super) async fn set_template_policy_in_tx(
     policy: NodeGroupTemplatePolicy,
 ) -> Result<(), sqlx::Error> {
     if matches!(policy, NodeGroupTemplatePolicy::Default) {
-        sqlx::query(sql!(
-            "DELETE FROM node_group_template_compat WHERE node_group_id = $1"
-        ))
-        .bind(node_group_id)
-        .execute(&mut **tx)
-        .await?;
+        pplx_space_node_group_store::clear_template_compat(&mut **tx, node_group_id).await?;
     }
-    sqlx::query(sql!(
-        "UPDATE node_groups SET template_policy = $2 WHERE id = $1"
-    ))
-    .bind(node_group_id)
-    .bind(policy)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
+    pplx_space_node_group_store::set_node_group_template_policy(&mut **tx, node_group_id, policy)
+        .await
 }
 
 /// Fetch the template rows named by a proposed allowlist so the handler can
@@ -382,12 +277,7 @@ pub(super) async fn templates_by_names_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     names: &[String],
 ) -> Result<Vec<CompatTemplateRow>, sqlx::Error> {
-    sqlx::query_as::<_, CompatTemplateRow>(sql!(
-        "SELECT name, visibility, org_id FROM templates WHERE name = ANY($1::TEXT[]) FOR SHARE"
-    ))
-    .bind(names)
-    .fetch_all(&mut **tx)
-    .await
+    pplx_space_template_store::templates::share_lock_visibilities(tx, names).await
 }
 
 /// Replace the group's allowlist with `names` (full-set PUT semantics).
@@ -396,24 +286,11 @@ pub(super) async fn replace_compat_in_tx(
     node_group_id: NodeGroupId,
     names: &[String],
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(sql!(
-        "DELETE FROM node_group_template_compat WHERE node_group_id = $1"
-    ))
-    .bind(node_group_id)
-    .execute(&mut **tx)
-    .await?;
+    pplx_space_node_group_store::clear_template_compat(&mut **tx, node_group_id).await?;
     if names.is_empty() {
         return Ok(());
     }
-    sqlx::query(sql!(
-        "INSERT INTO node_group_template_compat (node_group_id, template_name)
-         SELECT $1, name FROM UNNEST($2::TEXT[]) AS t(name)"
-    ))
-    .bind(node_group_id)
-    .bind(names)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
+    pplx_space_node_group_store::insert_template_compat(&mut **tx, node_group_id, names).await
 }
 
 /// Postgres-backed regression tests for the node-group store: the schema

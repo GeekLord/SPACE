@@ -10,14 +10,15 @@ use crate::metrics::sandbox::api::RequestedKind;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
-use pplx_space_node_model::{NodeDrainPhase, NodeDrainState, NodeManagedBy, NodeRole};
+use pplx_space_node_model::{NodeDrain, NodeDrainPhase, NodeManagedBy, NodeRole};
+use pplx_space_node_registration_store::drain_reads;
 use pplx_space_postgres_pool::contention;
-use pplx_space_sandbox_portability::portable_for_restore_affinity;
 use pplx_space_sandbox_store as sandbox_store;
 use pplx_space_sandbox_store::delete::{mark_deleting, restore_lifecycle_from_deleting};
 use pplx_space_sandbox_store::fork_source_lifecycle::{
     active_fork_source_operation_exists, lock_fork_source_lifecycle,
 };
+#[cfg(test)]
 use pplx_space_sql_locator::sql;
 use user_admission::{UserLifecycleRequest, admit_user_lifecycle};
 
@@ -183,22 +184,20 @@ async fn begin_delete_against_active_fork(
     if active_fork {
         return Err(fork_in_progress_conflict());
     }
-    let previous_lifecycle = sqlx::query_scalar::<_, String>(sql!(
-        "SELECT lifecycle FROM sandboxes WHERE id = $1 FOR UPDATE"
-    ))
-    .bind(sandbox_id)
-    .fetch_optional(&mut *guard)
-    .await
-    .map_err(|error| db_contention_error("failed to read sandbox lifecycle before delete", &error))?
-    .map(|lifecycle| {
-        lifecycle
-            .parse::<pplx_space_sandbox_model::SandboxLifecycle>()
-            .map_err(|error| {
-                tracing::error!(%sandbox_id, %error, "sandbox has invalid lifecycle before delete");
-                ControllerError::internal("sandbox has invalid lifecycle")
-            })
-    })
-    .transpose()?;
+    let previous_lifecycle = sandbox_store::row_locks::lock_lifecycle(&mut guard, sandbox_id)
+        .await
+        .map_err(|error| {
+            db_contention_error("failed to read sandbox lifecycle before delete", &error)
+        })?
+        .map(|lifecycle| {
+            lifecycle
+                .parse::<pplx_space_sandbox_model::SandboxLifecycle>()
+                .map_err(|error| {
+                    tracing::error!(%sandbox_id, %error, "sandbox has invalid lifecycle before delete");
+                    ControllerError::internal("sandbox has invalid lifecycle")
+                })
+        })
+        .transpose()?;
     mark_deleting(&mut guard, sandbox_id)
         .await
         .map_err(|error| db_contention_error("failed to persist sandbox delete intent", &error))?;
@@ -1087,18 +1086,6 @@ async fn run_stop_or_kill(
     }
 }
 
-/// The drain gate's single read of the sandbox row and its primary node.
-#[derive(sqlx::FromRow)]
-struct DrainGateRow {
-    portable: bool,
-    drain_phase: Option<NodeDrainPhase>,
-    drain_mode: Option<String>,
-    /// Whether `COALESCE(target_node_id, active_node_id)` names a node row.
-    primary_found: bool,
-    /// Whether that node has a `node_k8s` row.
-    mapped: bool,
-}
-
 /// Fetch the `drain_phase` of the node that the next placement-affecting
 /// call would land on. This must mirror `preferred_restore_node_name`'s
 /// resolution priority, otherwise a guard placed in front of the substrate
@@ -1143,13 +1130,14 @@ struct DrainGateRow {
 pub(super) async fn fetch_active_node_drain_state(
     pool: &PgPool,
     sandbox_id: SandboxId,
-) -> Result<Option<NodeDrainState>, sqlx::Error> {
+) -> Result<Option<NodeDrain>, sqlx::Error> {
     // Suspended-or-restoring sandboxes with a fresh ready S3 snapshot are
     // portable — restore can land them on any healthy node, so a drain phase
     // on their historical placement is no longer a reason to block
     // placement-affecting calls. Skip the rest of the gate in that case via
-    // the shared portability predicate. The `lifecycle IN ('suspended',
-    // 'restoring')` scope is load-bearing: for `started` / `paused` the
+    // the shared portability predicate `portable_for_restore_affinity`, which
+    // `placement_gate` reads. The `lifecycle IN ('suspended', 'restoring')`
+    // scope is load-bearing: for `started` / `paused` the
     // canonical state lives in the VM's live memory on the source node, not
     // in the snapshot, so a ready prior-cycle snapshot is stale relative to
     // the live VM and must not release the gate. `restoring` is included
@@ -1161,21 +1149,7 @@ pub(super) async fn fetch_active_node_drain_state(
     // sandbox row, so they are one statement: a snapshot at least as
     // consistent as the two reads it replaces. `portable` is only consulted
     // first; the primary columns are ignored when it is true.
-    let portable_predicate = portable_for_restore_affinity("s");
-    let gate_query = format!(
-        "SELECT COALESCE(({portable_predicate}), FALSE) AS portable,
-                n.drain_phase,
-                n.drain_mode,
-                n.id IS NOT NULL AS primary_found,
-                EXISTS (SELECT 1 FROM node_k8s nk WHERE nk.node_id = n.id) AS mapped
-           FROM sandboxes s
-           LEFT JOIN nodes n ON n.id = COALESCE(s.target_node_id, s.active_node_id)
-          WHERE s.id = $1"
-    );
-    let gate: Option<DrainGateRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql!(gate_query.as_str())))
-        .bind(sandbox_id)
-        .fetch_optional(pool)
-        .await?;
+    let gate = sandbox_store::placement_gate::placement_gate(pool, sandbox_id).await?;
     if gate.as_ref().is_some_and(|row| row.portable) {
         return Ok(None);
     }
@@ -1197,14 +1171,14 @@ pub(super) async fn fetch_active_node_drain_state(
     // would 409 on a node nothing is going to touch.
     let primary_mapped = primary.as_ref().is_some_and(|(_, _, mapped)| *mapped);
     let primary_state =
-        primary.and_then(|(phase, mode, _)| NodeDrainState::from_columns(phase, mode.as_deref()));
+        primary.and_then(|(phase, mode, _)| NodeDrain::from_v1_columns(phase, mode.as_deref()));
     // Return early **only** when the primary actually blocks. A non-blocking
     // primary must still fall through to the executions fallback, because
     // `preferred_restore_node_name` uses that fallback when the primary has no
     // `node_k8s` mapping — so it, not the primary, is the node placement lands
     // on. Short-circuiting on a gentle primary would mask a forced or
     // terminating fallback and let wake/access race an evacuation there.
-    if primary_state.is_some_and(NodeDrainState::blocks_placement) {
+    if primary_state.is_some_and(NodeDrain::blocks_placement) {
         return Ok(primary_state);
     }
     // A non-blocking *mapped* primary is the whole answer: placement resolves to
@@ -1221,18 +1195,8 @@ pub(super) async fn fetch_active_node_drain_state(
     // Fallback: the latest `sandbox_k8s_executions.k8s_node_name`. The
     // unique index on (sandbox_id, generation) makes the LIMIT 1
     // deterministic per sandbox.
-    let latest_k8s_name: Option<String> = sqlx::query_scalar(sql!(
-        "SELECT ske.k8s_node_name
-           FROM sandbox_k8s_executions ske
-          WHERE ske.sandbox_id = $1
-            AND ske.k8s_node_name IS NOT NULL
-          ORDER BY ske.generation DESC
-          LIMIT 1"
-    ))
-    .bind(sandbox_id)
-    .fetch_optional(pool)
-    .await?
-    .flatten();
+    let latest_k8s_name =
+        pplx_space_sandbox_store::k8s_executions::latest_k8s_node_name(pool, sandbox_id).await?;
     let Some(k8s_node_name) = latest_k8s_name else {
         return Ok(primary_state);
     };
@@ -1248,19 +1212,12 @@ pub(super) async fn fetch_active_node_drain_state(
     // whether the gate fires. Preferring a blocking sibling happens below, in
     // Rust, so the mode policy stays where `from_column_str` is rather than
     // being restated in an `ORDER BY`.
-    let siblings: Vec<(NodeDrainPhase, Option<String>)> = sqlx::query_as(sql!(
-        "SELECT n.drain_phase, n.drain_mode
-           FROM node_k8s nk
-           JOIN nodes n ON n.id = nk.node_id
-          WHERE nk.k8s_node_name = $1
-            AND n.drain_phase IS NOT NULL"
-    ))
-    .bind(k8s_node_name)
-    .fetch_all(pool)
-    .await?;
-    let siblings: Vec<NodeDrainState> = siblings
+    let siblings = drain_reads::draining_nodes_for_k8s_node_name(pool, &k8s_node_name).await?;
+    let siblings: Vec<NodeDrain> = siblings
         .into_iter()
-        .filter_map(|(phase, mode)| NodeDrainState::from_columns(Some(phase), mode.as_deref()))
+        .filter_map(|node| {
+            NodeDrain::from_v1_columns(Some(node.drain_phase), node.drain_mode.as_deref())
+        })
         .collect();
     // Precedence: any blocking candidate wins, whichever side it came from; else
     // the primary if it had a phase at all (so a caller can still see "draining,
@@ -1276,12 +1233,9 @@ pub(super) async fn fetch_active_node_drain_state(
 /// Build the 409 returned when a drained-node guard fires. Centralised so
 /// the explicit-action path and the implicit-wake path return identically
 /// shaped errors.
-pub(super) fn drain_block_conflict(
-    action: SandboxAction,
-    phase: NodeDrainPhase,
-) -> ControllerError {
+pub(super) fn drain_block_conflict(action: SandboxAction, drain: NodeDrain) -> ControllerError {
     ControllerError::conflict(format!(
-        "sandbox cannot {action} while its resident node is {phase}; \
+        "sandbox cannot {action} while its resident node is {drain}; \
          the node-drain reconciler is migrating it off"
     ))
 }
@@ -1296,7 +1250,7 @@ pub(super) fn drain_block_conflict(
 ///
 /// Returns 409 when the resolved node is `drained` or `terminating`, or is
 /// `draining` under a **forced** drain. A gentle drain does not block — see
-/// [`NodeDrainState::blocks_placement`].
+/// [`NodeDrain::blocks_placement`].
 pub(super) async fn ensure_resolved_node_not_draining(
     pool: &PgPool,
     sandbox_id: SandboxId,
@@ -1310,7 +1264,7 @@ pub(super) async fn ensure_resolved_node_not_draining(
     if let Some(state) = drain_state
         && state.blocks_placement()
     {
-        return Err(drain_block_conflict(action, state.phase));
+        return Err(drain_block_conflict(action, state));
     }
     Ok(())
 }
@@ -1458,7 +1412,8 @@ impl SandboxController {
         // self-healing (retry the DELETE once the upload finalizes).
         let phase_started = std::time::Instant::now();
         tracing::info!(sandbox_id = %id, phase = "snapshot_precheck", result = "started", "sandbox delete phase started");
-        let snapshot_precheck = in_flight_snapshot_upload_idle_for(pool, id).await;
+        let snapshot_precheck =
+            pplx_space_snapshot_store::upload::in_flight_idle_for(pool, id).await;
         tracing::info!(
             sandbox_id = %id,
             phase = "snapshot_precheck",

@@ -13,14 +13,15 @@ use pplx_space_admin_protocol::{
     AdminNodeStatusSnapshot, DrainRequest, ForceUploadFailure, ForceUploadLocalSnapshotsResponse,
     GetAdminNodeFilters, ListAdminNodesFilters,
 };
-use pplx_space_node_model::{NodeDrainMode, NodeDrainPhase, NodeDrainState, NodeManagedBy};
+use pplx_space_node_model::{NodeDrain, NodeDrainMode, NodeDrainPhase, NodeManagedBy};
+use pplx_space_node_registration_store::direct;
 use pplx_space_sandbox_model::SandboxId;
 use pplx_space_sandbox_residency::{NODE_CENSUS_RESIDENCY_ENV, ResidencyEvidence};
 use pplx_space_sandbox_store::StoredSandboxLifecycle;
+use pplx_space_sandbox_store::admin_occupancy;
 use pplx_space_sandbox_store::node_placements::{
     self, NodePlacementChangeCursor, NodePlacementChangeRow, NodePlacementFilter,
 };
-use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -437,7 +438,7 @@ fn admin_node_status(row: &AdminNodeRow) -> Option<AdminNodeStatusSnapshot> {
             .as_ref()
             .zip(row.execution_inventory_received_at)
             .map(|(status, received_at)| {
-                let (policy, policy_received_at) = match row.execution_policy() {
+                let (policy, policy_received_at) = match node_store::execution_policy(row) {
                     Some((policy, received_at)) => (Some(policy), received_at.map(format_time)),
                     None => (None, None),
                 };
@@ -769,7 +770,7 @@ fn parse_sort(raw: Option<&str>) -> Result<AdminNodeSort, (StatusCode, Json<serd
 /// **Do not set the env var from a test and expect this to see it.** The first
 /// caller in a test binary fixes the value for every later test in that process,
 /// silently. Tests that need a specific policy pass it explicitly to
-/// [`node_store::sandbox_occupancy_for_node_in_tx`] and
+/// [`pplx_space_sandbox_store::admin_occupancy::terminate_occupancy`] and
 /// [`node_store::AdminNodeStore::occupancy_for_nodes`], which is why both take
 /// the evidence as a parameter rather than calling this.
 fn cluster_residency_evidence() -> ResidencyEvidence {
@@ -1024,12 +1025,7 @@ pub(super) async fn list_node_sandboxes(
                 {
                     Ok(rows) => rows
                         .into_iter()
-                        .map(|row| node_store::NodeSandboxRow {
-                            id: row.id,
-                            lifecycle: row.lifecycle.as_str().to_owned(),
-                            active_node_id: row.active_node_id,
-                            target_node_id: row.target_node_id,
-                        })
+                        .map(node_store::NodeSandboxRow::from)
                         .collect(),
                     Err(err) => return db_error(err).into_response(),
                 };
@@ -1648,7 +1644,7 @@ async fn apply_drain_action(
         Err(err) => return db_error(err).into_response(),
     };
 
-    let current = match node_store::lock_node_for_update(&mut tx, node_id).await {
+    let current: AdminNodeRow = match direct::lock_admin_node(&mut tx, node_id).await {
         Ok(Some(row)) => row,
         Ok(None) => {
             return api_error(StatusCode::NOT_FOUND, "Node not found").into_response();
@@ -1832,8 +1828,8 @@ async fn apply_drain_action(
     //   but reads `group_occupancy_in_tx`, which is not census-aware.
     //   Its refusal to move an organization can therefore count phantom rows.
     if matches!(action, DrainAction::Terminate) {
-        let occupancy = match node_store::sandbox_occupancy_for_node_in_tx(
-            &mut tx,
+        let occupancy = match pplx_space_sandbox_store::admin_occupancy::terminate_occupancy(
+            &mut *tx,
             node_id,
             cluster_residency_evidence(),
         )
@@ -2071,17 +2067,20 @@ const FORCE_UPLOAD_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_
 const FORCE_UPLOAD_MAX_PER_INVOCATION: usize = 32;
 
 /// Hard cap on how many pinned-local-only sandbox IDs the
-/// `list_pinned_local_only_sandboxes` query can enumerate per call.
+/// `admin_occupancy::pinned_local_only_sandboxes` query can enumerate per
+/// call.
 ///
 /// The handler processes the first `FORCE_UPLOAD_MAX_PER_INVOCATION`
 /// IDs and reports the remaining `ENUMERATION_CAP - MAX_PER_INVOCATION`
-/// IDs in `deferred[]` for operator visibility. The query passes
-/// `LIMIT cap + 1` so the response can flip `truncated: true` when
-/// the actual pinned-list size exceeds the cap, signalling that
-/// re-invoking will keep finding new work. Bounds the DB transfer
-/// and JSON response size to O(1) regardless of how big the pinned
-/// list is on a backlogged node.
+/// IDs in `deferred[]` for operator visibility. The query's page is
+/// `cap + 1` ([`admin_occupancy::FORCE_UPLOAD_PAGE`], a literal `LIMIT` in
+/// its statement, asserted below) so the response can flip
+/// `truncated: true` when the actual pinned-list size exceeds the cap,
+/// signalling that re-invoking will keep finding new work. Bounds the DB
+/// transfer and JSON response size to O(1) regardless of how big the
+/// pinned list is on a backlogged node.
 pub(super) const FORCE_UPLOAD_ENUMERATION_CAP: usize = 256;
+const _: () = assert!(FORCE_UPLOAD_ENUMERATION_CAP + 1 == admin_occupancy::FORCE_UPLOAD_PAGE.get());
 
 /// Maximum acceptable wall-clock for the handler. The
 /// `:force-upload-local-snapshots` route lives under the admin API,
@@ -2109,7 +2108,7 @@ const _: () = {
 ///
 /// Enumerates every suspended sandbox whose `target_node_id` still pins
 /// it to this node **and** whose snapshot has not yet been registered
-/// to S3 (via [`node_store::list_pinned_local_only_sandboxes`]), then
+/// to S3 (via [`admin_occupancy::pinned_local_only_sandboxes`]), then
 /// calls the controller's `enqueue_suspended_snapshot_backup` per sandbox. That
 /// RPC enqueues a durable-worker upload on the on-node sbx-mgr; the
 /// worker lands a `state='ready'` row in `snapshots` +
@@ -2135,9 +2134,7 @@ const _: () = {
 /// source indentation into the message unless every line ends in a `\`
 /// continuation, which is invisible in review and shows up as runs of spaces in
 /// the API response.
-fn force_upload_gate_open_message(
-    drain_state: Option<NodeDrainState>,
-) -> (&'static str, &'static str) {
+fn force_upload_gate_open_message(drain_state: Option<NodeDrain>) -> (&'static str, &'static str) {
     match drain_state {
         None => (
             "conflict: node is not draining",
@@ -2191,7 +2188,7 @@ async fn apply_force_upload_local_snapshots(
     // canonical S3 copy.
     //
     // So the precondition is not "the node is draining" — it is "the gate is
-    // currently closed", which is exactly `NodeDrainState::blocks_placement`.
+    // currently closed", which is exactly `NodeDrain::refuses_activations`.
     // Those coincided until drain modes existed. They no longer do: a **gentle**
     // drain leaves the gate open on purpose, so it fails this check even though
     // its `drain_phase` is non-NULL. `drained` and `terminating` still pass in
@@ -2204,7 +2201,7 @@ async fn apply_force_upload_local_snapshots(
         .map(NodeDrainPhase::parse)
         .transpose()
     {
-        Ok(phase) => NodeDrainState::from_columns(phase, node.drain_mode.as_deref()),
+        Ok(phase) => NodeDrain::from_v1_columns(phase, node.drain_mode.as_deref()),
         Err(err) => {
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2213,7 +2210,7 @@ async fn apply_force_upload_local_snapshots(
             .into_response();
         }
     };
-    if !drain_state.is_some_and(NodeDrainState::blocks_placement) {
+    if !drain_state.is_some_and(NodeDrain::refuses_activations) {
         let (error, detail) = force_upload_gate_open_message(drain_state);
         audit::record(AdminAuditEntry {
             actor: &actor,
@@ -2224,7 +2221,7 @@ async fn apply_force_upload_local_snapshots(
             to_phase: None,
             from_drain_mode: None,
             replace_after_terminate: None,
-            drain_mode: drain_state.map(|state| state.mode),
+            drain_mode: drain_state.and_then(NodeDrain::mode),
             success: false,
             error: Some(error),
             outcome_counts: None,
@@ -2236,21 +2233,16 @@ async fn apply_force_upload_local_snapshots(
             .into_response();
     }
 
-    // `LIMIT cap + 1` so a returned slice of length `cap + 1` is the
-    // unambiguous "more pinned sandboxes exist beyond what's listed"
+    // The page is `cap + 1` rows so a returned slice of length `cap + 1` is
+    // the unambiguous "more pinned sandboxes exist beyond what's listed"
     // signal — we trim the sentinel row and flip `truncated: true`
     // on the response.
     // `cap + 1` so a full page is distinguishable from a page that merely
     // filled the cap exactly, which is what flips `truncated` below.
-    let enumeration_limit = NonZeroUsize::new(FORCE_UPLOAD_ENUMERATION_CAP + 1)
-        .expect("FORCE_UPLOAD_ENUMERATION_CAP + 1 is a positive constant");
-    let pinned =
-        match node_store::list_pinned_local_only_sandboxes(&state.pool, node_id, enumeration_limit)
-            .await
-        {
-            Ok(rows) => rows,
-            Err(err) => return db_error(err).into_response(),
-        };
+    let pinned = match admin_occupancy::pinned_local_only_sandboxes(&state.pool, node_id).await {
+        Ok(rows) => rows,
+        Err(err) => return db_error(err).into_response(),
+    };
 
     let mut response = ForceUploadLocalSnapshotsResponse {
         node_id,

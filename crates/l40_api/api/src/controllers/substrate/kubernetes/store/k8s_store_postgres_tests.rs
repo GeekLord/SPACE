@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use pplx_space_db_test_fixtures::{TestDb, pg_test_db_with_max_connections};
 use pplx_space_k8s_node_id::space_k8s_node_id;
-use pplx_space_sandbox_portability::portable_for_restore_affinity;
+use pplx_space_sandbox_portability::{fresh_ready_snapshot_exists, portable_for_restore_affinity};
 use time::OffsetDateTime;
 
 use super::*;
@@ -15,6 +15,7 @@ use super::*;
 use pplx_space_test_env::TestResult;
 
 mod cleanup_recovery_lifecycle_matrix_tests;
+mod delete_publication_lock_order_tests;
 mod lifecycle_writer_tests;
 mod materialization_record_tests;
 mod node_registration_tests;

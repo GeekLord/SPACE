@@ -30,7 +30,6 @@ mod readiness_stub {
 #[cfg(not(feature = "kubernetes"))]
 pub use readiness_stub::ReflectorReady;
 
-use pplx_space_sql_locator::sql;
 use std::{
     collections::{BTreeMap, HashMap},
     future::Future,
@@ -74,7 +73,6 @@ use pplx_space_node_api_client::{
     },
 };
 use pplx_space_public_api::OperationId;
-use pplx_space_sandbox_portability::deleting_snapshot_matches_artifact;
 use pplx_space_sbx_mgr_client::proto::SpacedWaitReadyRequest;
 use time::OffsetDateTime;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -414,13 +412,10 @@ pub(crate) async fn persist_optional_current_local_artifact(
         .begin()
         .await
         .db_context("failed to start current local artifact transaction")?;
-    let sandbox_exists =
-        sqlx::query_scalar::<_, Uuid>(sql!("SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"))
-            .bind(sandbox_id.as_uuid())
-            .fetch_optional(&mut *tx)
-            .await
-            .db_context("failed to lock sandbox for current local artifact")?
-            .is_some();
+    let sandbox_exists = pplx_space_sandbox_store::row_locks::lock_id(&mut tx, sandbox_id)
+        .await
+        .db_context("failed to lock sandbox for current local artifact")?
+        .is_some();
     if !sandbox_exists {
         tx.rollback()
             .await
@@ -2694,6 +2689,8 @@ fn backup_source_to_proto(
     }
 }
 
+// A forwarding impl that omits a defaulted method silently gives both substrates the default.
+#[deny(clippy::missing_trait_methods)]
 impl SubstrateAdapter for Substrate {
     fn managed_by(&self) -> &'static str {
         match &self.inner {

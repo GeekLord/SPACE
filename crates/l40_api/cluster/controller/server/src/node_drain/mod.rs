@@ -207,6 +207,8 @@ pub use crate::drained_node_terminator::{
 
 #[cfg(feature = "kubernetes")]
 pub mod aws;
+#[cfg(test)]
+pub(crate) mod guarded_delete;
 #[cfg(feature = "kubernetes")]
 pub mod kube_delete;
 pub mod noop;
@@ -626,7 +628,7 @@ pub struct ReconcilerConfig {
     /// the flag reaches — both halves of it, this pre-check and the completion
     /// write's guard scope, which is why two call sites read the field. The
     /// other half of the decision is therefore *reachability*, not safety, and
-    /// it is **conditional on the drain mode**. `NodeDrainState::blocks_placement`
+    /// it is **conditional on the drain mode**. `NodeDrain::blocks_placement`
     /// 409s a user `start` on a `drained` node in either mode;
     /// `blocks_user_calls_while_draining` is `matches!(self, Self::Forced)`, so a
     /// `draining` node blocks that `start` under a forced drain and leaves it
@@ -678,7 +680,7 @@ pub struct ReconcilerConfig {
     /// promise is that it does not touch residents, and a stopped evacuation
     /// does touch one: it gives up the node-local copy, after which a `start`
     /// is a retryable 503 until the re-placement lands. Under forced that
-    /// window costs nothing new — `NodeDrainState::blocks_placement` already
+    /// window costs nothing new — `NodeDrain::blocks_placement` already
     /// 409s a `start` on a forced-draining node for the whole drain — while
     /// under gentle it would be the first disruption the mode has ever caused.
     /// It also covers the motivating case as-is: a managed node group rollout
@@ -1110,7 +1112,7 @@ pub trait NodeDrainSink: Send + Sync + 'static {
     /// `fresh_ready_snapshot_exists` SQL fragment so this count
     /// agrees with `drained_node_terminator::count_local_snapshots`
     /// and the admin `:terminate` endpoint's
-    /// `sandbox_occupancy_for_node_in_tx` guard: all three observe
+    /// `admin_occupancy::terminate_occupancy` guard: all three observe
     /// the same "is this sandbox portable?" answer, so a node whose
     /// only remaining sandbox is `suspended` + S3-backed advances
     /// uniformly through `draining → drained → terminating` without
@@ -1464,7 +1466,7 @@ pub trait NodeDrainSink: Send + Sync + 'static {
     ///
     /// The list is **ordered by ascending failed-attempt count, then
     /// most-recently-active first** (see
-    /// [`store::restore_pending_evacuations_query`] for why attempt count
+    /// `SubstrateSink::list_restore_pending_evacuations` for why attempt count
     /// must outrank recency). [`Reconciler::spawn_restores`] fills the
     /// bounded cluster restore budget in list order, so under slot pressure
     /// never-failed sandboxes win the slots, hottest first within a tier.
@@ -1488,7 +1490,8 @@ pub trait NodeDrainSink: Send + Sync + 'static {
     /// a *work list*: it honours the retry backoff, so a re-placement that
     /// keeps failing leaves it for up to the backoff cap. Deriving the gauge
     /// from that list would make the alert go quiet exactly as the incident got
-    /// worse. See [`store::stopped_replacements_pending_query`].
+    /// worse. See
+    /// [`pplx_space_sandbox_store::stopped_replacements::pending`].
     fn count_stopped_replacements_pending(
         &self,
     ) -> impl std::future::Future<Output = Result<u64, sqlx::Error>> + Send;
@@ -1499,7 +1502,7 @@ pub trait NodeDrainSink: Send + Sync + 'static {
     /// the half that one cannot see: a stall *before* the teardown still has
     /// its node, so it never enters the unplaced population. Both are needed
     /// for "a stopped evacuation is wedged" to be alertable at all — see
-    /// [`store::stopped_evacuation_stall_secs_query`].
+    /// `SubstrateSink::stopped_evacuation_stall`.
     /// `None` when nothing is waiting, which the caller publishes as `0` — the
     /// gauge has to be emitted every sweep, including zero, or an alert on it
     /// goes stale rather than quiet.
@@ -1663,8 +1666,8 @@ pub trait NodeDrainSink: Send + Sync + 'static {
     /// reaper is disabled). Same flip the reaper applies, triggered by the
     /// EC2-terminated verdict instead of age, under the same identity
     /// guards as the other gone-node writes (see
-    /// `fail_inflight_snapshots_on_gone_node_query` in `store`). Returns
-    /// the number of snapshot rows flipped.
+    /// `pplx_space_snapshot_store::lost::fail_inflight_uploads_from_gone_node`).
+    /// Returns the number of snapshot rows flipped.
     fn fail_inflight_snapshots_on_gone_node(
         &self,
         node_id: NodeId,
@@ -3492,7 +3495,7 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
             //
             // Reachable with the feature *off*, deliberately: the listing keeps
             // offering a row that already carries the marker (see
-            // `evacuatable_sandbox_rows_query`'s third disjunct), so an
+            // `evacuation_candidates::list_on_node`'s third disjunct), so an
             // evacuation opened before the flag was turned off can still be
             // finished. The flag bites on the claim, not here.
             if pre_lifecycle == SandboxLifecycle::Stopped {

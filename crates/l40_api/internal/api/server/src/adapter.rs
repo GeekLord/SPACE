@@ -1,4 +1,5 @@
 use pplx_space_accounts::OrgId;
+use pplx_space_cluster_trigger_queue::ref_claims;
 use pplx_space_template_mgr_client::lookup_scope::TemplateLookupScope;
 
 use super::metadata::*;
@@ -6,7 +7,6 @@ use super::release_registration::*;
 use super::status::*;
 use super::*;
 use pplx_space_snapshot_model::BaseSnapshotShape;
-use pplx_space_sql_locator::sql;
 use pplx_space_template_model::TemplateDesiredState as DomainTemplateDesiredState;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TemplateOrg {
@@ -757,57 +757,12 @@ impl ClusterApi for ClusterApiService {
         let template_rows = if templates.is_empty() {
             Vec::new()
         } else {
-            sqlx::query_as::<_, TemplatePolicyRow>(sql!(
-                "WITH requested AS (
-                     SELECT DISTINCT UNNEST($1::TEXT[]) AS template
-                 ),
-                 private_requested AS (
-                     SELECT t.name
-                     FROM requested r
-                     JOIN templates t ON t.name = r.template
-                     WHERE NOT (t.visibility = 'generic' AND t.desired_state = 'present')
-                 ),
-                 placed AS (
-                     SELECT sb.template_id
-                     FROM sandboxes sb
-                     WHERE sb.target_node_id = $3
-                       AND EXISTS (SELECT 1 FROM private_requested)
-                     UNION
-                     SELECT sb.template_id
-                     FROM sandboxes sb
-                     WHERE sb.active_node_id = $3
-                       AND EXISTS (SELECT 1 FROM private_requested)
-                 )
-                 SELECT r.template,
-                        COALESCE(t.network_policy_json, $2::JSONB) AS network_policy_json,
-                        COALESCE(t.network_policy_generation, 0) AS network_policy_generation
-                 FROM requested r
-                 LEFT JOIN templates t ON t.name = r.template
-                 WHERE (t.visibility = 'generic' AND t.desired_state = 'present')
-                    OR t.name IN (SELECT template_id FROM placed)
-                    OR ($4 = 'worker' AND EXISTS (
-                        SELECT 1
-                        FROM kubernetes_pool_configs pc
-                        JOIN template_releases pr ON pr.id = pc.template_release_id
-                        WHERE pc.enabled
-                          AND pr.template_name = t.name
-                    ))
-                    OR ($4 = 'builder' AND EXISTS (
-                        SELECT 1
-                        FROM template_build_base_grants g
-                        WHERE g.base_template_name = t.name
-                          AND g.org_id = t.org_id
-                          AND ((g.builder_node_id IS NULL
-                                AND g.granted_at > NOW() - INTERVAL '1 hour')
-                               OR (g.builder_node_id = $3
-                                   AND g.granted_at > NOW() - INTERVAL '7 days'))
-                    ))"
-            ))
-            .bind(&templates)
-            .bind(Json(NetworkPolicyV1::deny_all()))
-            .bind(origin.id)
-            .bind(origin.role.as_str())
-            .fetch_all(&self.pool)
+            pplx_space_template_store::templates::node_network_policies(
+                &self.pool,
+                &templates,
+                origin.id,
+                origin.role,
+            )
             .await
             .map_err(|err| Status::internal(format!("query template policies: {err}")))?
         };
@@ -878,72 +833,12 @@ impl ClusterApi for ClusterApiService {
             ));
         }
 
-        let rows = sqlx::query_as::<_, NodeTemplateBaseSnapshotPolicyRow>(sql!(
-            "WITH requested AS (
-                 SELECT DISTINCT UNNEST($1::TEXT[]) AS template
-             ),
-             private_requested AS (
-                 SELECT t.name
-                 FROM requested r
-                 JOIN templates t ON t.name = r.template
-                 WHERE NOT (t.visibility = 'generic' AND t.desired_state = 'present')
-             ),
-             placed AS (
-                 SELECT sb.template_id
-                 FROM sandboxes sb
-                 WHERE sb.target_node_id = $2
-                   AND EXISTS (SELECT 1 FROM private_requested)
-                 UNION
-                 SELECT sb.template_id
-                 FROM sandboxes sb
-                 WHERE sb.active_node_id = $2
-                   AND EXISTS (SELECT 1 FROM private_requested)
-             ),
-             local_inventory AS (
-                 SELECT DISTINCT ON (nti.template_name)
-                        nti.template_name,
-                        nti.vcpu,
-                        nti.memory_mib
-                 FROM node_template_inventory nti
-                 WHERE nti.node_id = $2
-                   AND (nti.vcpu IS NOT NULL OR nti.memory_mib IS NOT NULL)
-                 ORDER BY nti.template_name,
-                          nti.observed_at DESC,
-                          nti.built_at DESC NULLS LAST,
-                          nti.content_hash ASC
-             )
-             SELECT r.template,
-                    COALESCE(p.ensure_base_snapshot, FALSE) AS ensure_base_snapshot,
-                    COALESCE(li.vcpu, p.snapshot_vcpu) AS snapshot_vcpu,
-                    COALESCE(li.memory_mib, p.snapshot_memory_mib) AS snapshot_memory_mib
-             FROM requested r
-             LEFT JOIN template_base_snapshot_policies p ON p.template = r.template
-             LEFT JOIN local_inventory li ON li.template_name = r.template
-             LEFT JOIN templates t ON t.name = r.template
-             WHERE (t.visibility = 'generic' AND t.desired_state = 'present')
-                OR t.name IN (SELECT template_id FROM placed)
-                OR ($3 = 'worker' AND EXISTS (
-                    SELECT 1
-                    FROM kubernetes_pool_configs pc
-                    JOIN template_releases pr ON pr.id = pc.template_release_id
-                    WHERE pc.enabled
-                      AND pr.template_name = t.name
-                ))
-                OR ($3 = 'builder' AND EXISTS (
-                    SELECT 1
-                    FROM template_build_base_grants g
-                    WHERE g.base_template_name = t.name
-                      AND g.org_id = t.org_id
-                      AND ((g.builder_node_id IS NULL
-                            AND g.granted_at > NOW() - INTERVAL '1 hour')
-                           OR (g.builder_node_id = $2
-                               AND g.granted_at > NOW() - INTERVAL '7 days'))
-                ))"
-        ))
-        .bind(&templates)
-        .bind(origin.id)
-        .bind(origin.role.as_str())
-        .fetch_all(&self.pool)
+        let rows = pplx_space_template_store::templates::node_base_snapshot_policies(
+            &self.pool,
+            &templates,
+            origin.id,
+            origin.role,
+        )
         .await
         .map_err(|err| Status::internal(format!("query template base-snapshot policies: {err}")))?;
 
@@ -1020,112 +915,12 @@ impl ClusterApi for ClusterApiService {
         // same snapshot as the admission it failed. Released templates are
         // limited to what the node reports holding, so the list says nothing
         // about templates the node does not already have.
-        let rows = sqlx::query_as::<_, TemplateDesiredStateRow>(
-            sql!("WITH requested AS (
-                 SELECT DISTINCT UNNEST($1::TEXT[]) AS template
-             ),
-             private_requested AS (
-                 SELECT t.name
-                 FROM requested r
-                 JOIN templates t ON t.name = r.template
-                 WHERE NOT (t.visibility = 'generic' AND t.desired_state = 'present')
-             ),
-             placed AS (
-                 SELECT sb.template_id
-                 FROM sandboxes sb
-                 WHERE sb.target_node_id = $3
-                   AND EXISTS (SELECT 1 FROM private_requested)
-                 UNION
-                 SELECT sb.template_id
-                 FROM sandboxes sb
-                 WHERE sb.active_node_id = $3
-                   AND EXISTS (SELECT 1 FROM private_requested)
-             ),
-             local_inventory AS (
-                 SELECT DISTINCT ON (nti.template_name)
-                        nti.template_name,
-                        nti.vcpu,
-                        nti.memory_mib
-                 FROM node_template_inventory nti
-                 WHERE nti.node_id = $3
-                   AND (nti.vcpu IS NOT NULL OR nti.memory_mib IS NOT NULL)
-                 ORDER BY nti.template_name,
-                          nti.observed_at DESC,
-                          nti.built_at DESC NULLS LAST,
-                          nti.content_hash ASC
-             )
-             SELECT r.template,
-                    t.desired_state,
-                    al.default_auto_lifecycle_json,
-                    CASE
-                        WHEN $2 = 'worker' AND t.desired_state = 'present'
-                        THEN pp.target_count
-                        ELSE NULL
-                    END AS pool_target,
-                    CASE
-                        WHEN $2 = 'worker' AND t.desired_state = 'present'
-                        THEN pp.boot_mode
-                        ELSE NULL
-                    END AS pool_boot_mode,
-                    CASE
-                        WHEN $2 = 'worker' AND t.desired_state = 'present' AND pp.boot_mode = 'snapshot'
-                        THEN COALESCE(li.vcpu, bsp.snapshot_vcpu)
-                        ELSE NULL
-                    END AS pool_vcpu,
-                    CASE
-                        WHEN $2 = 'worker' AND t.desired_state = 'present' AND pp.boot_mode = 'snapshot'
-                        THEN COALESCE(li.memory_mib, bsp.snapshot_memory_mib)
-                        ELSE NULL
-                    END AS pool_memory_mib,
-                    COALESCE(
-                        (t.visibility = 'generic' AND t.desired_state = 'present')
-                        OR t.name IN (SELECT template_id FROM placed)
-                        OR ($2 = 'worker' AND EXISTS (
-                            SELECT 1
-                            FROM kubernetes_pool_configs pc
-                            JOIN template_releases pr ON pr.id = pc.template_release_id
-                            WHERE pc.enabled
-                              AND pr.template_name = t.name
-                        ))
-                        OR ($2 = 'builder' AND EXISTS (
-                            SELECT 1
-                            FROM template_build_base_grants g
-                            WHERE g.base_template_name = t.name
-                              AND g.org_id = t.org_id
-                              AND ((g.builder_node_id IS NULL
-                                    AND g.granted_at > NOW() - INTERVAL '1 hour')
-                                   OR (g.builder_node_id = $3
-                                       AND g.granted_at > NOW() - INTERVAL '7 days'))
-                        ))
-                        OR (t.desired_state <> 'present' AND EXISTS (
-                            SELECT 1
-                            FROM node_template_inventory nti
-                            WHERE nti.template_name = r.template
-                              AND nti.node_id = $3
-                        )),
-                        FALSE
-                    ) AS admitted,
-                    EXISTS (
-                        SELECT 1
-                        FROM node_template_inventory nti
-                        WHERE nti.template_name = r.template
-                          AND nti.node_id = $3
-                    ) AS held_here
-             FROM requested r
-             JOIN templates t ON t.name = r.template
-             LEFT JOIN template_default_auto_lifecycle_policies al
-                    ON al.template = r.template
-             LEFT JOIN template_pool_policies pp
-                    ON pp.template = r.template
-             LEFT JOIN template_base_snapshot_policies bsp
-                    ON bsp.template = r.template
-             LEFT JOIN local_inventory li
-                    ON li.template_name = r.template"),
+        let rows = pplx_space_template_store::templates::node_desired_states(
+            &self.pool,
+            &templates,
+            origin.id,
+            origin.role,
         )
-        .bind(&templates)
-        .bind(origin.role.as_str())
-        .bind(origin.id)
-        .fetch_all(&self.pool)
         .await
         .map_err(|err| Status::internal(format!("query template desired state: {err}")))?;
 
@@ -1259,19 +1054,11 @@ impl ClusterApi for ClusterApiService {
         // payload columns are projected only for assigned-here rows; other
         // rows contribute 17 bytes to the partition instead of their
         // jsonb policy.
-        let rows = sqlx::query_as::<_, SandboxDesiredStateRow>(sql!(
-            "SELECT id AS sandbox_id,
-                    (active_node_id = $2) IS TRUE AS assigned_here,
-                    CASE WHEN active_node_id = $2
-                         THEN snapshots_enabled_desired END AS snapshots_enabled_desired,
-                    CASE WHEN active_node_id = $2
-                         THEN auto_lifecycle_json END AS auto_lifecycle_json
-             FROM sandboxes
-             WHERE id = ANY($1)"
-        ))
-        .bind(&sandbox_ids)
-        .bind(origin.id)
-        .fetch_all(&self.pool)
+        let rows = pplx_space_sandbox_store::node_desired_state::partition(
+            &self.pool,
+            &sandbox_ids,
+            origin.id,
+        )
         .await
         .map_err(|err| Status::internal(format!("query sandbox desired state: {err}")))?;
 
@@ -1296,36 +1083,11 @@ impl ClusterApi for ClusterApiService {
         // still says applied/healthy on this node, the next re-apply
         // detects the generation change and recovers. 60 s is a reasonable
         // upper bound on how long a 502 could persist in that scenario.
-        let exposure_rows = sqlx::query_as::<_, SandboxPortExposureDesiredStateRow>(sql!(
-            "SELECT spe.sandbox_id,
-                    spe.protocol,
-                    spe.guest_port,
-                    spe.desired_state
-             FROM sandbox_port_exposures spe
-             JOIN sandboxes s ON s.id = spe.sandbox_id
-             WHERE spe.sandbox_id = ANY($1)
-               AND s.active_node_id = $2
-               AND spe.source <> 'ecw'
-               AND (
-                   spe.apply_state != 'applied'
-                   OR (
-                       spe.desired_state = 'open'
-                       AND (
-                           spe.last_bridge_status IS NULL
-                           OR spe.last_bridge_status NOT IN
-                               ('direct', 'loopback_forwarded')
-                           OR spe.last_observed_at IS NULL
-                           OR spe.last_observed_at <
-                               NOW() - INTERVAL '60 seconds'
-                           OR spe.last_applied_node_id IS DISTINCT FROM $2
-                       )
-                   )
-               )
-             ORDER BY spe.sandbox_id, spe.guest_port ASC, spe.protocol ASC"
-        ))
-        .bind(&sandbox_ids)
-        .bind(origin.id)
-        .fetch_all(&self.pool)
+        let exposure_rows = pplx_space_sandbox_store::port_exposures::to_apply_on_node(
+            &self.pool,
+            &sandbox_ids,
+            origin.id,
+        )
         .await
         .map_err(|err| Status::internal(format!("query sandbox port exposures: {err}")))?;
 
@@ -1567,40 +1329,13 @@ impl ClusterApi for ClusterApiService {
         };
 
         let claim_token = format!("{}-{}", origin.id, Uuid::now_v7());
-        let rows = sqlx::query_as::<_, ClaimedFacetRefRow>(sql!(
-            "WITH picked AS (
-                 SELECT node_id, facet, element, requested_at
-                 FROM node_reconcile_queue
-                 WHERE node_id = $1
-                   AND next_attempt_at <= NOW()
-                   AND dead_at IS NULL
-                   AND (
-                       claim_token = ''
-                       OR claimed_at <= NOW() - ($3 * INTERVAL '1 second')
-                   )
-                 ORDER BY requested_at ASC, facet ASC, element ASC
-                 LIMIT $2
-                 FOR UPDATE SKIP LOCKED
-             )
-             UPDATE node_reconcile_queue q
-             SET claim_token = $4,
-                 claim_generation = q.generation,
-                 claimed_at = NOW(),
-                 updated_at = NOW()
-             FROM picked
-             WHERE q.node_id = picked.node_id
-               AND q.facet = picked.facet
-               AND q.element = picked.element
-             RETURNING q.facet,
-                       NULLIF(q.element, '') AS element,
-                       q.traceparent,
-                       picked.requested_at"
-        ))
-        .bind(origin.id)
-        .bind(limit)
-        .bind(NODE_RECONCILE_CLAIM_STALE_SECS)
-        .bind(&claim_token)
-        .fetch_all(&self.pool)
+        let rows = ref_claims::claim_node_refs(
+            &self.pool,
+            origin.id,
+            limit,
+            NODE_RECONCILE_CLAIM_STALE_SECS,
+            &claim_token,
+        )
         .await
         .map_err(|err| Status::internal(format!("claim node reconcile refs: {err}")))?;
 
@@ -1642,43 +1377,27 @@ impl ClusterApi for ClusterApiService {
         let mut succeeded = 0_u64;
         for reference in request.succeeded {
             let reference = proto_facet_ref_to_storage(reference)?;
-            let result = sqlx::query(sql!(
-                "DELETE FROM node_reconcile_queue
-                 WHERE node_id = $1
-                   AND facet = $2
-                   AND element = COALESCE($3, '')
-                   AND claim_token = $4
-                   AND generation = claim_generation"
-            ))
-            .bind(origin.id)
-            .bind(&reference.facet)
-            .bind(reference.element.as_deref())
-            .bind(&claim_token)
-            .execute(&mut *tx)
+            let completed = ref_claims::complete_claimed_ref(
+                &mut *tx,
+                origin.id,
+                &reference.facet,
+                reference.element.as_deref(),
+                &claim_token,
+            )
             .await
             .map_err(|err| Status::internal(format!("complete reconcile success: {err}")))?;
-            succeeded = succeeded.saturating_add(result.rows_affected());
-            if result.rows_affected() != 0 {
+            succeeded = succeeded.saturating_add(completed);
+            if completed != 0 {
                 clear_facet_apply_failed_condition(&mut tx, origin.id, &reference).await?;
             }
 
-            sqlx::query(sql!(
-                "UPDATE node_reconcile_queue
-                 SET claim_token = '',
-                     claim_generation = 0,
-                     claimed_at = NULL,
-                     next_attempt_at = NOW(),
-                     updated_at = NOW()
-                 WHERE node_id = $1
-                   AND facet = $2
-                   AND element = COALESCE($3, '')
-                   AND claim_token = $4"
-            ))
-            .bind(origin.id)
-            .bind(&reference.facet)
-            .bind(reference.element.as_deref())
-            .bind(&claim_token)
-            .execute(&mut *tx)
+            ref_claims::release_claimed_ref(
+                &mut *tx,
+                origin.id,
+                &reference.facet,
+                reference.element.as_deref(),
+                &claim_token,
+            )
             .await
             .map_err(|err| Status::internal(format!("release refreshed reconcile ref: {err}")))?;
         }
@@ -1693,99 +1412,56 @@ impl ClusterApi for ClusterApiService {
                 "node-ctl reconciliation failed without an error message".to_string()
             });
             let facet_for_metrics = reference.facet.clone();
-            let attempts = sqlx::query_scalar::<_, i32>(sql!(
-                "SELECT attempts
-                 FROM node_reconcile_queue
-                 WHERE node_id = $1
-                   AND facet = $2
-                   AND element = COALESCE($3, '')
-                   AND claim_token = $4"
-            ))
-            .bind(origin.id)
-            .bind(&reference.facet)
-            .bind(reference.element.as_deref())
-            .bind(&claim_token)
-            .fetch_optional(&mut *tx)
+            let attempts = pplx_space_cluster_trigger_queue::claimed_ref_attempts(
+                &mut *tx,
+                origin.id,
+                &reference.facet,
+                reference.element.as_deref(),
+                &claim_token,
+            )
             .await
             .map_err(|err| Status::internal(format!("read reconcile retry count: {err}")))?
             .unwrap_or(0);
             let next_attempt = attempts.saturating_add(1);
-            let result = if next_attempt >= NODE_RECONCILE_MAX_ATTEMPTS {
-                sqlx::query(sql!(
-                    "UPDATE node_reconcile_queue
-                     SET attempts = attempts + 1,
-                         last_error = $5,
-                         dead_at = NOW(),
-                         dead_reason = $5,
-                         claim_token = '',
-                         claim_generation = 0,
-                         claimed_at = NULL,
-                         updated_at = NOW()
-                     WHERE node_id = $1
-                       AND facet = $2
-                       AND element = COALESCE($3, '')
-                       AND claim_token = $4
-                       AND generation = claim_generation"
-                ))
-                .bind(origin.id)
-                .bind(&reference.facet)
-                .bind(reference.element.as_deref())
-                .bind(&claim_token)
-                .bind(&error)
-                .execute(&mut *tx)
+            let transitioned = if next_attempt >= NODE_RECONCILE_MAX_ATTEMPTS {
+                ref_claims::dead_letter_claimed_ref(
+                    &mut *tx,
+                    origin.id,
+                    &reference.facet,
+                    reference.element.as_deref(),
+                    &claim_token,
+                    &error,
+                )
                 .await
             } else {
                 let delay_secs = reconcile_retry_delay_secs(attempts);
-                sqlx::query(sql!(
-                    "UPDATE node_reconcile_queue
-                     SET attempts = attempts + 1,
-                         last_error = $5,
-                         claim_token = '',
-                         claim_generation = 0,
-                         claimed_at = NULL,
-                         next_attempt_at = NOW() + ($6 * INTERVAL '1 second'),
-                         updated_at = NOW()
-                     WHERE node_id = $1
-                       AND facet = $2
-                       AND element = COALESCE($3, '')
-                       AND claim_token = $4
-                       AND generation = claim_generation"
-                ))
-                .bind(origin.id)
-                .bind(&reference.facet)
-                .bind(reference.element.as_deref())
-                .bind(&claim_token)
-                .bind(&error)
-                .bind(delay_secs)
-                .execute(&mut *tx)
+                ref_claims::retry_claimed_ref(
+                    &mut *tx,
+                    origin.id,
+                    &reference.facet,
+                    reference.element.as_deref(),
+                    &claim_token,
+                    &error,
+                    delay_secs,
+                )
                 .await
             }
             .map_err(|err| Status::internal(format!("complete reconcile failure: {err}")))?;
-            if next_attempt >= NODE_RECONCILE_MAX_ATTEMPTS && result.rows_affected() != 0 {
+            if next_attempt >= NODE_RECONCILE_MAX_ATTEMPTS && transitioned != 0 {
                 pplx_space_reconcile_metrics::queue_dead_letter(&facet_for_metrics);
             }
-            if result.rows_affected() != 0 {
+            if transitioned != 0 {
                 record_facet_apply_failed_condition(&mut tx, origin.id, &reference, &error).await?;
             }
-            failed = failed.saturating_add(result.rows_affected());
+            failed = failed.saturating_add(transitioned);
 
-            sqlx::query(sql!(
-                "UPDATE node_reconcile_queue
-                 SET claim_token = '',
-                     claim_generation = 0,
-                     claimed_at = NULL,
-                     next_attempt_at = NOW(),
-                     updated_at = NOW()
-                 WHERE node_id = $1
-                   AND facet = $2
-                   AND element = COALESCE($3, '')
-                   AND claim_token = $4"
-            ))
-            .bind(origin.id)
-            .bind(&reference.facet)
-            .bind(reference.element.as_deref())
-            .bind(&claim_token)
-            .execute(&mut *tx)
+            ref_claims::release_claimed_ref(
+                &mut *tx,
+                origin.id,
+                &reference.facet,
+                reference.element.as_deref(),
+                &claim_token,
+            )
             .await
             .map_err(|err| Status::internal(format!("release refreshed failed ref: {err}")))?;
         }
@@ -1823,94 +1499,24 @@ impl ClusterApi for ClusterApiService {
             }));
         }
 
-        let sandbox_ids = states
+        let reports = states
             .iter()
-            .map(|state| state.sandbox_id.as_uuid())
-            .collect::<Vec<_>>();
-        let protocols = states
-            .iter()
-            .map(|state| state.protocol.as_str())
-            .collect::<Vec<_>>();
-        let guest_ports = states
-            .iter()
-            .map(|state| i32::from(state.guest_port))
-            .collect::<Vec<_>>();
-        let apply_states = states
-            .iter()
-            .map(|state| state.apply_state.as_str())
-            .collect::<Vec<_>>();
-        let errors = states
-            .iter()
-            .map(|state| state.error.as_deref())
-            .collect::<Vec<_>>();
-        let bridge_statuses = states
-            .iter()
-            .map(|state| state.bridge_status.as_deref())
-            .collect::<Vec<_>>();
-        let service_generations = states
-            .iter()
-            .map(|state| state.service_generation.as_deref())
+            .map(
+                |state| pplx_space_sandbox_store::port_exposures::ApplyStateReport {
+                    sandbox_id: state.sandbox_id,
+                    protocol: state.protocol.as_str(),
+                    guest_port: i32::from(state.guest_port),
+                    apply_state: state.apply_state.as_str(),
+                    error: state.error.as_deref(),
+                    bridge_status: state.bridge_status.as_deref(),
+                    service_generation: state.service_generation.as_deref(),
+                },
+            )
             .collect::<Vec<_>>();
 
-        let missed = sqlx::query_as::<_, PortExposureApplyMissRow>(sql!(
-            "WITH input AS (
-                 SELECT *
-                 FROM UNNEST(
-                     $1::UUID[],
-                     $2::TEXT[],
-                     $3::INT[],
-                     $4::TEXT[],
-                     $5::TEXT[],
-                     $7::TEXT[],
-                     $8::TEXT[]
-                 ) AS input(sandbox_id, protocol, guest_port, apply_state, error,
-                            bridge_status, service_generation)
-             ),
-             updated AS (
-                 UPDATE sandbox_port_exposures spe
-                 SET apply_state = input.apply_state,
-                     last_applied_node_id =
-                         CASE WHEN input.apply_state = 'applied'
-                              THEN $6
-                              ELSE spe.last_applied_node_id
-                         END,
-                     last_error =
-                         CASE WHEN input.apply_state = 'failed'
-                              THEN input.error
-                              ELSE NULL
-                         END,
-                     last_bridge_status =
-                         COALESCE(input.bridge_status, spe.last_bridge_status),
-                     last_applied_bridge_generation =
-                         COALESCE(input.service_generation, spe.last_applied_bridge_generation),
-                     last_observed_at = NOW(),
-                     updated_at = NOW()
-                 FROM input
-                 JOIN sandboxes s ON s.id = input.sandbox_id
-                 WHERE spe.sandbox_id = input.sandbox_id
-                   AND spe.protocol = input.protocol
-                   AND spe.guest_port = input.guest_port
-                   AND spe.sandbox_id = s.id
-                   AND s.active_node_id = $6
-                 RETURNING spe.sandbox_id, spe.protocol, spe.guest_port
-             )
-             SELECT input.sandbox_id, input.protocol, input.guest_port
-             FROM input
-             LEFT JOIN updated
-               ON updated.sandbox_id = input.sandbox_id
-              AND updated.protocol = input.protocol
-              AND updated.guest_port = input.guest_port
-             WHERE updated.sandbox_id IS NULL"
-        ))
-        .bind(sandbox_ids)
-        .bind(protocols)
-        .bind(guest_ports)
-        .bind(apply_states)
-        .bind(errors)
-        .bind(origin.id)
-        .bind(bridge_statuses)
-        .bind(service_generations)
-        .fetch_all(&self.pool)
+        let missed = pplx_space_sandbox_store::port_exposures::record_apply_states(
+            &self.pool, origin.id, &reports,
+        )
         .await
         .map_err(|err| Status::internal(format!("update sandbox port exposure states: {err}")))?;
 
@@ -1992,6 +1598,13 @@ impl ClusterApi for ClusterApiService {
         request: Request<crate::proto::GetExecutionCurrencyRequest>,
     ) -> Result<Response<crate::proto::GetExecutionCurrencyResponse>, Status> {
         ClusterApiService::get_execution_currency(self, request).await
+    }
+
+    async fn fetch_firewall_rules(
+        &self,
+        request: Request<crate::proto::FetchFirewallRulesRequest>,
+    ) -> Result<Response<crate::proto::FetchFirewallRulesResponse>, Status> {
+        ClusterApiService::fetch_firewall_rules(self, request).await
     }
 }
 

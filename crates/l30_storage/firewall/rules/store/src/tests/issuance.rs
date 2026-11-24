@@ -7,6 +7,9 @@ use pplx_space_state_reconciliation::ReconcileReason;
 
 use super::*;
 
+mod canary;
+mod round;
+
 /// Bound for tests only: there is no production first-check delay yet.
 const FIRST_CHECK_IN: Duration = Duration::from_secs(90);
 const FIREWALL: &str = "firewall_rules_changed";
@@ -21,6 +24,12 @@ enum Queue {
     /// Queues, then expires the item's lease at the current clock reading, so
     /// the check must read the clock at the stamp to refuse.
     ThenLapses,
+    /// Queues, then gives the item another token, so a release matches
+    /// nothing.
+    ThenStealsLease,
+    /// Queues, then adds a check, rolled back with the issuance, that a
+    /// release violates.
+    ThenBlocksRelease,
 }
 
 impl Wakeup for Queue {
@@ -42,6 +51,26 @@ impl Wakeup for Queue {
                      WHERE node_id = $1 AND phase = 'in_flight'"
                 ))
                 .bind(node)
+                .execute(&mut **tx)
+                .await?;
+                Ok(queued)
+            }
+            Self::ThenStealsLease => {
+                sqlx::query(sql!(
+                    "UPDATE firewall_rules_rollout_items
+                     SET lease_token = gen_random_uuid()
+                     WHERE node_id = $1 AND phase = 'in_flight'"
+                ))
+                .bind(node)
+                .execute(&mut **tx)
+                .await?;
+                Ok(queued)
+            }
+            Self::ThenBlocksRelease => {
+                sqlx::query(sql!(
+                    "ALTER TABLE firewall_rules_rollout_items
+                     ADD CONSTRAINT test_no_release CHECK (lease_token IS NOT NULL) NOT VALID"
+                ))
                 .execute(&mut **tx)
                 .await?;
                 Ok(queued)
@@ -68,14 +97,16 @@ async fn issued(pool: &PgPool, target: &LeasedTarget) -> TestResult<Stamp> {
     }
 }
 
-/// Everything issuance may write for `node`: its assignment (generation,
-/// revision), its item's stamp and schedule, and its trigger row (reasons,
-/// generation, attempts, requested and next attempt times).
+/// Everything issuance or a round's opening may write for `node`: its
+/// assignment (generation, revision), its item's stamp and schedule, its
+/// trigger row (reasons, generation, attempts, requested and next attempt
+/// times), and its observation row.
 #[derive(Debug, PartialEq)]
 struct Effects {
     assignment: Option<(i64, Uuid)>,
     stamp: Option<(Option<i64>, Option<Timestamp>, Option<Timestamp>)>,
     trigger: Option<(Vec<String>, i64, i32, OffsetDateTime, OffsetDateTime)>,
+    observation: Option<Observation>,
 }
 
 impl Effects {
@@ -83,7 +114,19 @@ impl Effects {
         assignment: None,
         stamp: Some((None, None, None)),
         trigger: None,
+        observation: None,
     };
+}
+
+#[derive(Debug, PartialEq, sqlx::FromRow)]
+struct Observation {
+    manager_epoch: i64,
+    pending_round: Option<i64>,
+    pending_round_issued_at: Option<OffsetDateTime>,
+    pending_assignment_generation: Option<i64>,
+    accepted_round: Option<i64>,
+    accepted_round_issued_at: Option<OffsetDateTime>,
+    accepted_report: Option<String>,
 }
 
 async fn effects(pool: &PgPool, rollout: RolloutId, node: NodeId) -> TestResult<Effects> {
@@ -111,6 +154,15 @@ async fn effects(pool: &PgPool, rollout: RolloutId, node: NodeId) -> TestResult<
         trigger: sqlx::query_as(sql!(
             "SELECT reasons::text[], generation, attempts, requested_at, next_attempt_at
              FROM node_reconcile_triggers WHERE node_id = $1"
+        ))
+        .bind(node)
+        .fetch_optional(pool)
+        .await?,
+        observation: sqlx::query_as(sql!(
+            "SELECT manager_epoch, pending_round, pending_round_issued_at,
+                    pending_assignment_generation, accepted_round,
+                    accepted_round_issued_at, accepted_report::text AS accepted_report
+             FROM firewall_rules_node_observations WHERE node_id = $1"
         ))
         .bind(node)
         .fetch_optional(pool)

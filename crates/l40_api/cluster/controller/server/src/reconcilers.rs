@@ -95,6 +95,7 @@ use pplx_space_cluster_pool::WarmPoolStore;
 use pplx_space_cluster_reconciler::{
     TriggerEndpointResolver, TriggerFanoutConfig, TriggerNodeApiTarget, metrics, trigger_fanout,
 };
+use pplx_space_postgres_pool::Db;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
@@ -296,13 +297,13 @@ pub async fn run_reconcilers(
         })?;
     let mut handles = vec![
         tokio::spawn(trigger_fanout::run(
-            pool.clone(),
+            Db::from(pool.clone()),
             trigger_substrate,
             TriggerFanoutConfig::default(),
             shutdown_token.child_token(),
         )),
         tokio::spawn(metrics::run_queue_metrics(
-            pool.clone(),
+            Db::from(pool.clone()),
             metrics::QueueMetricsConfig::default(),
             shutdown_token.child_token(),
         )),
@@ -365,6 +366,12 @@ pub async fn run_reconcilers(
                 shutdown_token.child_token(),
             )
         }),
+        // Firewall rules canary issuance. Off: nothing configures it yet.
+        tokio::spawn(crate::firewall_rules_issue::run(
+            None,
+            pool.clone(),
+            shutdown_token.child_token(),
+        )),
     ];
     if let Some(native_public_operation_executor) = native_public_operation_executor {
         // The cluster activation limiter exists in this process only while the

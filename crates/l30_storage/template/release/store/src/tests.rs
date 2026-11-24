@@ -1770,3 +1770,299 @@ async fn partition_selector_and_memory_release_objects_match_contracts() -> Test
     ));
     Ok(())
 }
+
+#[tokio::test]
+async fn a_release_is_published_once_a_storage_location_is_registered() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let template = "storage-vend-release";
+    let hash: ContentHash = format!("sha256:{}", "ab".repeat(32)).parse()?;
+    let unregistered: ContentHash = format!("sha256:{}", "cd".repeat(32)).parse()?;
+    insert_template(&db.pool, template).await?;
+    let release = insert_release(&db.pool, template, &hash.to_string(), None).await?;
+
+    // A release row without artifacts has not been published yet.
+    assert!(!release_published(&db.pool, template, &hash).await?);
+
+    insert_location(
+        &db.pool,
+        release,
+        "s3://artifacts/templates/storage-vend-release/x?region=us-east-1",
+    )
+    .await?;
+    assert!(release_published(&db.pool, template, &hash).await?);
+    assert!(!release_published(&db.pool, template, &unregistered).await?);
+
+    // A release registered before the `sha256:` prefix was required is stored
+    // bare, and is just as published.
+    let bare_hex = "ef".repeat(32);
+    let bare_release = insert_release(&db.pool, template, &bare_hex, None).await?;
+    insert_location(
+        &db.pool,
+        bare_release,
+        "s3://artifacts/templates/storage-vend-release/y?region=us-east-1",
+    )
+    .await?;
+    let legacy: ContentHash = format!("sha256:{bare_hex}").parse()?;
+    assert!(release_published(&db.pool, template, &legacy).await?);
+    Ok(())
+}
+
+/// Widening an org-specific template whose content is wrapped under its
+/// owner's key to `generic` would make it launchable-but-undecryptable for
+/// every other org — the RFC forbids it and defers re-keying. The guard
+/// must report the per-template encryption sidecar so the handler refuses
+/// the widen; a template without a sidecar is safe to widen.
+#[tokio::test(flavor = "current_thread")]
+async fn widen_guard_detects_owner_encryption() -> TestResult {
+    // Seeded by the baseline migration's fixture data.
+    const ORG_A: Uuid = Uuid::from_u128(0x1);
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    for name in ["plain-owned", "encrypted-owned"] {
+        sqlx::query(
+            "INSERT INTO templates (id, name, org_id, visibility)
+             VALUES ($1, $2, $3, 'org_specific')",
+        )
+        .bind(Uuid::now_v7())
+        .bind(name)
+        .bind(ORG_A)
+        .execute(pool)
+        .await?;
+    }
+
+    let key_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO org_master_keys (id, org_id, provider, key_identifier)
+         VALUES ($1, $2, 'test', 'k')",
+    )
+    .bind(key_id)
+    .bind(ORG_A)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO template_encrypted_fields
+             (template_name, org_id, master_key_id, wrapped_dek, network_policy_json)
+         VALUES ('encrypted-owned', $1, $2, '\\x00'::BYTEA, '\\x00'::BYTEA)",
+    )
+    .bind(ORG_A)
+    .bind(key_id)
+    .execute(pool)
+    .await?;
+
+    assert!(
+        !template_has_owner_encryption(pool, "plain-owned").await?,
+        "a template with no encryption sidecar is safe to widen"
+    );
+    assert!(
+        template_has_owner_encryption(pool, "encrypted-owned").await?,
+        "a per-template encryption sidecar must block the widen"
+    );
+    assert!(
+        !template_has_owner_encryption(pool, "absent").await?,
+        "an unknown template has no sidecar"
+    );
+    Ok(())
+}
+
+/// Registration's fills write only an empty field and say whether it was empty.
+#[tokio::test(flavor = "current_thread")]
+async fn registration_fills_only_a_missing_binding_or_owner() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    insert_template(&db.pool, TEMPLATE).await?;
+    let release = insert_release(&db.pool, TEMPLATE, HASH, None).await?;
+    let first = metadata(environment(1));
+    assert!(registration::fill_execution_metadata(&db.pool, release, &first).await?);
+    assert!(
+        !registration::fill_execution_metadata(&db.pool, release, &metadata(environment(2)))
+            .await?
+    );
+    let stored: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT execution_metadata FROM template_releases WHERE id = $1")
+            .bind(release)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(stored, Some(first));
+
+    sqlx::query("UPDATE templates SET org_id = $2, visibility = 'org_specific' WHERE name = $1")
+        .bind(TEMPLATE)
+        .bind(pplx_space_db_test_fixtures::SEED_ORG_ID)
+        .execute(&db.pool)
+        .await?;
+    sqlx::query("UPDATE template_releases SET org_id = $2 WHERE id = $1")
+        .bind(release)
+        .bind(pplx_space_db_test_fixtures::SEED_ORG_ID)
+        .execute(&db.pool)
+        .await?;
+    insert_location(&db.pool, release, LOCATION).await?;
+    let location: Uuid = sqlx::query_scalar(
+        "SELECT id FROM template_release_storage_locations WHERE template_release_id = $1",
+    )
+    .bind(release)
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(registration::adopt_storage_location_owner(&db.pool, location).await?);
+    assert!(!registration::adopt_storage_location_owner(&db.pool, location).await?);
+    let owner: Option<Uuid> =
+        sqlx::query_scalar("SELECT org_id FROM template_release_storage_locations WHERE id = $1")
+            .bind(location)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(owner, Some(pplx_space_db_test_fixtures::SEED_ORG_ID));
+    Ok(())
+}
+
+/// Whether another transaction can take `lock` on release `release` now.
+async fn release_lock_free(pool: &PgPool, release: Uuid, lock: &str) -> TestResult<bool> {
+    let mut other = pool.begin().await?;
+    let result = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT 1 FROM template_releases WHERE id = $1 FOR {lock} NOWAIT"
+    )))
+    .bind(release)
+    .execute(&mut *other)
+    .await;
+    other.rollback().await?;
+    match result {
+        Ok(_) => Ok(true),
+        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("55P03") => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn release_locks_last_until_the_callers_transaction_ends() -> TestResult {
+    let Some(db) = twin_ready_db().await? else {
+        return Ok(());
+    };
+    let bound = metadata(environment(1));
+    let original = seeded(&db.pool, Some(bound.clone())).await?;
+    let bare = HASH.strip_prefix("sha256:").expect("prefixed");
+    let other_spelling = insert_release(&db.pool, TEMPLATE, bare, None).await?;
+
+    let mut tx = db.pool.begin().await?;
+    assert_eq!(
+        registration::lock_execution_metadata(&mut tx, original).await?,
+        Some(bound)
+    );
+    assert!(!release_lock_free(&db.pool, original, "KEY SHARE").await?);
+    assert!(release_lock_free(&db.pool, other_spelling, "UPDATE").await?);
+    tx.rollback().await?;
+    let mut tx = db.pool.begin().await?;
+    assert!(matches!(
+        registration::lock_execution_metadata(&mut tx, Uuid::now_v7()).await,
+        Err(sqlx::Error::RowNotFound)
+    ));
+    tx.rollback().await?;
+
+    let mut tx = db.pool.begin().await?;
+    let release = lookup::lock_release_of_present_template(&mut tx, original)
+        .await?
+        .expect("a present template's release");
+    assert_eq!(
+        (release.id, release.content_hash.as_str()),
+        (original, HASH)
+    );
+    assert!(!release_lock_free(&db.pool, original, "KEY SHARE").await?);
+    let mut other = db.pool.begin().await?;
+    sqlx::query("SELECT 1 FROM templates WHERE name = $1 FOR UPDATE NOWAIT")
+        .bind(TEMPLATE)
+        .execute(&mut *other)
+        .await?;
+    other.rollback().await?;
+    tx.rollback().await?;
+    sqlx::query("UPDATE templates SET desired_state = 'deleting' WHERE name = $1")
+        .bind(TEMPLATE)
+        .execute(&db.pool)
+        .await?;
+    let mut tx = db.pool.begin().await?;
+    assert!(
+        lookup::lock_release_of_present_template(&mut tx, original)
+            .await?
+            .is_none()
+    );
+    assert!(release_lock_free(&db.pool, original, "UPDATE").await?);
+    tx.rollback().await?;
+
+    let mut tx = db.pool.begin().await?;
+    removal::lock_releases_of_digest(&mut tx, other_spelling).await?;
+    assert!(!release_lock_free(&db.pool, original, "KEY SHARE").await?);
+    assert!(!release_lock_free(&db.pool, other_spelling, "KEY SHARE").await?);
+    tx.rollback().await?;
+    assert!(release_lock_free(&db.pool, original, "UPDATE").await?);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn original_lookups_and_the_twin_check_follow_the_shared_rule() -> TestResult {
+    let Some(db) = twin_ready_db().await? else {
+        return Ok(());
+    };
+    let original = seeded(&db.pool, None).await?;
+    let bare = HASH.strip_prefix("sha256:").expect("prefixed");
+    let other_spelling = insert_release(&db.pool, TEMPLATE, bare, None).await?;
+    for hash in [HASH, bare] {
+        assert_eq!(
+            lookup::original_release_id(&db.pool, TEMPLATE, hash).await?,
+            Some(original),
+            "the original that owns a location wins under either spelling"
+        );
+    }
+    assert_eq!(
+        lookup::original_release_id(&db.pool, "other", HASH).await?,
+        None
+    );
+    let registered = registration::original_release(&db.pool, TEMPLATE, HASH, bare)
+        .await?
+        .expect("the digest's original");
+    assert_eq!((registered.id, registered.hash.as_str()), (original, HASH));
+    assert!(
+        registration::original_release(&db.pool, "other", HASH, bare)
+            .await?
+            .is_none()
+    );
+
+    assert!(!lookup::release_serves_a_tag(&db.pool, original).await?);
+    pplx_space_template_store::test_support::tag_release(
+        &db.pool,
+        TEMPLATE,
+        other_spelling,
+        "stable",
+    )
+    .await?;
+    assert!(
+        lookup::release_serves_a_tag(&db.pool, original).await?,
+        "a tag on the other spelling resolves to the digest original"
+    );
+    pplx_space_template_store::test_support::tag_release(&db.pool, TEMPLATE, original, "pinned")
+        .await?;
+    assert!(
+        !lookup::release_serves_a_tag(&db.pool, other_spelling).await?,
+        "a non-original serves neither its own non-latest tag nor a tag on another release of the digest"
+    );
+    pplx_space_template_store::test_support::tag_release(
+        &db.pool,
+        TEMPLATE,
+        other_spelling,
+        "latest",
+    )
+    .await?;
+    assert!(lookup::release_serves_a_tag(&db.pool, other_spelling).await?);
+
+    assert!(!lookup::release_has_twins(&db.pool, original).await?);
+    let twin = insert_release(&db.pool, TEMPLATE, HASH, Some(metadata(environment(2)))).await?;
+    assert!(lookup::release_has_twins(&db.pool, original).await?);
+    assert!(
+        !lookup::release_has_twins(&db.pool, twin).await?,
+        "a twin is no original"
+    );
+    assert!(
+        !lookup::release_has_twins(&db.pool, other_spelling).await?,
+        "the other spelling's original has no twin of its own"
+    );
+    Ok(())
+}
